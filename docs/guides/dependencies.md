@@ -38,12 +38,23 @@
 - **不导出 schemastery `Config`**：导出它需要运行时 import `@deepseek-ai/schemastery`，与零宿主 import
   冲突。代价是没有宿主的 Settings-UI 页面，行 config 由插件自己校验（`src/row-config.ts`）。
 
+**`@deepseek-ai/dsh-session` 看似可以删，实际不行**：`src/` 里没有一行按名字 import 它，但它参与了
+typecheck。`src/host-types.ts` 从 `@deepseek-ai/dsh-agent` 取 `Agent`，而 `Agent` 的 `session` 属性是宿主用
+模块增广补上的（`dsh-agent/lib/types/runtime-types.d.ts:164-168`），类型为 `dsh-session` 的 `Session`，
+`Session.header` 又是 `SessionHeader`。适配层正是读 `agent.session.id` 与 `agent.session.header`（会话键、
+根/子 agent 门禁），所以这些类型经 `dsh-agent` 间接到达，而不是直接 import。九个 peer 全 `optional: true`，
+声明它零成本。
+
+这九条精确版本各有一条 `.github/dependabot.yml` 的 `ignore`（与 `@earendil-works/*` 同样处理）：升级只能
+走一次独立变更，不能让自动 PR 越过它。
+
 ## 依赖自动更新
 
 `.github/dependabot.yml` 的骨架与 `yandy/pi-packages` 保持一致（周更、限 5 个 PR、dev 依赖
 minor/patch 成组）。唯一刻意的差异是 `ignore`：
 
 - `@earendil-works/*` 三个宿主包精度钉死 0.80.2（见上节）；
+- `@deepseek-ai/*` 九个 dsh 宿主包同样钉死精确版本（见上节「dsh 宿主包」）；
 - `@yandy0725/memory-core` 是 workspace 内依赖 —— 自动更新只会产出必然红 CI 的 PR 或绕开发布
   顺序。
 
