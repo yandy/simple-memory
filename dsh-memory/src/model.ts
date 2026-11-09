@@ -50,8 +50,21 @@ const DISABLED_REASON =
 	"autoSurfacing is disabled in the plugin row config — set autoSurfacing.enabled = true to enable it";
 
 /**
+ * 宿主拒绝推理档位时的错误码：`resolveCallWithInfo`（`dsh-llm/lib/index.js:2194-2196`）在
+ * `modelInfo.reasoning === undefined && requested !== undefined` 时抛它，而 `ModelInfo.reasoning` 是可选的
+ * （`dsh-llm/lib/types/types.d.ts:424`）。core 的默认 `thinkLevel` 是字符串 `"off"`（一个 defined 值），
+ * 所以我们**总是**发送显式档位：任何 modelInfo 不带 reasoning 的路线都会在启动期关掉
+ * auto-surfacing —— 而那时错的键是 `thinkLevel`，不是 `model`。
+ */
+const UNSUPPORTED_EFFORT_CODE = "UNSUPPORTED_REASONING_EFFORT";
+
+/**
  * 把宿主拒绝的可抛值转成一句可执行的原因。抛出来的值不保证是 `Error`，`code` / `message`
  * 也都可能缺失；缺 `code` 时绝不能把字符串 `"undefined"` 漏进用户可见文案。
+ *
+ * 建议文案按 `code` 分叉：档位不被支持时点名 `thinkLevel`，其余情况才点名模型键。指错键的代价
+ * 是用户反复去改一个根本没毛病的 `model`。（不能改成「干脆不传 effort」：宿主把
+ * `requested === undefined` 当成「用 `reasoning.defaultEffort`」，那会**打开**推理而不是避开错误。）
  */
 function hostRejectionReason(model: string, error: unknown): string {
 	const e = error as { code?: unknown; message?: unknown } | null | undefined;
@@ -61,7 +74,11 @@ function hostRejectionReason(model: string, error: unknown): string {
 	let reason = `autoSurfacing model "${model}" was rejected by the host`;
 	if (code !== null) reason += ` (${code})`;
 	if (detail !== null) reason += `: ${detail}`;
-	return `${reason} — check autoSurfacing.model (or defaults.model) in the plugin row config`;
+	const advice =
+		code === UNSUPPORTED_EFFORT_CODE
+			? "this host route advertises no reasoning efforts, so the configured autoSurfacing.thinkLevel cannot be sent — lower or remove thinkLevel in the plugin row config (the model itself may be fine)"
+			: "check autoSurfacing.model (or defaults.model) in the plugin row config";
+	return `${reason} — ${advice}`;
 }
 
 /**

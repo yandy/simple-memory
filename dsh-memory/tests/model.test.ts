@@ -97,6 +97,35 @@ describe("resolveSurfacingAvailability", () => {
 		);
 	});
 
+	it("names thinkLevel, not the model keys, when the host rejects the reasoning effort", async () => {
+		// 宿主的 `resolveCallWithInfo` 在 `modelInfo.reasoning === undefined && requested !== undefined` 时抛
+		// 这个码（`dsh-llm/lib/index.js:2194-2196`）。我们总是发显式 effort（core 默认就是字符串 "off"），
+		// 所以错的键是 `thinkLevel`；指到 `model` 上会让用户反复去改一个根本没毛病的模型名。
+		const config = makeConfig({ autoSurfacing: { model: "deepseek-official/deepseek-flash", thinkLevel: "off" } });
+		const resolve = vi.fn<ResolveCallConfig>();
+		resolve.mockRejectedValue({ code: "UNSUPPORTED_REASONING_EFFORT", message: "reasoning not supported" });
+
+		const result = await resolveSurfacingAvailability(config, resolve);
+
+		expect(result.available).toBe(false);
+		expect(result.reason).toContain("UNSUPPORTED_REASONING_EFFORT");
+		expect(result.reason).toContain("reasoning not supported");
+		expect(result.reason).toContain("thinkLevel");
+		expect(result.reason).not.toContain("check autoSurfacing.model");
+	});
+
+	it("keeps naming the model keys for any other host rejection code", async () => {
+		const config = makeConfig({ autoSurfacing: { model: "deepseek-official/deepseek-flash", thinkLevel: "max" } });
+		const resolve = vi.fn<ResolveCallConfig>();
+		resolve.mockRejectedValue({ code: "NO_ADAPTER", message: "no adapter for provider" });
+
+		const result = await resolveSurfacingAvailability(config, resolve);
+
+		expect(result.reason).toContain("NO_ADAPTER");
+		expect(result.reason).toContain("check autoSurfacing.model (or defaults.model)");
+		expect(result.reason).not.toContain("thinkLevel");
+	});
+
 	it("resolves fully and forwards provider/model from parseModelRef", async () => {
 		const config = makeConfig({ autoSurfacing: { model: "deepseek-official/deepseek-flash", thinkLevel: "high" } });
 		const resolve = vi.fn<ResolveCallConfig>();
