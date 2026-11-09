@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
 	DEFAULT_CONFIG,
 	MemoryStore,
@@ -29,7 +29,11 @@ assert.equal(defaultMemoryRoot({ XDG_DATA_HOME: "/data" }, "/home/u"), join("/da
 assert.equal(defaultMemoryRoot({}, "/home/u"), join("/home/u", ".local", "share", "simple-memory"));
 
 const xdg = process.env.XDG_DATA_HOME;
-assert.ok(xdg?.startsWith(tmpdir()), "run with XDG_DATA_HOME pointing inside the temp dir");
+
+// 刻意不要求落在 os.tmpdir() 下：CI 的 RUNNER_TEMP 在 Linux 上是 /home/runner/work/_temp。
+// 「不污染真实数据根」由下一行保证：`defaultMemoryRoot()` 在模块加载时就读这个变量，
+// 所以 `cfg.memoryDir` 必须等于 XDG 派生出来的那个目录。
+assert.ok(xdg && isAbsolute(xdg), "run with XDG_DATA_HOME set to an absolute path");
 const expectedRoot = join(xdg, "simple-memory");
 
 const project = await mkdtemp(join(tmpdir(), "smoke-project-"));
