@@ -6,7 +6,9 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
  *
  * 读侧（`read`）挂在宿主的 system prompt 装配路径上（spec §5.4 的 `text` 回调必须同步），
  * 而 `buildIndexSection` 是异步的（读 MEMORY.md + 截断 + 净化）。所以这里把两者拆开：
- * 刷新在 `agent/created`、memory 工具写入后、`/memory` 执行后、每轮第一个 step 之前异步发生，
+ * 刷新在 `agent/created`、memory 工具写入后、`/memory` 执行后、以及**每一个** `agent/pre-step`
+ * 之前异步发生（不是「每轮第一个 step」：刷新点在召回门禁**之前**，所以每轮的每个 step 都刷一次
+ * —— 这是一条**成本**属性：长会话里每轮的磁盘读次数 ≈ steps-per-turn，调优时别把它当成每轮一次），
  * 读则只是同步查一张 `Map`。
  *
  * 两条硬约束（spec §5.4）：
