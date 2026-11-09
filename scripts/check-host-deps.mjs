@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * 校验各 workspace 对「宿主提供包（host-provided packages）」的声明是否符合
- * AGENTS.md 的「依赖管理」约定：
+ * docs/guides/dependencies.md 的约定：
  *
  * - 宿主提供包不得出现在任何 workspace 的 `dependencies`：pi 本体在加载扩展前会扫描
  *   扩展包的 package.json，命中即告警
@@ -133,7 +133,7 @@ for (const workspace of rootPkg.workspaces ?? []) {
 }
 
 if (problems.length > 0) {
-	console.error("宿主提供包声明检查失败（规范：AGENTS.md）：");
+	console.error("宿主提供包声明检查失败（规范：docs/guides/dependencies.md）：");
 	for (const problem of problems) console.error(`  - ${problem}`);
 	console.error(`\n共 ${problems.length} 项问题。修复后运行 npm install 以同步 package-lock.json。`);
 	process.exit(1);

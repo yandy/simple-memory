@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .worktrees/
+.pi/
 **/docs/superpowers/plans/
 *.log
 .DS_Store
