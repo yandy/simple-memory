@@ -20,7 +20,8 @@ pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样�
 - **`memory` 工具** —— 五个 action：`add` / `replace` / `remove` / `list` / `search`，schema 与
   handler 直接来自 core，模型看到的线格式与 pi 一致。
 - **`/memory` 命令** —— 打印状态块（目录、索引容量、条目数、模块开关、锁持有者），`/memory unlock
-  --force` 是清除崩溃遗留 `.lock` 的唯一入口。
+  --force` 是清除崩溃遗留 `.lock` 的唯一入口。即使会话是以配置错误启动的（启动时目录没解出来），
+  `unlock` 也会用会话的 cwd 按需重解一次目录再清锁 —— 它不能变成死路。
 - **每轮自动召回（auto-surfacing）** —— 每一轮第一步之前，用一次零工具侧查询挑出与用户输入相关的
   条目，把正文包进 `<relevant_memories>` 插进进入该步的消息。
 
@@ -29,6 +30,10 @@ pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样�
 **`extractMemories` 与 `dream` 本轮没有实现**，包括 dream 的 nudge 提示与 `/dream` 命令。这两样在 dsh
 侧需要先新造一个「一次性受限工具子会话」，风险与成本独立成下一刀。所以不要拿它当 pi-memory 的完全
 对等物：**没有**每轮自动提取，**没有** `/dream` 整理，索引也不会在会话中途被冻结（见下）。
+
+这两个键在行 config 里**能**通过校验（白名单与 core 的 `MemoryConfig` 逐字对齐，方便照抄 pi 的
+`memory.json`），但写了不生效 —— 所以你写了它们时，`/memory` 的 `Modules:` 行会就地报
+`dream=not implemented in this adapter`（`extractMemories` 同理）。
 
 不冻结的原因是 dsh 每一步都重新装配 system prompt（pi 是整个会话冻结索引、回放录制值来护住 prompt
 cache），所以索引是一份快照：在 `agent/created`、每次记忆写入成功后、`/memory` 执行后、每个 `pre-step`
@@ -110,6 +115,10 @@ model id 自己含斜杠也没问题（如 `megcore/qwen/qwen3.8-max` → `provi
 **缺模型或模型不可解析时，降级而不是关掉记忆**：只有 auto-surfacing 被关闭，`memory_index` 段与
 `memory` 工具照常可用；降级原因显示在 `/memory` 的 `Modules:` 行（`autoSurfacing=off(<原因>)`）。
 本轮 dsh 不实现 dream，所以**不会**像 pi 那样要求你配一个永远用不到的 `dream.model`。
+
+`thinkLevel` 会原样当宿主的 `reasoningEffort` 透传（core 的默认值是 `"off"`）。若某条宿主路线的
+model info 不带 `reasoning` 块，宿主会以 `UNSUPPORTED_REASONING_EFFORT` 拒绕—— 这时 `Modules:` 行的
+原因会点名 `thinkLevel`（而不是 `model`）：要改的是档位，模型本身可能根本没毛病。
 
 ## search scope=sessions
 
