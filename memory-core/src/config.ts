@@ -137,9 +137,15 @@ export function taskModel(cfg: MemoryConfig, task: ModelTask): string | undefine
  * 会执行的任务及其模型值。
  *
  * `tasks`：适配层声明自己实现了哪些任务（如 dsh 本轮不实现 dream，就传 `["autoSurfacing"]`）。
- * 省略 = 既有行为逐字不变（dream 恒在执行集合内，另两个按 `enabled`）；给定则**只**考虑这些任务，
+ * 省略 = 既有行为不变（dream 恒在执行集合内，另两个按 `enabled`）；给定则**只**考虑这些任务，
  * dream 不再被强制加入，另两个仍按 `enabled` 过滤。顺序与调用方列举顺序无关，恒为
  * dream → extractMemories → autoSurfacing。
+ *
+ * 缺省路径上**不是**逐字不变，唯一的例外（实现期已裁定）：`deepMerge` 会把用户写的
+ * `"extractMemories": null` / `"autoSurfacing": null` 原样带进来，旧实现直接读 `.enabled` 会抛
+ * `TypeError`，现在按 falsy 跳过该任务。这与 `taskModel` 对 `"dream": null` 的既有防御同一取向：
+ * 配置读不懂时应给出「该任务关闭 / 没有模型」这种可读结果，而不是把启动校验变成一句看不懂的
+ * 初始化失败。
  */
 export function requiredModels(
 	cfg: MemoryConfig,
@@ -160,6 +166,7 @@ export function requiredModels(
  * 启动校验：空数组 = 通过。
  * `resolve` 由调用方注入（生产时是 `(v) => resolveModel(v, ctx.modelRegistry) !== undefined`），
  * 因此本函数不依赖 SDK 的 registry 类型，可用假 resolve 单测。
+ * `tasks`：原样透传给 `requiredModels`（只校验列出的任务；`null` 子树跳过那个例外同上）。
  */
 export function modelConfigErrors(
 	cfg: MemoryConfig,

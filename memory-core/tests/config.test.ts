@@ -366,6 +366,20 @@ describe("modelConfigErrors 的 tasks 参", () => {
 		expect(requiredModels(all, ["autoSurfacing", "dream", "extractMemories"]).map((m) => m.task))
 			.toEqual(["dream", "extractMemories", "autoSurfacing"]);
 	});
+
+	// 已裁定的新语义（实现期修订）：**省略 `tasks`** 时 `null` 子树按 falsy 跳过，而不是抛 TypeError。
+	// 带 defaults.model 使其余任务不贡献错误，返回值只反映「null 子树被跳过」这一件事。
+	const withModel = { ...cfg, defaults: { model: "test/shared", sessionPersistence: { enabled: false } } };
+	it("省略 tasks 时 extractMemories 为 null 不抛错：跳过该任务，dream 仍在集合内", () => {
+		const c = { ...withModel, extractMemories: null } as unknown as MemoryConfig;
+		expect(modelConfigErrors(c, () => true)).toEqual([]);
+		expect(requiredModels(c).map((m) => m.task)).toEqual(["dream", "autoSurfacing"]);
+	});
+	it("省略 tasks 时 autoSurfacing 为 null 不抛错：跳过该任务，dream 仍在集合内", () => {
+		const c = { ...withModel, autoSurfacing: null } as unknown as MemoryConfig;
+		expect(modelConfigErrors(c, () => true)).toEqual([]);
+		expect(requiredModels(c).map((m) => m.task)).toEqual(["dream"]);
+	});
 });
 
 describe("taskModel", () => {
