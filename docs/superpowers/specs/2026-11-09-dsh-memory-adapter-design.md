@@ -162,6 +162,36 @@ agent loop **会 await** 的 waterfall，用户按 Esc 取消之后，循环仍�
 跑了但没选中、抛错）全部压成 `[]`（:49-67 的 `try/catch` 与 `result === null` 分支），适配层因此
 无法向用户或日志区分「召回失败」与「没有相关记忆」。pi-memory 同样受此限制。→ §9 痛点 P12。
 
+### 2.6 实现期修订：`MEMORY_TOOL_SNIPPET` 在 dsh 的落点与出现判据
+
+Task 16 审阅发现：§5.5 / §5.6 写了「`promptSnippet` → 索引 section 开头」，但**没有任何一个任务把它派下去**，
+于是 `MEMORY_TOOL_SNIPPET` 在 `dsh-memory/src/**` 里零引用。本节把落点与判据定下来。
+
+**为什么需要重新找落点**：pi 的 snippet 不在索引 section 里，它是 `ToolDefinition.promptSnippet`
+字段（`pi-memory/src/memory-tool.ts:79`），由 pi 宿主自己渲染进 system prompt —— 即 snippet 搭的是
+**工具定义**的车。dsh 的 `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`（`output` /
+`execute` 等在投影时被剥掉），投有 `description` 一个模型可见通道，而那个已经给了
+`MEMORY_TOOL_DESCRIPTION`。所以我们自己的 `memory_index` section 是唯一能把 snippet 递给模型的通道。
+
+**出现判据（本节新定，原文未写）**：snippet 出现 ⇔ **该 session 有 runtime**
+（`registry.get(sessionId) !== undefined`）。理由：那正是 `agent/created` 给该 agent 注册工具的
+条件，而 pi 的 snippet 是「工具注册了就在」。三个推论：
+
+1. 健康但**零记忆**的会话也要有 snippet（此时索引正文为空，section 就只有 snippet）——
+   这正是新项目第一次被鼓励写记忆的时机，不能因为索引还是空的就把工具说明也吐掉。
+2. **错误态**会话（`store === null`）也要有：按 D13 工具仍然注册（只是 `execute` 抛可读原因），
+   与 pi 一致。
+3. **子 agent 不要**：D9 的门禁使子 agent 根本不会得到 runtime，而全局 section 的 `text` 回调
+   查不到缓存就返回空串 —— 两个机制自然对齐，无需额外门禁。
+
+**落点：`index.ts` 的 section `text` 回调，而不是 `index-cache.ts`。** 理由：「三通道文案往哪里落」
+是宿主知识（本文自己的判据：语义相同 → core，语义随宿主而异 → 适配层），而 `index-cache` 的职责是
+「索引快照」，它必须继续对未知 session 返回 `""`。拼接规则：无 runtime → `""`；有 runtime 且索引为空
+→ 只有 snippet；两者都有 → `snippet + "\n\n" + 索引正文`。
+
+注意这**不会**改变索引正文本身：`buildIndexSection` 的输出仍逐字不动（跨宿主字节恒等仍是硬要求），
+snippet 只是在它前面。也不影响 pi：pi 继续用宿主的 `promptSnippet` 通道。
+
 ## 3. 宿主事实：pi 的原语在 dsh 里对应什么
 
 这张表是本轮全部工作量的来源。**没有一行是记忆逻辑** —— 记忆逻辑在 core 里，一行都不用重写。
@@ -391,7 +421,7 @@ ctx.systemPrompt.section({
 ```
 
   section 文本本体 = core 的 `buildIndexSection` 输出，与 pi 逐字相同（含截断标记），
-  前面拼 core 的 `MEMORY_TOOL_SNIPPET`（§5.6 的三通道说明）。
+  前面拼 core 的 `MEMORY_TOOL_SNIPPET`（三通道说明见 §5.6，出现判据见 §2.6）。
 - **子 agent 门禁**：`agent/created` 对**每个** agent 都发（子 agent 由 `dsh-subagent` 走
   `ctx.agents.create`，根 ctx 的监听器会看到全部）。不过滤的后果是每个子 agent 都触发一次
   `workingDirectory.ensure` + git 探测 + 建 store，且子 agent 每轮多付一次侧查询。pi 侧同样对子 agent
@@ -464,7 +494,7 @@ export function memoryTool(ctx: Context, rt: SessionMemoryRuntime): ToolDefiniti
 - 三通道文案（core 出口，措辞与预算由 `scripts/prompt-hygiene.ts` 把关，执行点在
   `pi-memory/tests/prompt-meta.test.ts`）在 dsh 的落点：`description` → 工具 schema（dsh 的
   `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`，`output`/`execute` 等在投影时
-  被剥掉）；`promptSnippet` → 索引 section 开头；`promptGuidelines` → **本轮无落点**
+  被剥掉）；`promptSnippet` → 索引 section 开头（**出现判据见 §2.6**）；`promptGuidelines` → **本轮无落点**
   （→ §9 痛点 P4，需要实测少了它之后 dsh 侧模型的写记忆行为是否与 pi 有可观察差异）。
 - 错误传播：core 的 handler **抛错**表达失败，dsh 也是 throw → `isError: true`，语义天然对齐。
 
