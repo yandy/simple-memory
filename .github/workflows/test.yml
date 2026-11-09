@@ -1,0 +1,87 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lockfile-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Verify package-lock.json is in sync
+        run: |
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          git diff --exit-code -- package-lock.json
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run check:host-deps
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+  # 仓内解析走 memory-core 的源码（vitest alias + tsconfig paths），所以 `test` job 测的是逻辑。
+  # 这个 job 把 alias 关掉，让 pi-memory 的测试经包 exports 打到 memory-core/dist —— 用户拿到的
+  # 那条解析路径必须被真实执行一次，否则首次发布就是它的第一次运行。
+  test-dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w memory-core
+      - run: npm test -w pi-memory
+        env:
+          MEMORY_CORE_FROM_DIST: "1"
+
+  # 20.16.0 是 memory-core 的 engines 下限（dsh 生态声明的最低宿主版本），24 是开发版本。
+  # 这个 job 只验证运行时形状，不跑 vitest：开发工具链的 Node 下限高于 engines。
+  pack-smoke:
+    strategy:
+      matrix:
+        node: ["20.16.0", "24"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w memory-core
+      - run: npm pack -w memory-core --pack-destination "$RUNNER_TEMP" --json > "$RUNNER_TEMP/pack.json"
+      - name: Assert the tarball carries dist and types, and no tests
+        run: node scripts/assert-pack-manifest.mjs "$RUNNER_TEMP/pack.json"
+      # 必须在干净目录内执行 smoke：Node 的 ESM 解析跟随脚本位置，从仓库根执行会命中仓库自己的
+      # workspace 符号链接（→ memory-core/dist），tarball 是空包也照样绿。
+      # XDG_DATA_HOME 指向临时目录：defaultMemoryRoot() 在模块加载时求值，不设就会往真实数据根写。
+      - name: Install the tarball into a clean directory and run the smoke
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke"
+          npm init -y > /dev/null
+          npm install --registry=https://registry.npmjs.org "$RUNNER_TEMP"/yandy0725-memory-core-*.tgz
+          cp "$GITHUB_WORKSPACE/scripts/pack-smoke.mjs" .
+          XDG_DATA_HOME="$RUNNER_TEMP/xdg" node pack-smoke.mjs

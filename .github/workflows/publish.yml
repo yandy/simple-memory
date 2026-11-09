@@ -1,0 +1,43 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Determine package directory
+        id: info
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          case "$TAG" in
+            memory-core-v*)
+              echo "dir=memory-core" >> "$GITHUB_OUTPUT"
+              ;;
+            pi-memory-v*)
+              echo "dir=pi-memory" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unknown release tag: $TAG (expected memory-core-v* or pi-memory-v*)" >&2
+              exit 1
+              ;;
+          esac
+
+      - run: npm ci
+
+      # memory-core 的 prepublishOnly 会先跑 build，所以 dist/ 不会来自过期产物。
+      # 顺序约束：pi-memory 的 dependencies 指向 @yandy0725/memory-core@^1.0.0，
+      # core 不在 registry 上就发 pi-memory，用户会装不上。见 docs/guides/release.md。
+      - run: npm publish --provenance --workspace=${{ steps.info.outputs.dir }}
