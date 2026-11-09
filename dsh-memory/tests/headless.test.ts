@@ -43,6 +43,17 @@ describe("createDshHeadless — 成功路径", () => {
 		expect(await port.run(baseReq())).toBe("ab");
 	});
 
+	it("ignores a text-delta whose text is not a string instead of appending 'undefined'", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "text-delta", text: undefined },
+				{ type: "text-delta", text: "ok" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("ok");
+	});
+
 	it("accumulates text block-end chunks and ignores usage/block-start", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream(
@@ -82,6 +93,32 @@ describe("createDshHeadless — 成功路径", () => {
 		};
 		const port = createDshHeadless(llm);
 		expect(await port.run(baseReq())).toBe("answer");
+	});
+
+	it("excludes reasoning text even when a text-delta lands on a reasoning block-start bucket", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "block-start", index: 0, blockType: "reasoning" },
+				{ type: "text-delta", index: 0, text: "x" },
+				{ type: "block-start", index: 1, blockType: "text" },
+				{ type: "text-delta", index: 1, text: "answer" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("answer");
+	});
+
+	it("orders by block-start first-seen, not by the order text deltas arrive", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "block-start", index: 0, blockType: "text" },
+				{ type: "block-start", index: 1, blockType: "text" },
+				{ type: "text-delta", index: 1, text: "b" },
+				{ type: "text-delta", index: 0, text: "a" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("ab");
 	});
 
 	it("concatenates multiple text blocks in first-seen order when their indices arrive out of order", async () => {
@@ -139,6 +176,32 @@ describe("createDshHeadless — 成功路径", () => {
 		expect(await port.run(baseReq())).toBe("done ");
 	});
 
+	it("reads to exhaustion, never entering the iterator.return cleanup channel, on a stop finish", async () => {
+		const llm: LlmLike = {
+			stream() {
+				const chunks: StreamChunkLike[] = [
+					{ type: "text-delta", text: "done " },
+					{ type: "finish", reason: { kind: "stop" } },
+				];
+				let i = 0;
+				return {
+					[Symbol.asyncIterator]() {
+						return {
+							next: () =>
+								Promise.resolve(i < chunks.length ? { value: chunks[i++], done: false } : { value: undefined, done: true }),
+							// 宿主 adapterStream 的 finally 在 break 时才会 await iterator.return()，
+							// 而 cleanup 失败归在 "remain thrown"（dsh-llm/lib/index.js:2381-2384）。
+							// 这里让它 reject：若实现 break，成功调用会掉进 catch 返回 null；读到流尽则不会调用。
+							return: () => Promise.reject(new Error("cleanup channel entered")),
+						};
+					},
+				};
+			},
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("done ");
+	});
+
 	it("returns an empty string (not null) for a successful round with no text", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream({ type: "finish", reason: { kind: "stop" } }),
@@ -180,6 +243,21 @@ describe("createDshHeadless — 传给 llm.stream 的入参", () => {
 		expect("tools" in opts).toBe(false);
 		expect("sessionId" in opts).toBe(false);
 		expect("system" in opts).toBe(false);
+	});
+
+	it("omits the reasoningEffort key entirely when req.effort is undefined", async () => {
+		const captured: unknown[] = [];
+		const llm: LlmLike = {
+			stream(opts) {
+				captured.push(opts);
+				return emptyStream();
+			},
+		};
+		const port = createDshHeadless(llm);
+		await port.run(baseReq({ task: "no effort" }));
+		expect(captured).toHaveLength(1);
+		const opts = captured[0] as Record<string, unknown>;
+		expect("reasoningEffort" in opts).toBe(false);
 	});
 
 	it("forwards the caller's signal through unchanged", async () => {
@@ -285,6 +363,21 @@ describe("createDshHeadless — signal", () => {
 		const port = createDshHeadless(llm);
 		expect(await port.run(baseReq({ signal: controller.signal }))).toBeNull();
 	});
+
+	it("returns null on the next chunk when the signal aborts but the stream ignores it", async () => {
+		const controller = new AbortController();
+		const llm: LlmLike = {
+			async *stream() {
+				yield { type: "text-delta", text: "x" };
+				controller.abort();
+				// 一个不理会 signal 的流：abort 后继续 yield，永不结束。
+				yield { type: "text-delta", text: "y" };
+				yield { type: "text-delta", text: "y" };
+			},
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq({ signal: controller.signal }))).toBeNull();
+	});
 });
 
 describe("createDshHeadless — timeout", () => {
@@ -336,6 +429,58 @@ describe("createDshHeadless — timeout", () => {
 			};
 			const port = createDshHeadless(llm);
 			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toBe("ok");
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("clears its timer after a terminal error finish", async () => {
+		vi.useFakeTimers();
+		try {
+			const llm: LlmLike = {
+				stream: chunkStream({ type: "finish", reason: { kind: "error" } }),
+			};
+			const port = createDshHeadless(llm);
+			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toBeNull();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("clears its timer when llm.stream throws", async () => {
+		vi.useFakeTimers();
+		try {
+			const llm: LlmLike = {
+				stream() {
+					throw Object.assign(new Error("auth failed"), { code: "AUTH" });
+				},
+			};
+			const port = createDshHeadless(llm);
+			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toBeNull();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("clears its timer after a timeout abort", async () => {
+		vi.useFakeTimers();
+		try {
+			const llm: LlmLike = {
+				async *stream(opts) {
+					await new Promise<void>((resolve) => {
+						if (opts.signal?.aborted) return resolve();
+						opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+					});
+					yield { type: "finish", reason: { kind: "aborted" } };
+				},
+			};
+			const port = createDshHeadless(llm);
+			const pending = port.run(baseReq({ timeoutMs: 30_000 }));
+			await vi.advanceTimersByTimeAsync(30_000);
+			expect(await pending).toBeNull();
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();
