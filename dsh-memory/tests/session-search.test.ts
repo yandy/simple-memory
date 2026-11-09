@@ -231,8 +231,10 @@ describe("createSessionSearch", () => {
 	});
 
 	it("caps the output body at 50000 bytes (the byte arm of truncateForInjection)", async () => {
-		// 5 个命中，每个命中拿满 ±50 的上下文窗口（101 行 × 202 字节 ≈ 20 KB），合计 ≈ 102 KB ——
-		// 足以触发按字节削的 50000 上限（2000 行的那一臂在 maxMatches: 5 下到不了）。
+		// 5 个命中，每个命中拿满 ±50 的上下文窗口（101 行）。每行是两个空格缩进 + 截到 200 字符
+		// 的消息文本：本例文本长 191–192 字符，即约 193–194 字节/行，每个命中约 19.5 KB，5 个合计
+		// 约 98 KB（实测 97538 字节）—— 足以触发按字节削的 50000 上限（2000 行的那一臂
+		// 在 maxMatches: 5 下到不了）。
 		const events: Array<{ type: string; data: unknown }> = [];
 		for (let region = 0; region < 5; region++) {
 			for (let i = 0; i < 50; i++) events.push(userMessage(`before-${region}-${i} ${"x".repeat(180)}`));

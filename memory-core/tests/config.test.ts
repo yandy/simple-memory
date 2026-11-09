@@ -394,7 +394,7 @@ describe("taskModel", () => {
 });
 
 describe("mergeConfig", () => {
-	it("深合并、跳过 undefined、数组整体替换、不改 base", () => {
+	it("深合并、跳过 undefined 值、保留同层其它键、不改写 base", () => {
 		const base = DEFAULT_CONFIG;
 		const out = mergeConfig(base, {
 			memIndexMaxLines: 99,
@@ -412,12 +412,18 @@ describe("mergeConfig", () => {
 	});
 	it("与 loadConfigFrom 读同一份 JSON 的结果逐字相等", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "mergecfg-"));
-		const file = join(dir, "memory.json");
-		const overlay = { memIndexMaxBytes: 1234, autoSurfacing: { enabled: false, maxFiles: 2 } };
-		await writeFile(file, JSON.stringify(overlay));
-		const viaFile = await loadConfigFrom([file]);
-		const viaMerge = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
-		expect(viaMerge).toEqual(viaFile);
+		try {
+			const file = join(dir, "memory.json");
+			const overlay = { memIndexMaxBytes: 1234, autoSurfacing: { enabled: false, maxFiles: 2 } };
+			await writeFile(file, JSON.stringify(overlay));
+			const viaFile = await loadConfigFrom([file]);
+			const viaMerge = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
+			expect(viaMerge).toEqual(viaFile);
+		} finally {
+			// 本文件顶部的 afterEach 只清它自己建的两个目录；这里自建的临时目录要自己清，
+			// 否则断言失败时会在 tmpdir 里留下一堆 mergecfg-* 目录。
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -425,7 +431,8 @@ describe("EffortLevel", () => {
 	it("EffortLevel 接受宿主的任意档位，ThinkLevel 是它的别名", () => {
 		const dshEffort: EffortLevel = "max"; // dsh 的 DeepSeek 路线档位，旧 ThinkLevel 表达不出
 		const piEffort: ThinkLevel = dshEffort; // 双向可赋值 = 同一类型
-		expect([dshEffort, piEffort]).toEqual(["max", "max"]);
+		const back: EffortLevel = piEffort; // ← 另一个方向，上面那句注释才是真的
+		expect([dshEffort, piEffort, back]).toEqual(["max", "max", "max"]);
 	});
 });
 
@@ -433,8 +440,13 @@ describe("公开出口", () => {
 	it("带上 1.1.0 的三个加法", async () => {
 		const api = await import("../src/index.js");
 		expect(typeof api.mergeConfig).toBe("function");
-		expect(api.requiredModels.length).toBeGreaterThanOrEqual(1); // tasks 是可选参，不计入 length
-		expect(api.modelConfigErrors.length).toBeGreaterThanOrEqual(2);
+		// 精确钉住形参个数（而不是 `toBeGreaterThanOrEqual`：它对多一个或少一个形参都报绿）。
+		// 注：`Function.length` 数的是「第一个带默认值/剩余参之前」的形参，TS 的可选参 `tasks?`
+		// 编译后就是普通形参，**计入** length：requiredModels(cfg, tasks?) = 2，
+		// modelConfigErrors(cfg, resolve, tasks?) = 3。「tasks 仍是可选」由类型系统钉：
+		// 本文件与 dsh-memory 都有省略它的调用，它一旦变必传那些调用就编译不过。
+		expect(api.requiredModels.length).toBe(2);
+		expect(api.modelConfigErrors.length).toBe(3);
 		// EffortLevel 是类型导出，运行时没有对应值：从入口做类型导入能编译通过，即证明
 		// index.ts 的 `export type { EffortLevel }` 真的把它放上了公开面。
 		const fromIndex: EffortLevelFromIndex = "max";

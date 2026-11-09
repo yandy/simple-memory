@@ -61,7 +61,7 @@ function rowConfig(): Record<string, unknown> {
 
 /** core 对一份目录会用到的 MemoryStore 构造参数（与 dsh 的 store-registry 同一套默认值窗口）。 */
 function storeConfig(memoryDir: string) {
-	const cfg = mergeConfig(structuredClone(DEFAULT_CONFIG), { memoryDir: root });
+	const cfg = mergeConfig(structuredClone(DEFAULT_CONFIG), { memoryDir });
 	return {
 		memoryDir,
 		indexMaxLines: cfg.memIndexMaxLines,

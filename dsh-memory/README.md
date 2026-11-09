@@ -56,8 +56,13 @@ dsh plugin --profile web add file:/abs/path/to/dsh-memory
 `<spec>` 现在是本地目录（本包 `private: true`、版本 `0.0.0`，尚未发布）；将来发布后换成包名
 `@yandy0725/dsh-memory`。装完重启 dsh 生效。
 
-改代码后的开发回路：重新 `npm run build -w dsh-memory` 然后重启 dsh。卸载一条命令即可，同时摘掉
-`dependencies` 与 `dsh.profile.bundles` 两处：
+改代码后的开发回路：重新 `npm run build -w dsh-memory` 然后重启 dsh。
+
+> **限定**：这条回路假定安装是**软链**的（即 pnpm 把 `file:` 目录依赖当链接而不是拷贝处理）。
+> 这一点**尚未在真宿主上核实**；若实际是拷贝安装，每次改完代码都得重新跑一次 `dsh plugin … add`（或等价的
+> 重装命令）才能看到新产物，单重启不够。
+
+卸载一条命令即可，同时摘掉 `dependencies` 与 `dsh.profile.bundles` 两处：
 
 ```sh
 dsh plugin --profile web remove @yandy0725/dsh-memory
@@ -158,7 +163,7 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 
 ## 验证状态
 
-单元测试与跨 harness 共享测试全绿（dsh-memory `206 passed`，memory-core `489 passed | 4 skipped`，
+单元测试与跨 harness 共享测试全绿（dsh-memory `227 passed`，memory-core `489 passed | 4 skipped`，
 pi-memory `200 passed`）。**尚未对真实运行的宿主验证**：装进真实 dsh profile 的端到端、以及召回消息
 用 `form: "notice"` 时正文是否确实进模型（单测只钉住了「消息的 content 含完整正文、summary 是短摘要」，
 真宿主行为待后续任务确认）。别把这两样当成已验证。

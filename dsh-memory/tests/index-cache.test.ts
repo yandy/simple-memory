@@ -75,18 +75,22 @@ describe("createIndexCache", () => {
 		expect(cache.lastError("nope")).toBeNull();
 	});
 
-	it("passes core's output through byte-identically, leaving {{x}} untouched", async () => {
+	it("passes core's index output through byte-identically, leaving an entry name's {{x}} untouched", async () => {
 		const memoryDir = join(dir, "mem");
 		const store = makeStore(memoryDir);
 		const rt = makeRuntime(memoryDir, store);
 		const cache = createIndexCache();
 
+		// `buildIndexSection` 只输出索引行（名字 + description），所以真正走到 `read()` 的 `{{x}}`
+		// 是条目的**名字**，不是正文（正文从不进索引）。钉住的属性是：core 输出什么就透传什么，
+		// 不做二次转义 —— 宿主渲染器的 `{{...}}` 插值由 section 的 `interpolate: false` 关掉。
 		await store.addEntry({ name: "{{x}}", description: "brace template", body: "body {{x}}" });
 		await cache.refresh(rt);
 
 		const expected = await buildIndexSection(store, rt.config.memIndexInjectMaxLines, rt.config.memIndexInjectMaxBytes);
 		expect(cache.read("s1")).toBe(expected);
 		expect(cache.read("s1")).toContain("{{x}}");
+		expect(cache.read("s1")).not.toContain("body {{x}}");
 	});
 
 	it("keeps the previous value and records the error when a refresh fails", async () => {
