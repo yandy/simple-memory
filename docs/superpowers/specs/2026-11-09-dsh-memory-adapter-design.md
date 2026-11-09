@@ -521,8 +521,9 @@ export function memoryTool(ctx: Context, rt: SessionMemoryRuntime): ToolDefiniti
 - 三通道文案（core 出口，措辞与预算由 `scripts/prompt-hygiene.ts` 把关，执行点在
   `pi-memory/tests/prompt-meta.test.ts`）在 dsh 的落点：`description` → 工具 schema（dsh 的
   `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`，`output`/`execute` 等在投影时
-  被剥掉）；`promptSnippet` → 索引 section 开头（**出现判据见 §2.6**）；`promptGuidelines` → **本轮无落点**
-  （→ §9 痛点 P4，需要实测少了它之后 dsh 侧模型的写记忆行为是否与 pi 有可观察差异）。
+  被剥掉）；`promptSnippet` 与 `promptGuidelines` → **都落进索引 section**，顺序为
+  snippet → guidelines → 索引正文，出现判据与该 session 是否有 runtime 绑定（**见 §2.6 与 §2.7**）。
+  三通道因此全部有落点，§9 痛点 P4 已结案。
 - 错误传播：core 的 handler **抛错**表达失败，dsh 也是 throw → `isError: true`，语义天然对齐。
 
 `/memory` 命令：
