@@ -1,0 +1,12 @@
+{
+	"extends": "../tsconfig.base.json",
+	"compilerOptions": {
+		"target": "ES2024",
+		"lib": ["ES2024"],
+		"types": ["node"],
+		"paths": {
+			"@yandy0725/memory-core": ["../memory-core/src/index.ts"]
+		}
+	},
+	"include": ["src/**/*.ts", "tests/**/*.ts"]
+}
