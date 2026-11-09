@@ -192,6 +192,33 @@ Task 16 审阅发现：§5.5 / §5.6 写了「`promptSnippet` → 索引 section
 注意这**不会**改变索引正文本身：`buildIndexSection` 的输出仍逐字不动（跨宿主字节恒等仍是硬要求），
 snippet 只是在它前面。也不影响 pi：pi 继续用宿主的 `promptSnippet` 通道。
 
+### 2.7 实现期修订：`MEMORY_TOOL_GUIDELINES` 也落进同一个 section
+
+本节由终审引出。§9 的痛点 P4 原本写着「guidelines 在 dsh 没有落点」，但这个理由**已被 §2.6 自己推翻**：
+既然 `memory_index` section 是一个可用的模型可见通道、且 snippet 已经落在那里，guidelines 同样能落，
+而且不需要改 core、不需要改 prompt 文本、不碰用户契约（落的**位置**是适配层的事，文本本身逐字不动）。
+
+实测三通道字数（从 `memory-core/dist` 读）：`description` **522**、`snippet` **58**、`guidelines` **1143**（7 条）。
+只落前两个意味着 dsh 只发了 core 提示词契约的 580/1723 = **34%**，而 pi 的三通道预算是 2750 字符。
+
+**裁定：guidelines 也落进 `memory_index` section，出现判据与 snippet 完全相同（该 session 有 runtime）。**
+三条理由：
+
+1. **记忆目录是共享的，所以写入质量是跳宿主的。** guidelines 管的正是写入质量（「description 必须自足」
+   及其正反例：Bad: "Debugging tips" / Good: "staging SSH listens on 2222, not 22"）。dsh 会话写出含糊的
+   description，会**连带降低 pi 会话的召回质量** —— 这是跨宿主损害，不是 dsh 单方面的风格选择，
+   而 P4 原本的框定没提到这一层。
+2. **pi 三通道全发**，对齐才符合 D14 的同语义原则。
+3. **成本很小且可缓存**：约 1143 字符 ≈ 300 token，而且是 section 里的**静态**文本（能被 prompt cache
+   命中），相对于索引本身最多 16KB 的注入预算占比很小。
+
+公平地说反面：`MEMORY_TOOL_DESCRIPTION` 已经携带了其中最重要的那一条规则（「A memory's description is
+the only text a future session sees when deciding relevance, so it must be self-contained」），所以这是一个
+**质量差距而不是空洞**。如果用户更在意那 300 token，删掉它是一行的事 —— 所以这条裁定已明确报给用户。
+
+拼接顺序固定为：`snippet` → `guidelines` → 索引正文（与 pi 把两者都放 system prompt 、工具描述另走的
+布局等价），分隔用空行。无 runtime 时仍返回 `""`，索引正文仍逐字不动。
+
 ## 3. 宿主事实：pi 的原语在 dsh 里对应什么
 
 这张表是本轮全部工作量的来源。**没有一行是记忆逻辑** —— 记忆逻辑在 core 里，一行都不用重写。
@@ -748,7 +775,7 @@ P1 / P2 / P11 已定为**本轮就修**（core 1.1.0 的三个加法，见 §2.1
 | **P1** | `loadConfigFrom(files)` 只接受**文件列表**，`deepMerge` 是私有函数 | dsh 的唯一配置层是内存里的行 `config:` 对象，没有文件 | **本轮修（§2.1）**：core 导出纯函数 `mergeConfig(base, overlay)`，并让 `loadConfigFrom` 内部改用它（合并语义只有一份）。dsh 侧因此不需要自写 deep-merge | **下一轮**：按用户定的「core 只提供默认值、不管理配置」把文件 IO 也下放 —— `loadConfigFrom` 标记废弃或移除，适配层自己读文件再调 `mergeConfig`（对 pi-memory 是破坏性变更，要走独立 spec） |
 | **P2** | `ThinkLevel` 是 pi 的闭枚举（`off\|minimal\|low\|medium\|high\|xhigh`） | dsh 的 DeepSeek 路线合法档位是 `off\|low\|high\|max` —— **`max` 在 core 的类型里表达不出来**；pi-ai 路线又是另一套（含 `xhigh`）。合法值在 dsh 里是 **per-route 的数据**，不是枚举 | **本轮修（§2.1）**：新增 `export type EffortLevel = string`，`ThinkLevel` 降为它的别名；已核实 pi-memory 的 typecheck 不受影响（它交给 SDK 的边界本来就是 cast） | **下一轮**：配置**键名** `thinkLevel` 也是 pi 词汇（dsh 叫 `reasoningEffort`），但它是用户契约，改名要迁移说明；与 P6（`sessionPersistence`）、P7（`MEMORY_TOOL_LABEL`）一起做 |
 | **P3** | 索引注入的「异步刷新 + 同步读」缓存没有抽象 | pi 用 186 行（`index-source.ts`）实现冻结 + 回放录制值；dsh 因为 `section.text` 必须同步，也要一份同样的缓存，但刷新时机完全不同 | 适配层各写一份 | core 提供 `createIndexSnapshot({ refresh, read })`，把「刷新时机」留给适配层，把「截断 + 净化 + 空值语义」收进来 |
-| **P4** | 三通道文案（`description` / `promptSnippet` / `promptGuidelines`）假设宿主有三个落点 | dsh 的 `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`，`output`/`execute` 等在投影时被剥掉 → guidelines 没有落点 | snippet 进索引 section 开头，guidelines 本轮不落 | 需要实测：少了 guidelines 之后 dsh 侧模型的写记忆行为是否与 pi 有可观察差异。若有，考虑把 guidelines 折进 snippet（**这是改 prompt 文本，属用户契约，要独立 spec**） |
+| **P4** | 三通道文案（`description` / `promptSnippet` / `promptGuidelines`）假设宿主有三个落点 | dsh 的 `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`，`output`/`execute` 等在投影时被剥掉 → 宿主侧只有 `description` 一个模型可见通道 | **已解决（实现期，见 §2.6 与 §2.7）**：三个通道全部落地 —— `description` 进工具 schema，`promptSnippet` 与 `promptGuidelines` 进 `memory_index` section | ~~需要实测~~ —— 本条原记的理由（「guidelines 没有落点」）已被 §2.6 自己推翻：既然 section 是一个可用的模型可见通道且 snippet 已落在那里，guidelines 同样能落，且不需改 core、不需改 prompt 文本。**剩下的真问题不是落点而是预算**：三通道共 1723 字符（description 522 / snippet 58 / guidelines 1143），而 pi 的三通道预算是 2750；若将来要缩，应作为一个独立的 prompt 预算决策来做（属用户契约，要独立 spec） |
 | **P5** | 宿主想要 schema 化的配置（dsh 的 schemastery `Config`、pi 的 typebox），而 core 的配置是纯 JSON | 导出 `Config` 就要运行时 import `@deepseek-ai/schemastery`，与「零宿主 import」冲突 | 不导出，自己校验行 config，放弃免费 Settings UI | core 提供一份**纯 JSON Schema** 的配置描述（就像 `memoryToolSchema()` 那样），由适配层转成宿主的 schema DSL |
 | **P6** | `SessionPersistenceConfig` 是 pi `AgentSession` 的旋钮，却出现在共享配置契约与 `HeadlessRunRequest` 里 | dsh 没有对应旋钮，只能忽略 | 忽略 | 挪进「宿主自有扩展位」（如 `host?: Record<string, unknown>`），共享契约里只留中立字段 |
 | **P7** | `MEMORY_TOOL_LABEL` 的注释自己写着「pi 的 UI 标签…其他宿主没有对应通道时忽略即可」 | dsh 的工具没有 label 通道（`presentCall` 是 Host-local、Web 客户端明确忽略） | 不用 | 标注为 pi 专属，或从 core 公开面移走 |
@@ -757,6 +784,7 @@ P1 / P2 / P11 已定为**本轮就修**（core 1.1.0 的三个加法，见 §2.1
 | **P10** | core 假设「一个会话一个固定 cwd」（`resolveMemoryDir(cfg, cwd)` 调一次） | dsh 的 cwd 运行期可变（`ctx.workingDirectory.set()` + durable `working-directory/change`），且 web app 会话的初始 cwd 往往是通用 default-workspace 而不是项目目录 | `agent/created` 时解析一次当作会话权威（与 pi 对等），`/memory` 打印 `Dir` 让用户能发现不一致 | 下一轮（extract / dream）之前重新评估：要不要支持「cwd 变化 → 换 store」，以及 default-workspace 这种「不是项目」的 cwd 该落到 `local/<escaped-path>` 的哪个键上 |
 | **P11** | `requiredModels()` 恒包含 `dream` | dsh 本轮不实现 dream，照抄就会要求用户配一个永远用不到的 `dream.model`，否则整个记忆层是暗的 | **本轮修（§2.1）**：`requiredModels` / `modelConfigErrors` 各加一个可选 `tasks` 参，缺省行为逐字不变；dsh 传 `["autoSurfacing"]`。「失败只降级该模块而不进全局错误态」仍是适配层的职责（D13） | 无（修完即毕）。可考虑进一步把「适配层实现了哪些任务」变成注册式声明，但那要等第三个宿主出现才知道对不对 |
 | **P12** | `runSideQuery` 把三种语义完全不同的结果压成同一个 `[]` | `orchestration/surfacing.ts:49-67`：`try { … if (result === null) return []; return parseSelectedFiles(…) } catch { return [] }` —— 宿主拒绝/超时、「跑了但没选中」、抛错，对适配层完全不可区分。后果：适配层无法向用户或日志报「召回失败了」，只能静默当「没相关记忆」。pi-memory 同样受此限制（它的 catch 只能包住自己的代码） | 本轮不改（只记录）。dsh 侧的 `deps.warn` 因此只能盖住 `scanEntries` / `renderSurfacedBlock` 这类适配层自己的失败 | 返回 `{ selected, outcome: "ok" \| "skipped" \| "error" }`，或让端口错误上抛由适配层决定。注意这是**行为**变更，会影响 pi-memory 的现有用例，要走独立 spec |
+| **P13** | `MemoryHandlerDeps.searchSessions(cwd, query, cfg)` 的签名里**没有 signal**，适配层想传也传不了 | `memory search scope=sessions` 跑在工具的 `execute` 里，一次可能读多达 10 个 zstd 解码的完整会话日志（`session-search.ts:184-201`），而它**完全不可取消**：`memory-tool.ts` 只能忽略 `exec.signal`。这也与宿主文档冲突：`dsh-tools/lib/types/contracts.d.ts:28-31` 要求「Async work must observe or forward `exec.signal` and settle only after its owned work reaches quiescence」 | 本轮不改。影响是**有界**的（确实会 settle，不会挂死），后果仅是 Esc 之后浪费一些 CPU/IO，与 P12 不同量级 | 给 `searchSessions` 加可选 `signal?: AbortSignal`（TS 的参数双变性使 pi-memory 现有的三参实现仍可赋值，所以是纯加法），并把 `exec.signal` 从 `createMemoryActionHandler` 透传下来。**应与 P12 一起设计** —— 两者都是「core 的端口签名缺少适配层需要的取消/结果词汇」，分两次改同一处签名是浪费 |
 
 ## 10. 备选方案（已排除）
 
@@ -805,7 +833,7 @@ SQLite 索引（磁盘与隐私面），而且会让 dsh 的召回强于 pi —�
   `delegationDepth` 为辅；**不得用 `parentSession`**。
 - `/memory` 状态块的确切行序与措辞（§5.6 给的是口径，不是逐字文案）。
 - 单测的具体用例切分，但下列几条是**必须**有的：
-  1. `dist/` 里零 `@deepseek-ai` 命中（D2 的执行点）；
+  1. `dist/` 里零 `@deepseek-ai` 命中（D2 的执行点）—— **这一条落在 CI 而不是单测**（它需要先 build，见 §6 的 `.github/workflows/test.yml` 行）；§11 旧版把它列为单测是错的，已修正；
   2. `interpolate: false` 下正文含 `{{x}}` 原样输出；
   3. `execute` 的返回值**深度**无 `undefined`；
   4. 两个不同 cwd 的 agent 各写各的目录；
