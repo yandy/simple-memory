@@ -67,6 +67,7 @@ section 里能看到、`memory` 工具能读到；反向同样成立。（`memor
 | **导出纯函数 `mergeConfig`** | `export function mergeConfig(base: MemoryConfig, overlay: unknown): MemoryConfig` | 把 `config.ts` 里**已有的私有** `deepMerge` 提出来导出，并让 `loadConfigFrom` 内部改用它 —— 合并语义只有一份，不可能漂移。跳过 `undefined`、plain object 递归、数组整体替换的语义逐字不变 |
 | **思考档位类型变不透明** | `export type EffortLevel = string`（新增，中立名）；`export type ThinkLevel = EffortLevel`（保留别名） | 闭枚举 → `string` 是放宽，core 里**没有**任何 exhaustive switch。保留 `ThinkLevel` 别名是为了 `pi-memory/src/config.ts:29` 的重导出与已发布的 3.0.0 不破。pi-memory 的 typecheck 已核实不会变红：它交给 pi SDK 的边界本来就是 cast（`agent-runner.ts:95` 是 `thinkingLevel: opts.thinkLevel as any`，`:204` 是 `req.effort as ThinkLevel \| undefined`）。**配置键名 `thinkLevel` 不动**（那是用户契约，改名要迁移说明），只改类型 —— 键名的 pi 词汇归下一轮 |
 | **校验可指定任务集合** | `requiredModels(cfg, tasks?: readonly ModelTask[])` 与 `modelConfigErrors(cfg, resolve, tasks?: readonly ModelTask[])` 各加一个可选第三/第二参 | 缺省行为不变（仍走 `requiredModels(cfg)` 那个「dream 恒在集合内」的规则）；传了 `tasks` 就只校验这些任务。dsh 传 `["autoSurfacing"]`。**修订注（实现期裁定，见下）**：缺省路径上有一处已裁定的行为变更 —— 用户写了 `"extractMemories": null` 时，旧行为是抛 `TypeError`，新行为是跳过该任务 |
+| **侧查询可传 abort signal**（实现期新增，见 §2.5） | `RunSideQueryOpts` 加可选 `signal?: AbortSignal`，`runSideQuery` 把它透传给端口的 `HeadlessRunRequest.signal` | 端口本来就声明了 `signal?`（`orchestration/ports.ts:29`），但 `runSideQuery`（`orchestration/surfacing.ts:49-62`）从不设它，所以宿主那一轮的取消信号传不进去。因为 core 把侧查询的 `timeoutMs` 写死为 `30_000`，而适配层是在宿主**会 await** 的 `agent/pre-step` waterfall 里调它的，不传 signal 就意味着用户取消后仍可能卡住 30 秒。可选字段 = 纯加法，pi-memory 不传就是 undefined，零影响 |
 
 发布顺序按 `docs/guides/release.md`：`npm version 1.1.0 --workspace=memory-core --no-git-tag-version`
 → 同时 add `memory-core/package.json` 与 `package-lock.json` → push → `gh release create
@@ -137,6 +138,30 @@ Task 13 审阅时发现本文初版对 §5.8 的两处描述不够严，已修�
 这两条与 §2.3 的四条同源：都是「看上去合理的宿主描述」与「宿主实际行为」的差。区别在于：
 §2.3 的四条是事实错误，本节两条是**约束自身不自洽 / 不够精确**。
 
+### 2.5 实现期修订：core 需要第四个加法（侧查询的 abort signal）
+
+Task 14 的审阅发现本文 §3 第 8 行的一句声称是**做不到的**：「侧查询挂在 pre-step 的 `signal` 上，
+随 turn 取消」。事实是：
+
+- core 的 `HeadlessRunRequest` **声明了** `signal?: AbortSignal`（`orchestration/ports.ts:29`），
+  dsh 的端口实现（`dsh-memory/src/headless.ts`）也真的组合并兜它；
+- 但 `RunSideQueryOpts`（`orchestration/surfacing.ts:6-21`）**没有 signal 字段**，
+  `runSideQuery`（:49-62）也从不设 `HeadlessRunRequest.signal`；
+- 而 `runSideQuery` 把 `timeoutMs` 写死为 `30_000`（:57）。
+
+所以适配层拿到的端口根本没机会收到宿主那一轮的取消信号。后果是具体的：`agent/pre-step` 是宿主
+agent loop **会 await** 的 waterfall，用户按 Esc 取消之后，循环仍会被一次已经没人要结果的侧查询
+占住最多 30 秒 —— 这正是本模块「绝不能拖垮一轮」承诺的反面。
+
+**裁定：给 core 加第四个纯加法** —— `RunSideQueryOpts.signal?: AbortSignal`，并由 `runSideQuery`
+透传给端口。理由：（1）可选字段，对 pi-memory 零影响（不传就是 undefined，而端口本来就声明了它）；
+（2）core 1.1.0 **尚未发布**，现在加几乎零成本，等发布后再加就要再走一次发布流程与顺序门；
+（3）不加的代价是用户可见的 30 秒卡顿。§3 第 8 行已按此修订。
+
+同时记录一条相关但**本轮不改**的事实：`runSideQuery` 把三种语义完全不同的结果（宿主拒绝/超时、
+跑了但没选中、抛错）全部压成 `[]`（:49-67 的 `try/catch` 与 `result === null` 分支），适配层因此
+无法向用户或日志区分「召回失败」与「没有相关记忆」。pi-memory 同样受此限制。→ §9 痛点 P12。
+
 ## 3. 宿主事实：pi 的原语在 dsh 里对应什么
 
 这张表是本轮全部工作量的来源。**没有一行是记忆逻辑** —— 记忆逻辑在 core 里，一行都不用重写。
@@ -150,7 +175,7 @@ Task 13 审阅时发现本文初版对 §5.8 的两处描述不够严，已修�
 | 5 | `pi.registerCommand("memory", {handler})` | `ctx.commands.register({name, description, input?, handler})`，`name` 须匹配 `/^[a-z][a-z0-9_-]*$/`（不带斜杠），handler 收 `{commandId, agent, rawInput, attachments, signal}`，返回 `{kind:"success", text?}` 或 `{kind:"error", text}` | `/memory` 直接可用。`unlock` 的确认：命令 handler **不在 turn 里**，`ctx.approval.request()` 会拒；改用「必须显式写 `unlock --force`」（§5.6） |
 | 6 | `SessionManager.list(cwd)` + 直接读 jsonl | `ctx.sessionQuery`（`listSessions` / `readSession` / `filterEvents` / `observeSession` 都可用），但**全文搜索默认关**：`dsh-base/cordis.patch.yml:149-161` 把 `session-query-sqlite` 配成 `openAt: never` + `path: ':memory:'`，`searchSessions()` 直接抛 `SESSION_QUERY_SEARCH_DISABLED` | D14：自己扫，不碰宿主配置 |
 | 7 | `event.messages` 就是 `{role, content, toolCalls}` | session **events**（`user/message` / `assistant/message` / `tool/call` / `tool/result`），且**多数 `user/message` 是合成的**，要靠 `source.kind` 区分（`'user'` 才是真人） | 本轮只需要「取本轮真人 prompt」（`agent/pre-step` 的 `messages` 已经是被 claim 的 user messages，再按 `source.kind === "user"` 过一遍）；events → `ExtractMessage` 的映射留给下一轮 |
-| 8 | `session_shutdown` 等在途任务收尾 | SIGTERM 后 **5 秒硬退**（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5000`），第二个信号立即 `process.exit()` | 本轮没有在途 LLM 写任务（侧查询挂在 pre-step 的 `signal` 上，随 turn 取消），所以不受影响；下一轮 dream 必须用 `ctx.jobs` 的 unowned job + 锁的同步 `cancel()` 钩子 |
+| 8 | `session_shutdown` 等在途任务收尾 | SIGTERM 后 **5 秒硬退**（`PROCESS_SHUTDOWN_TIMEOUT_MS = 5000`），第二个信号立即 `process.exit()` | 本轮没有在途 LLM **写**任务（侧查询不写盘，不会留下 `.lock`），所以硬退不造成数据损坏。侧查询靠 `RunSideQueryOpts.signal`（§2.1 第四个加法）挂到 pre-step 的 signal 上随 turn 取消，并在 await 之后复检 abort；注意宿主 5 秒硬退仍短于 core 写死的 30 秒超时，退出时仍可能在途（可接受）。下一轮 dream 必须用 `ctx.jobs` 的 unowned job + 锁的同步 `cancel()` 钩子 |
 | 9 | model id 字符串 + `ThinkLevel`（pi 的 6 档枚举） | `{provider, model}` 两段 + `reasoningEffort`（**合法值是 per-route 的数据**，不是枚举：DeepSeek 路线 `off\|low\|high\|max`，pi-ai 路线 `off\|minimal\|low\|medium\|high\|xhigh\|max`） | D12 + D13。core 1.1.0 把档位类型放宽成不透明的 `EffortLevel = string`（§2.1），所以 `max` 能过 typecheck；合法值由适配层的启动期 `resolveCallConfig` 校验 |
 | 10 | `ctx.cwd`（一个 session 固定不变） | 没有 `ctx.cwd` / `ctx.workspace`。用 `ctx.workingDirectory.get(session)`（同步）或 `.ensure(agent, signal)`（带校验，first-party 用法）；另有不可变的 `agent.session.header.cwd`（原始项目目录）。**而且 dsh 的 cwd 是运行期可变的**（`ctx.workingDirectory.set()` + durable `working-directory/change`） | `agent/created` 时解析一次，作为该会话的权威（与 pi 对等）；不订阅 `working-directory/change`。`/memory` 打印解析出的 `Dir`，让用户能发现不一致 → §9 痛点 P10 |
 | 11 | `pi.extensions: ["./index.ts"]`，宿主剥类型 | bundle 形态：`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`；in-tree 包**全部**发编译后的 `lib/index.js` + `lib/types/**/*.d.ts`。bundle 必须出现在 profile 的 `dsh.profile.bundles` 列表里才会被 compose，而**`dsh plugin --profile <p> add <spec>` 会自动写这个列表**：`dsh-plugin-manager/lib/types/operations.js:101-135` 在包管理操作之后 reconcile bundles（新装且声明了 `dsh.bundle.patch` 的依赖被 push 进去并写回 manifest，移除时同样过滤掉）；`dsh-app-boot` 的 `reconcileProfilePlugins` 文档原文即「New bundle dependencies activate automatically」。本机 `web` profile 里的 `dsh-web-fetch-http-fakeip` 就是这个路径的活证据（同时出现在 `dependencies` 与 `dsh.profile.bundles`，而安装只用了一条 `dsh plugin add`） | D2 + D11；安装与开发回路见 §7.1 |
@@ -701,6 +726,7 @@ P1 / P2 / P11 已定为**本轮就修**（core 1.1.0 的三个加法，见 §2.1
 | **P9** | `neutrality.test.ts` 只查 import 说明符与仓内坐标，**不查词汇** | P2 / P6 / P7 这类 pi 词汇泄漏今天没有任何门禁拦得住 | 无 | 加一条词汇扫描（core 的 `src/**` 里出现宿主专有名词就红），或改成「公开面上每个宿主味符号必须有中立替代」的清单测 |
 | **P10** | core 假设「一个会话一个固定 cwd」（`resolveMemoryDir(cfg, cwd)` 调一次） | dsh 的 cwd 运行期可变（`ctx.workingDirectory.set()` + durable `working-directory/change`），且 web app 会话的初始 cwd 往往是通用 default-workspace 而不是项目目录 | `agent/created` 时解析一次当作会话权威（与 pi 对等），`/memory` 打印 `Dir` 让用户能发现不一致 | 下一轮（extract / dream）之前重新评估：要不要支持「cwd 变化 → 换 store」，以及 default-workspace 这种「不是项目」的 cwd 该落到 `local/<escaped-path>` 的哪个键上 |
 | **P11** | `requiredModels()` 恒包含 `dream` | dsh 本轮不实现 dream，照抄就会要求用户配一个永远用不到的 `dream.model`，否则整个记忆层是暗的 | **本轮修（§2.1）**：`requiredModels` / `modelConfigErrors` 各加一个可选 `tasks` 参，缺省行为逐字不变；dsh 传 `["autoSurfacing"]`。「失败只降级该模块而不进全局错误态」仍是适配层的职责（D13） | 无（修完即毕）。可考虑进一步把「适配层实现了哪些任务」变成注册式声明，但那要等第三个宿主出现才知道对不对 |
+| **P12** | `runSideQuery` 把三种语义完全不同的结果压成同一个 `[]` | `orchestration/surfacing.ts:49-67`：`try { … if (result === null) return []; return parseSelectedFiles(…) } catch { return [] }` —— 宿主拒绝/超时、「跑了但没选中」、抛错，对适配层完全不可区分。后果：适配层无法向用户或日志报「召回失败了」，只能静默当「没相关记忆」。pi-memory 同样受此限制（它的 catch 只能包住自己的代码） | 本轮不改（只记录）。dsh 侧的 `deps.warn` 因此只能盖住 `scanEntries` / `renderSurfacedBlock` 这类适配层自己的失败 | 返回 `{ selected, outcome: "ok" \| "skipped" \| "error" }`，或让端口错误上抛由适配层决定。注意这是**行为**变更，会影响 pi-memory 的现有用例，要走独立 spec |
 
 ## 10. 备选方案（已排除）
 
