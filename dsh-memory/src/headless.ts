@@ -24,13 +24,14 @@ export interface LlmLike {
 }
 
 /**
- * 宿主 chunk 词汇的宽松投影。刻意不成为第二份宿主定义：只有我们要读的那两种 arm 有精确形状，
+ * 宿主 chunk 词汇的宽松投影。刻意不成为第二份宿主定义：只有我们要读的那三种 arm 有精确形状，
  * 其余一律落到 `{ type: string; [k: string]: unknown }`。宿主是快速变动的 rc，收紧这里就是
  * 在适配层里偷偷钉死一份随时会漂的宿主类型。
  */
 export type StreamChunkLike =
-	| { type: "text-delta"; text: string }
-	| { type: "content-block"; block: { type: string; text?: string } }
+	| { type: "text-delta"; index?: number; text: string }
+	| { type: "block-end"; index?: number; block: { type: string; text?: string } }
+	| { type: "finish"; reason?: { kind?: string } }
 	| { type: string; [k: string]: unknown };
 
 export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
@@ -77,16 +78,27 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 				...(signal !== undefined ? { signal } : {}),
 			};
 
-			let text = "";
+			// 按 index 累积文本，语义对齐宿主的 BlockAssembler：text-delta 是增量流，
+			// block-end 里的 block 才是权威终值（覆盖同 index 的 delta），两者同发时不能重复计数。
+			// 缺失或非数字 index 归入同一个默认桶，避免出现 "undefined" 键或丢文本。
+			const textByIndex = new Map<number, string>();
+			const defaultIndex = -1;
+			const bucketIndex = (index: unknown): number =>
+				typeof index === "number" && Number.isFinite(index) ? index : defaultIndex;
+
 			try {
 				for await (const chunk of llm.stream(streamOptions)) {
 					if (chunk.type === "text-delta") {
-						text += chunk.text;
-					} else if (chunk.type === "content-block") {
+						const index = bucketIndex((chunk as { index?: unknown }).index);
+						textByIndex.set(index, (textByIndex.get(index) ?? "") + chunk.text);
+					} else if (chunk.type === "block-end") {
 						// 兜底 arm（`{ type: string; [k: string]: unknown }`）会让判别式收窄失效：
 						// `chunk.block` 在这里是 unknown，必须显式 cast 到我们要读的形状。
-						const block = (chunk as { block?: { type?: unknown; text?: unknown } }).block;
-						if (block?.type === "text" && typeof block.text === "string") text += block.text;
+						const end = chunk as { index?: unknown; block?: { type?: unknown; text?: unknown } };
+						if (end.block?.type === "text" && typeof end.block.text === "string") {
+							// 覆盖（不是追加）：block-end 是该 index 的权威终值。
+							textByIndex.set(bucketIndex(end.index), end.block.text);
+						}
 					} else if (chunk.type === "finish") {
 						// 宿主有两条失败通道：adapter 选择/派发/迭代失败被转成终止 finish chunk，
 						// 只有 middleware/consumer 失败才真的抛（dsh-llm/lib/index.js:2355-2357,
@@ -98,7 +110,8 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 						// stop / max-tokens / tool-calls / 未知（宿主可合并扩展）→ 正常结束，返回累积文本。
 						break;
 					}
-					// 其余 chunk（usage / block-start / reasoning-delta / …）一律忽略。
+					// reasoning-delta 是思维链，绝不能累积进答案 —— 加进来会污染侧查询输出，
+					// 这是最容易被人「好心」补上的地方。tool-call-delta / usage / block-start 也一律忽略。
 				}
 			} catch {
 				// middleware / nested-call / cleanup / consumer 失败仍会抛：同样视为「本轮没跑成」。
@@ -107,7 +120,12 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 				if (timer !== undefined) clearTimeout(timer);
 			}
 
-			// core 靠 null 区分「没跑」与「跑了没写出东西」：成功但空文本必须是 ""。
+			// 按 index 升序（数字序，不是插入序）拼接；core 靠 null 区分「没跑」与「跑了没写出东西」。
+			const text = [...textByIndex.entries()]
+				.sort(([a], [b]) => a - b)
+				.map(([, value]) => value)
+				.join("");
+			// 成功但空文本必须是 ""。
 			return text.trim() === "" ? "" : text;
 		},
 	};

@@ -43,16 +43,67 @@ describe("createDshHeadless — 成功路径", () => {
 		expect(await port.run(baseReq())).toBe("ab");
 	});
 
-	it("accumulates text content-blocks and ignores unrelated chunks", async () => {
+	it("accumulates text block-end chunks and ignores usage/block-start", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream(
-				{ type: "content-block", block: { type: "text", text: "hello " } },
+				{ type: "block-start", index: 0, blockType: "text" },
+				{ type: "block-end", index: 0, block: { type: "text", text: "hello " } },
 				{ type: "usage" },
-				{ type: "content-block", block: { type: "reasoning", text: "IGNORED" } },
+				{ type: "block-end", index: 1, block: { type: "reasoning", text: "IGNORED" } },
 			),
 		};
 		const port = createDshHeadless(llm);
 		expect(await port.run(baseReq())).toBe("hello ");
+	});
+
+	it("does not double-count when a text-delta and a same-index block-end both arrive", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "text-delta", index: 0, text: "hello" },
+				{ type: "block-end", index: 0, block: { type: "text", text: "hello" } },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("hello");
+	});
+
+	it("yields the same text from delta-only and block-end-only streams", async () => {
+		const run = (chunks: StreamChunkLike[]) => createDshHeadless({ stream: chunkStream(...chunks) }).run(baseReq());
+		expect(await run([{ type: "text-delta", index: 0, text: "same" }])).toBe("same");
+		expect(await run([{ type: "block-end", index: 0, block: { type: "text", text: "same" } }])).toBe("same");
+	});
+
+	it("returns only the answer, not the reasoning, when reasoning-delta is present", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "text-delta", index: 0, text: "answer" },
+				{ type: "reasoning-delta", index: 0, text: "chain-of-thought" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("answer");
+	});
+
+	it("concatenates multiple text blocks in ascending index order when they arrive out of order", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "block-end", index: 1, block: { type: "text", text: "b" } },
+				{ type: "block-end", index: 0, block: { type: "text", text: "a" } },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("ab");
+	});
+
+	it("treats missing or non-numeric index as one default bucket instead of dropping text", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "text-delta", text: "a" },
+				{ type: "text-delta", index: "bad", text: "b" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("ab");
 	});
 
 	it("returns the accumulated text on a normal stop finish chunk", async () => {
