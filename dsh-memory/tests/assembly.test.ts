@@ -35,6 +35,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	vi.unstubAllEnvs();
 	await rm(dir, { recursive: true, force: true });
 });
@@ -427,6 +428,50 @@ describe("apply — 启动期降级与每轮召回", () => {
 		const status = await runMemoryCommand(fake, agent);
 		expect(status.text).toContain("autoSurfacing=off(");
 		expect(status.text).toContain("NO_ADAPTER");
+	});
+
+	it("bounds the startup model-resolution await and degrades instead of hanging when the host never answers", async () => {
+		// R27：截获 AbortSignal.timeout 而不是 fake timers —— Node 用 setWeakAbortSignalTimeout 实现它，
+		// fake timers 驱动不了。这里记录实参、再交给真实实现生成一个 50ms 的短 bound，既钉住 10_000 上界，
+		// 又让 abort 路径真的在 ~50ms 内走完。
+		const originalTimeout = AbortSignal.timeout;
+		const timeoutArgs: number[] = [];
+		vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+			timeoutArgs.push(ms);
+			return originalTimeout(50);
+		});
+
+		const fake = createFakeCtx();
+		// 替身必须 abort-aware：宿主查找永不 settle 时，signal abort 才能把 pending 的 await 变成 rejection，
+		// model.ts 既有的 try 才能把它降级成 { available: false, reason }。
+		const resolveCallConfig = vi.spyOn(fake.ctx.llm, "resolveCallConfig").mockImplementation(
+			(...args: unknown[]) =>
+				new Promise<unknown>((_resolve, reject) => {
+					const signal = args[1] as AbortSignal | undefined;
+					signal?.addEventListener("abort", () => {
+						const err = new Error("The operation was aborted due to timeout");
+						(err as { code?: string }).code = "ABORT_ERR";
+						reject(err);
+					});
+				}),
+		);
+
+		// apply 在第一个 await 之前同步调用 AbortSignal.timeout(10_000)，所以不等它 settle 就能钉住上界。
+		const activation = apply(fake.ctx, rowConfig({ autoSurfacing: { enabled: true, model: "prov/mod" } }));
+		expect(timeoutArgs).toEqual([10_000]);
+
+		const dispose = await activation;
+		expect(typeof dispose).toBe("function");
+
+		expect(fake.sections.map((section) => section.name)).toEqual(["memory_index"]);
+		expect(fake.commands.map((command) => command.name)).toEqual(["memory"]);
+		expect(resolveCallConfig).toHaveBeenCalledTimes(1);
+
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		const status = await runMemoryCommand(fake, agent);
+		expect(status.text).toContain("autoSurfacing=off(");
 	});
 
 	it("recalls relevant memories on the agent/pre-step waterfall", async () => {
