@@ -491,13 +491,20 @@ ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) =
 - `dshHeadless(ctx)`（`headless.ts`）实现 core 的 `HeadlessAgentPort`，本轮只需支持零工具：
   `ctx.llm.stream({ provider, model, reasoningEffort, messages, system, signal })`，自己累积文本
   （不用宿主的 `BlockAssembler` —— 那是运行时宿主 import）。**累积规则按宿主真实的 chunk 词汇（§2.3 第 4 行）**：
-  按 **首次出现顺序**维护缓冲区（与宿主 `BlockAssembler` 一致）—— `text-delta` 追加到该 index，
-  `block-end` 且 `block.type === "text"` 时用它作为该 index 的**权威终值并冻结它**（之后的 delta 忽略），
-  最后按首次出现顺序拼接。依据：`dsh-llm/lib/index.js:954-1055` 的 `order.push(index)`（block-start 或
-  `ensure()` 首次建 partial 时）、`assembled()` 的 `this.order.map(...)`，以及 text-delta / block-end
-  两个分支开头的 `if (partial.block) return;`。**不是数值升序**，也**不是覆盖后继续追加**。
-  `reasoning-delta`（宿主把它累积成独立的 `{type:"reasoning"}` block，不并入 text）、
-  `tool-call-delta`、`usage`、`block-start` 一律忽略。
+  按 **首次出现顺序**维护缓冲区（与宿主 `BlockAssembler` 一致）—— 首次出现的时机是 **`block-start`**
+  （宿主在 `block-start` 与 `ensure()` 里 `order.push(index)`），所以 `block-start` 用来**建立 index 顺序与
+  记录 `blockType`**，但不贡献文本；`text-delta` 追加到该 index；`block-end` 一旦设了权威 block 就**冻结该 index**
+  （之后的 delta 忽略）；最后按首次出现顺序拼接，**只取 `blockType`（或 block-end 的 `block.type`）为 `text` 的桶**。
+  依据：`dsh-llm/lib/index.js:954-1055` 的 `order.push(index)`、`ensure(index, blockType)`、
+  `assemble()` 按 blockType 产块、以及 text-delta / block-end 两个分支开头的 `if (partial.block) return;`。
+  **不是数值升序**，也**不是覆盖后继续追加**。只取 text 块是必须的：宿主把 `reasoning-delta` 累积成独立的
+  `{type:"reasoning"}` 块，若不按 blockType 区分，一个 reasoning 块上的 `text-delta` 会被当成答案输出。
+  `tool-call-delta`（含其 `block-end`）、`usage` 一律忽略；`finish` **只记录不 break**，读到流尽后在循环外裁决
+  （两个 first-party 一次性调用都这么写：`dsh-session-title-llm/lib/index.js:209-217`、
+  `dsh-experimental-translator/lib/index.js:741-757`）。**不 break 是硬要求**：`for await` 提前退出会隐式
+  `await iterator.return()`，而宿主 `adapterStream` 的 `finally`（`dsh-llm/lib/index.js:2381-2384`）在
+  `completed === false` 时会 `await close()`，而方法注释把 cleanup 失败归在 "remain thrown" 那一半 ——
+  一次成功调用可能因此丢掉有效文本，或因 cleanup 挂住而无上限挂死（此时 `timeoutMs` 已用完）。
   `builtinTools: "none"` → `tools` 字段直接不给；`memoryTool: null`；
   收到 `builtinTools: "file-io"` 或 `memoryTool !== null` 的请求 → 返回 `null`（本轮不支持，
   下一轮 extract / dream 才实现），**不抛错**。
@@ -506,6 +513,8 @@ ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) =
   **但失败有两条通道，必须都覆盖**（见 §2.3）：adapter 选择/派发/迭代失败被宿主转成**终止
   chunk**（`{type:"finish", reason:{kind:"error"|"aborted", failure}}`）而不是抛错，只有
   middleware / nested-call / cleanup / consumer 失败才真的抛。只包 try/catch 会漏掉前者。
+循环内每个 chunk 还要先 `signal?.throwIfAborted()`（两个 first-party 消费者都这么做），否则一个不理会
+  signal 的流会让调用超过 `timeoutMs`。
 - 召回消息的形状（`dsh-llm` 的 `UserMessage`）：
 
 ```ts
