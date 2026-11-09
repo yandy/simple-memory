@@ -70,6 +70,9 @@ export function createMemoryTool(rt: SessionMemoryRuntime, deps: MemoryToolDeps)
 			render: (_args, value) => [{ type: "text", text: value.content }],
 		},
 		async execute(args, _exec) {
+			// `_exec.signal` 仅为宿主接口兼容而被接受：core 的 handler 返回
+			// `(params: unknown) => Promise<...>`，没有 abort 入参，取消在本层无法落地；
+			// 要真正支持取消得先改 core，本轮不做。
 			const r = await handler(args);
 			// 只保留 content：`r.details` 含 `capacityWarning: undefined`，进 output 会触发
 			// 宿主的 `snapshotJsonValue` 抛 `ToolOutputError`（见 OUTPUT_SCHEMA 上方的注释）。

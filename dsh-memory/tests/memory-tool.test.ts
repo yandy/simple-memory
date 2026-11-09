@@ -131,24 +131,42 @@ describe("createMemoryTool", () => {
 
 		// toEqual 深比较：模型看到的线格式必须与 pi 逐字相同，绝不转成 dsh 的 authoring DSL。
 		expect(tool.parameters).toEqual(memoryToolSchema(MAIN_AGENT_ACTIONS));
+		// D8 的「逐字相同」是字节级：toEqual 不钉键序，键序变了仍然绿。用 JSON 往返钉死。
+		expect(JSON.stringify(tool.parameters)).toBe(JSON.stringify(memoryToolSchema(MAIN_AGENT_ACTIONS)));
 	});
 
 	it("uses only host-supported JSON Schema subset keywords at every node", () => {
 		const rt = makeRuntime(join(dir, "mem"), null);
 		const tool = createMemoryTool(rt, makeDeps());
 
-		const keys = collectSchemaKeywords(tool.parameters);
+		// dsh 对 output.schema 也强制同一关键字子集：validateToolDefinition 校验 definition 时两处都走。
+		const keys = [...collectSchemaKeywords(tool.parameters), ...collectSchemaKeywords(tool.output.schema)];
 		expect(keys.length).toBeGreaterThan(0);
 		for (const key of keys) {
 			expect(ALLOWED_SCHEMA_KEYS.has(key), `schema keyword not allowed by dsh: ${key}`).toBe(true);
 		}
 	});
 
-	it("writes an entry file and index line on disk and returns the Saved content", async () => {
+	it("rejects dream-only actions that are outside the registered scope", async () => {
 		const memoryDir = join(dir, "mem");
 		const store = makeStore(memoryDir);
 		const rt = makeRuntime(memoryDir, store);
 		const tool = createMemoryTool(rt, makeDeps());
+
+		// 注册范围是硬约束：MAIN_AGENT_ACTIONS 只有 5 个，rename / rebuild_index 是 dream 专属。
+		// 若有人把 actions 扩成 [...MAIN_AGENT_ACTIONS, "rename"]，这条会红：execute 会真的走改名分支
+		// 而不是拒绝（core 的 handler 抛 `Unknown action: ${p.action}`）。
+		await expect(tool.execute({ action: "rename", name: "a", new_name: "b" }, {})).rejects.toThrowError(
+			new Error("Unknown action: rename"),
+		);
+	});
+
+	it("writes an entry file and index line on disk, returns the Saved content, and fires onWrite", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		const rt = makeRuntime(memoryDir, store);
+		const onWrite = vi.fn();
+		const tool = createMemoryTool(rt, makeDeps({ onWrite }));
 
 		const result = await tool.execute({ action: "add", name: "N", content: "C" }, {});
 
@@ -156,6 +174,20 @@ describe("createMemoryTool", () => {
 		expect(existsSync(join(memoryDir, "N.md"))).toBe(true);
 		const index = await readFile(join(memoryDir, "MEMORY.md"), "utf8");
 		expect(index).toContain("[N](N.md)");
+		// Task 16 靠这个回调刷新索引快照：只在成功写 action 后回调，且 name 是 trim 后的。
+		expect(onWrite).toHaveBeenCalledExactlyOnceWith({ action: "add", name: "N" });
+	});
+
+	it("does not fire onWrite for read actions", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		const rt = makeRuntime(memoryDir, store);
+		const onWrite = vi.fn();
+		const tool = createMemoryTool(rt, makeDeps({ onWrite }));
+
+		await tool.execute({ action: "list" }, {});
+
+		expect(onWrite).not.toHaveBeenCalled();
 	});
 
 	it("returns a value with no undefined anywhere, even after a real successful write", async () => {
@@ -182,7 +214,9 @@ describe("createMemoryTool", () => {
 		const rt = makeRuntime(join(dir, "unused"), null, { error: "row config is broken" });
 		const tool = createMemoryTool(rt, makeDeps());
 
-		await expect(tool.execute({ action: "list" }, {})).rejects.toThrow("row config is broken");
+		// 逐字相等：Task 15 把这个字符串原样展示给用户，core 的 handler 也原样 rethrow
+		// getUnavailableMessage() 的结果，任何「有帮助的」前缀都会是行为漂移。
+		await expect(tool.execute({ action: "list" }, {})).rejects.toThrowError(new Error("row config is broken"));
 	});
 
 	it("delegates scope=sessions search to deps.searchSessions with rt.cwd and rt.config.sessionSearch", async () => {
