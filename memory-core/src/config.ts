@@ -188,6 +188,14 @@ function deepMerge<T>(base: T, over: Partial<T>): T {
 	return out;
 }
 
+/**
+ * 把 `overlay` 深合并到 `base` 上：`undefined` 跳过、plain object 递归、数组整体替换、`null` 子树原样带入。
+ * 返回**新对象**，不改 `base` —— 这是适配层在内存里覆盖配置的唯一入口（与 `loadConfigFrom` 共用同一份语义）。
+ */
+export function mergeConfig(base: MemoryConfig, overlay: unknown): MemoryConfig {
+	return deepMerge(base, (overlay ?? {}) as Partial<MemoryConfig>);
+}
+
 function readJsonSafe(path: string): Partial<MemoryConfig> {
 	try {
 		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf-8")) as Partial<MemoryConfig>;
@@ -228,7 +236,7 @@ export interface LoadConfigFromOptions {
 export async function loadConfigFrom(files: string[], opts: LoadConfigFromOptions = {}): Promise<MemoryConfig> {
 	let cfg: MemoryConfig = { ...DEFAULT_CONFIG, memoryDir: opts.memoryRoot ?? defaultMemoryRoot() };
 	for (const file of files) {
-		cfg = deepMerge(cfg, readJsonSafe(file));
+		cfg = mergeConfig(cfg, readJsonSafe(file));
 	}
 	cfg.memoryDir = expandTilde(cfg.memoryDir, opts.platform ?? process.platform);
 	return cfg;

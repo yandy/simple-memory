@@ -6,6 +6,7 @@ import {
 	DEFAULT_CONFIG,
 	defaultMemoryRoot,
 	loadConfigFrom,
+	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
@@ -351,5 +352,33 @@ describe("taskModel", () => {
 		expect(taskModel(shared, "dream")).toBe("shared/model");
 		expect(taskModel({ ...shared, dream: { ...shared.dream, model: "own/model" } }, "dream")).toBe("own/model");
 		expect(taskModel({ ...shared, defaults: undefined }, "autoSurfacing")).toBeUndefined();
+	});
+});
+
+describe("mergeConfig", () => {
+	it("深合并、跳过 undefined、数组整体替换、不改 base", () => {
+		const base = DEFAULT_CONFIG;
+		const out = mergeConfig(base, {
+			memIndexMaxLines: 99,
+			autoSurfacing: { maxFiles: 7 },
+			lock: { timeoutMs: undefined },
+		});
+		expect(out.memIndexMaxLines).toBe(99);
+		expect(out.autoSurfacing.maxFiles).toBe(7);
+		expect(out.autoSurfacing.maxEntryBytes).toBe(DEFAULT_CONFIG.autoSurfacing.maxEntryBytes); // 同层其它键保留
+		expect(out.lock.timeoutMs).toBe(DEFAULT_CONFIG.lock.timeoutMs); // undefined 被跳过
+		expect(base.memIndexMaxLines).toBe(DEFAULT_CONFIG.memIndexMaxLines); // base 未被改写
+	});
+	it("null 子树原样带入（与 loadConfigFrom 的既有语义一致）", () => {
+		expect(mergeConfig(DEFAULT_CONFIG, { extractMemories: null }) as any).toMatchObject({ extractMemories: null });
+	});
+	it("与 loadConfigFrom 读同一份 JSON 的结果逐字相等", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "mergecfg-"));
+		const file = join(dir, "memory.json");
+		const overlay = { memIndexMaxBytes: 1234, autoSurfacing: { enabled: false, maxFiles: 2 } };
+		await writeFile(file, JSON.stringify(overlay));
+		const viaFile = await loadConfigFrom([file]);
+		const viaMerge = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
+		expect(viaMerge).toEqual(viaFile);
 	});
 });

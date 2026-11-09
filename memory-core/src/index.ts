@@ -58,6 +58,7 @@ export {
 	defaultMemoryRoot,
 	expandTilde,
 	loadConfigFrom,
+	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
