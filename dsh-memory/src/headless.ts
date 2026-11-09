@@ -78,26 +78,36 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 				...(signal !== undefined ? { signal } : {}),
 			};
 
-			// 按 index 累积文本，语义对齐宿主的 BlockAssembler：text-delta 是增量流，
-			// block-end 里的 block 才是权威终值（覆盖同 index 的 delta），两者同发时不能重复计数。
-			// 缺失或非数字 index 归入同一个默认桶，避免出现 "undefined" 键或丢文本。
-			const textByIndex = new Map<number, string>();
-			const defaultIndex = -1;
-			const bucketIndex = (index: unknown): number =>
-				typeof index === "number" && Number.isFinite(index) ? index : defaultIndex;
+			// 按 index 累积文本，语义对齐宿主的 BlockAssembler（dsh-llm/lib/index.js:954-1055）：
+			// - Map 键 = 原始 chunk.index（含 undefined，不做 -1 之类的哨兵替换；哨兵会与真实 index 相撞），
+			//   Map 的插入序就是首次出现序 —— 拼接按首次出现序，不是数字升序。
+			// - text-delta 是增量流，追加到该 index；一旦 block-end 给出权威终值，该 index 就冻结，
+			//   之后的 delta 一律忽略（宿主两个分支开头的 `if (partial.block) return;`）。
+			// - block-end 的 text 块是该 index 的权威终值（覆盖之前累积的 delta），两者同发时不能重复计数。
+			const partials = new Map<unknown, { text: string; block: string | null }>();
+			const ensure = (index: unknown): { text: string; block: string | null } => {
+				let partial = partials.get(index);
+				if (partial === undefined) {
+					partial = { text: "", block: null };
+					partials.set(index, partial);
+				}
+				return partial;
+			};
 
 			try {
 				for await (const chunk of llm.stream(streamOptions)) {
 					if (chunk.type === "text-delta") {
-						const index = bucketIndex((chunk as { index?: unknown }).index);
-						textByIndex.set(index, (textByIndex.get(index) ?? "") + chunk.text);
+						const partial = ensure((chunk as { index?: unknown }).index);
+						if (partial.block !== null) continue; // 已被 block-end 冻结，后续 delta 忽略
+						partial.text += chunk.text;
 					} else if (chunk.type === "block-end") {
 						// 兜底 arm（`{ type: string; [k: string]: unknown }`）会让判别式收窄失效：
 						// `chunk.block` 在这里是 unknown，必须显式 cast 到我们要读的形状。
 						const end = chunk as { index?: unknown; block?: { type?: unknown; text?: unknown } };
 						if (end.block?.type === "text" && typeof end.block.text === "string") {
-							// 覆盖（不是追加）：block-end 是该 index 的权威终值。
-							textByIndex.set(bucketIndex(end.index), end.block.text);
+							const partial = ensure(end.index);
+							if (partial.block !== null) continue; // 重复 block-end：保持首个权威值
+							partial.block = end.block.text; // 覆盖之前累积的 delta，并冻结该 index
 						}
 					} else if (chunk.type === "finish") {
 						// 宿主有两条失败通道：adapter 选择/派发/迭代失败被转成终止 finish chunk，
@@ -120,11 +130,8 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 				if (timer !== undefined) clearTimeout(timer);
 			}
 
-			// 按 index 升序（数字序，不是插入序）拼接；core 靠 null 区分「没跑」与「跑了没写出东西」。
-			const text = [...textByIndex.entries()]
-				.sort(([a], [b]) => a - b)
-				.map(([, value]) => value)
-				.join("");
+			// 按首次出现顺序（Map 插入序）拼接；core 靠 null 区分「没跑」与「跑了没写出东西」。
+			const text = [...partials.values()].map((partial) => partial.block ?? partial.text).join("");
 			// 成功但空文本必须是 ""。
 			return text.trim() === "" ? "" : text;
 		},

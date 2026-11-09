@@ -84,7 +84,7 @@ describe("createDshHeadless — 成功路径", () => {
 		expect(await port.run(baseReq())).toBe("answer");
 	});
 
-	it("concatenates multiple text blocks in ascending index order when they arrive out of order", async () => {
+	it("concatenates multiple text blocks in first-seen order when their indices arrive out of order", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream(
 				{ type: "block-end", index: 1, block: { type: "text", text: "b" } },
@@ -92,18 +92,40 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("ab");
+		expect(await port.run(baseReq())).toBe("ba");
 	});
 
-	it("treats missing or non-numeric index as one default bucket instead of dropping text", async () => {
+	it("freezes an index once its block-end has arrived, ignoring later deltas for that index", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "block-end", index: 0, block: { type: "text", text: "A" } },
+				{ type: "text-delta", index: 0, text: "B" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("A");
+	});
+
+	it("keys buckets by the raw index, so chunks without an index share one bucket and append together", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream(
 				{ type: "text-delta", text: "a" },
-				{ type: "text-delta", index: "bad", text: "b" },
+				{ type: "text-delta", text: "b" },
 			),
 		};
 		const port = createDshHeadless(llm);
 		expect(await port.run(baseReq())).toBe("ab");
+	});
+
+	it("does not use a -1 sentinel: a missing index and a real -1 index stay separate buckets", async () => {
+		const llm: LlmLike = {
+			stream: chunkStream(
+				{ type: "block-end", block: { type: "text", text: "A" } },
+				{ type: "text-delta", index: -1, text: "B" },
+			),
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq())).toBe("AB");
 	});
 
 	it("returns the accumulated text on a normal stop finish chunk", async () => {
