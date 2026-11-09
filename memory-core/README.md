@@ -167,6 +167,22 @@ can call nothing yet still "succeeds".
 | Where config files live, and whether the project is trusted | host knowledge; `loadConfigFrom(files)` takes an explicit list |
 | Counting sessions to decide when to nudge | needs the host's session store |
 
+### Config helpers new in 1.1.0
+
+- `mergeConfig(base, overlay)` deep-merges an in-memory object into a `MemoryConfig`. Use it when the
+  host's config is **not a file** — a cordis row's `config:` object handed to the plugin at activation,
+  for example. `loadConfigFrom(files)` now delegates to it, so there is exactly one merge implementation
+  and the two paths stay in lockstep.
+- `EffortLevel` is the type of every thinking/reasoning level in the config. It is an **opaque string**:
+  core passes it through without interpreting or validating it. Legal values are per-host data (in dsh,
+  per-provider-route), which is why a closed enum was the wrong shape. `ThinkLevel` remains as a
+  deprecated alias so existing adapters' type re-exports do not break.
+- `modelConfigErrors(cfg, resolve, tasks?)` and `requiredModels(cfg, tasks?)` take an optional `tasks`
+  argument so an adapter can declare **which tasks it actually implements** — it is no longer forced to
+  demand a model for a task it does not have (for example an adapter with no dream support). Omitting
+  `tasks` keeps the previous behaviour: dream is always in the required set and the other two are gated
+  by `enabled`.
+
 ### Mapping used by the pi adapter
 
 | Need | core | pi |

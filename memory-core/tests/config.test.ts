@@ -15,6 +15,7 @@ import {
 	type MemoryConfig,
 	type ThinkLevel,
 } from "../src/config.js";
+import type { EffortLevel as EffortLevelFromIndex } from "../src/index.js";
 
 describe("DEFAULT_CONFIG", () => {
 	it("has expected defaults", () => {
@@ -425,5 +426,18 @@ describe("EffortLevel", () => {
 		const dshEffort: EffortLevel = "max"; // dsh 的 DeepSeek 路线档位，旧 ThinkLevel 表达不出
 		const piEffort: ThinkLevel = dshEffort; // 双向可赋值 = 同一类型
 		expect([dshEffort, piEffort]).toEqual(["max", "max"]);
+	});
+});
+
+describe("公开出口", () => {
+	it("带上 1.1.0 的三个加法", async () => {
+		const api = await import("../src/index.js");
+		expect(typeof api.mergeConfig).toBe("function");
+		expect(api.requiredModels.length).toBeGreaterThanOrEqual(1); // tasks 是可选参，不计入 length
+		expect(api.modelConfigErrors.length).toBeGreaterThanOrEqual(2);
+		// EffortLevel 是类型导出，运行时没有对应值：从入口做类型导入能编译通过，即证明
+		// index.ts 的 `export type { EffortLevel }` 真的把它放上了公开面。
+		const fromIndex: EffortLevelFromIndex = "max";
+		expect(fromIndex).toBe("max");
 	});
 });
