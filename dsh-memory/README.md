@@ -30,6 +30,10 @@ pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样�
 侧需要先新造一个「一次性受限工具子会话」，风险与成本独立成下一刀。所以不要拿它当 pi-memory 的完全
 对等物：**没有**每轮自动提取，**没有** `/dream` 整理，索引也不会在会话中途被冻结（见下）。
 
+不冻结的原因是 dsh 每一步都重新装配 system prompt（pi 是整个会话冻结索引、回放录制值来护住 prompt
+cache），所以索引是一份快照：在 `agent/created`、每次记忆写入成功后、`/memory` 执行后、每个 `pre-step`
+之前异步刷新，读侧同步查表。
+
 ## 安装
 
 一条命令。宿主会在包操作之后自动把包名写进 profile 的 `dsh.profile.bundles` 并应用 bundle 的
@@ -37,9 +41,11 @@ pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样�
 的 `package.json`：
 
 ```sh
-npm run build -w dsh-memory                              # 先产出 dist/
+npm run build -w memory-core && npm run build -w dsh-memory   # 先产出 dist/
 dsh plugin --profile web add file:/abs/path/to/dsh-memory
 ```
+
+顺序不能反：`dsh-memory` 的 build 经 workspace 符号链接解析 core 的 `dist/`，而 `dist/` 不入库。
 
 `<spec>` 现在是本地目录（本包 `private: true`、版本 `0.0.0`，尚未发布）；将来发布后换成包名
 `@yandy0725/dsh-memory`。装完重启 dsh 生效。
