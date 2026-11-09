@@ -77,12 +77,16 @@ describe.skipIf(process.platform !== "win32")("withFsRetry against a real Window
 	}
 
 	it("crosses a short exclusive hold", async () => {
-		// 就绪后仅占 300ms：默认预算的等待间隔合计已有 600ms（20+40+80+160+300），加上尝试
-		// 本身必然覆盖持有时长。用 600ms 时余量全靠尝试耗时凑，CI 的定时器粒度（15.6ms）
-		// 与就绪轮询延迟（≤50ms）会把边际吃穿（首跑真机已复现）。
+		// ready 是在取得独占**之后**写的，所以紧跟其后的第一次尝试必然撞上冲突；跨过 300ms 的
+		// 持锁原本只需默认预算（900ms）的前几次重试。这里仍显式放宽到 ~2.7s：runner 上杀软/
+		// 索引器会在 `$fs.Close()` 之后继续压着文件，真机已复现一次 EBUSY 落在默认预算之外。
+		// 默认阶梯本身由 tests/fs-retry.test.ts 用注入的 sleep 锁死（20/40/80/160/300/300），
+		// 这条用例只负责证明「真实的 Windows 共享冲突被当成瞬时错误并跨过去」。
 		startExclusiveHold(300);
 		await waitForReady();
-		await expect(withFsRetry(() => writeFile(target, "written", "utf8"))).resolves.toBeUndefined();
+		await expect(
+			withFsRetry(() => writeFile(target, "written", "utf8"), { retries: 12 }),
+		).resolves.toBeUndefined();
 		expect(await readFile(target, "utf8")).toBe("written");
 	});
 
