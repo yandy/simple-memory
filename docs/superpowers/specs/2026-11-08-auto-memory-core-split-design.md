@@ -1,8 +1,8 @@
-# `auto-memory` 基础层拆分设计（pi-memory → 中立 core + pi 适配层）
+# `memory-core` 基础层拆分设计（pi-memory → 中立 core + pi 适配层）
 
 日期：2026-11-08
 状态：**已批准**（2026-11-08）
-范围：新包 `@yandy0725/auto-memory`（先作为本 monorepo 的第 11 个 workspace 开发，再搬到独立 repo）；`pi-memory`（2.5.2 → 3.0.0）
+范围：新包 `@yandy0725/memory-core`（先作为本 monorepo 的第 11 个 workspace 开发，再搬到独立 repo）；`pi-memory`（2.5.2 → 3.0.0）
 不在范围：任何 dsh 插件代码、opencode 适配、发布动作
 
 ---
@@ -27,27 +27,26 @@
 |---|---|---|
 | **D1** | 分层边界取 **B**：core = 存储层 + LLM 编排（prompt 文本、dream/extract/surfacing 的流程）+ 中立工具契约；**注入时机与 session 内状态留在适配层** | A（只搬存储层）会让 dream/extract 在两个 harness 各写一遍，而它们的难点是与锁/快照边界的配合，重写必然退化。C（连注入状态机进 core）会把 pi 的「索引按 session 冻结以保 prompt cache」与 dsh 的「section provider 每次 assembly 重新求值」这两种互斥语义塞进同一状态机，在 core 里长出 harness 分支 |
 | **D2** | 交付边界 = **core 包 + pi 适配层跑通现有全部测试**。dsh 只作为端口设计的对照（按它的真实 API 设计端口），**本轮不写 dsh 插件** | 抽象需要对齐真实宿主能力才不会跑偏；但 dsh 插件是独立工作量，且其 cordis 装配、schemastery 转换、profile 打包都需要单独验证 |
-| **D3** | 共享数据根 = **`$XDG_DATA_HOME/auto-memory`**（未设置时 `~/.local/share/auto-memory`），其下沿用现有 `<git\|local>/<project>/` 结构 | 数据必须住在中立位置，否则「跨 harness 共享」无从谈起；与包名 `auto-memory` 同名，一眼对得上 |
+| **D3** | 共享数据根 = **`$XDG_DATA_HOME/simple-memory`**（未设置或为相对路径时 `~/.local/share/simple-memory`），其下沿用现有 `<git\|local>/<project>/` 结构 | 数据必须住在中立位置，否则「跨 harness 共享」无从谈起；目录名与仓库名 `simple-memory` 一致，用户从 `ls ~/.local/share` 就能反查到是哪个仓写的 |
 | **D4** | **不自动迁移**旧数据。core 对 `~/.pi/memory` **一无所知**；旧目录存在的提示逻辑只写在 pi 适配层 | 自动 mv 要处理两个 harness 同时启动、中途失败、`.lock`/`.backups` 被搬走等情况；提示逻辑属于宿主的升级路径，不属于中立基础层 |
-| **D5** | npm 包名 `@yandy0725/auto-memory`，最终形态是独立 repo `auto-memory`、**单包**（不开 workspaces） | core 必须发 npm：pi-memory 要依赖它，而 dsh 的 out-of-tree 插件解析不到宿主包、只能把它当自己的真依赖。pi 适配层留在本 monorepo 继续叫 `@yandy0725/pi-memory`；未来的 dsh 插件进已有的 `dsh-plugins` repo，所以 core repo 没有第二个包 |
-| **D6** | **两阶段交付**：阶段 1 在本 monorepo 里以第 11 个 workspace `auto-memory/` 开发，pi-memory 用 workspace 依赖，全部测试与真机验证在一个 PR 里跑通；阶段 2 再把它搬到独立 repo、发布、把 pi-memory 的依赖翻成 npm 版本 | 先发 core 就意味着在 pi 适配层还没实测之前把 core 的公开 API 对外定格，之后要改就是 breaking；先在 monorepo 内跑通，发布时 API 已经被两个真实调用方（pi 适配层 + §9.5 的中立脚本）压过 |
-| **D7** | 阶段 1 里 core **以 TS 源码为入口**（`main`/`exports` → `./src/index.ts`），**不带 build 步骤**；`dist/`（ESM + `.d.ts`）在阶段 2 搬出时加入并翻转 `exports` | monorepo 内所有消费方都原生吃 TS（pi 的扩展加载器、vitest、`tsc --noEmit`），加 build 只会引入「测试前必须先 build」的顺序依赖。`dist/` 是**发布**要求（dsh 插件跑在用户自己的 Node 上，`dsh-plugins` 声明 `engines.node >=20.16.0`，不能假设类型剥离），正好在需要它的那一步加 |
+| **D5** | npm 包名 `@yandy0725/memory-core`，住在独立 monorepo `github.com/yandy/simple-memory`，与 `pi-memory`、`dsh-memory`（占位）同仓 | core 必须发 npm：pi-memory 要依赖它，而 dsh 的 out-of-tree 插件解析不到宿主包、只能把它当自己的真依赖。适配层只实现两个端口，正确性由 core 的版本决定 —— 分仓就要用版本号对齐这份契约，而同仓时一行改动跨不了两个仓的两套 CI |
+| **D6** | **交付边界**：core、pi 适配层与 dsh 占位同仓（`simple-memory`），两边全部测试与真机验证全绿才算交付；`npm publish` 与 GitHub Release 不在本设计范围内 | 先发 core 就意味着在 pi 适配层还没实测之前把 core 的公开 API 对外定格，之后要改就是 breaking；同仓同一次变更内跑通，发布时 API 已经被真实调用方压过 |
+| **D7** | core 以 **`dist` 为发布入口**（`exports`/`main`/`types` 均指 `dist`，`files` 带上 `src/` 供 source map 对齐）；**仓内**解析走 `src`（`pi-memory` 的 vitest alias + tsconfig `paths`） | `dist` 是**发布**要求：dsh 插件跑在用户自己的 Node 上（该生态声明 `engines.node >=20.16.0`），不能假设类型剥离。同时，发布形态必须在仓内被真实执行过一次，否则首次发布就是这套形状的第一次运行 |
 | **D8** | `pi-memory` 版本 **3.0.0**；core 首发 **1.0.0**（不发 rc） | D3 移动了数据根，对现有用户是破坏性变更。core 是新 lineage，且按 D6 发布时已被实测，磁盘格式与工具语义都是从 2.x 继承的稳定行为 |
-| **D9** | 两个阶段各自**到 PR 为止**；`npm publish` 与 GitHub Release 都不在本设计范围内，单独决策 | npm publish 基本不可逆 |
+| **D9** | 本设计**到 PR 为止**；`npm publish` 与 GitHub Release 不在范围内，单独决策 | npm publish 基本不可逆 |
 
 **明确排除（非目标）**：dsh 插件实现、opencode 适配、把记忆库改成 SQLite/向量检索、改动 memory 的磁盘格式（frontmatter 字段、索引行格式、`.backups` 布局全部逐字不变）、改动 `memory` 工具的语义与 action 集合、把 `index-source.ts` 的 section 冻结机制推广到 core、任何自动数据迁移代码。
 
-### 2.1 阶段划分
+### 2.1 落地形态
 
-| | 阶段 1（本轮） | 阶段 2（本轮之后） |
-|---|---|---|
-| core 住在哪 | `pi-packages/auto-memory/`，根 `workspaces` 第 11 项 | 独立 repo `github.com/yandy/auto-memory` |
-| core 入口 | `./src/index.ts`，无 build | `./dist/index.js` + `.d.ts`，`tsc` 构建 |
-| pi-memory 怎么依赖 | `dependencies: {"@yandy0725/auto-memory": "^1.0.0"}`，npm workspaces 本地 link（版本满足即不外求 registry） | 同一个 range，解析到 registry 上已发布的 1.0.0 |
-| 交付物 | 一个 PR：新增 workspace + pi-memory 3.0.0 改造 + 测试拆分 + §9 全部验证 | 建 repo → 发布 core 1.0.0 → 删掉 monorepo 里的 `auto-memory/` 并翻依赖 → 发布 pi-memory 3.0.0 |
-| 破坏性 | 对 monorepo 有（根 `package.json`、CI filter），对用户无 | 对用户有（D3 的数据根迁移） |
-
-阶段 1 结束时，`auto-memory/` 必须已经满足「独立 repo 的全部要求」——零 harness 依赖、自带 `README.md`/`README.zh.md`/`LICENSE`/`biome.json`/`tsconfig.json`/`vitest.config.ts`、测试自足——搬出去只是 `mv` 加一次 `git init`，不需要重构。
+| | 形态 |
+|---|---|
+| 仓 | `github.com/yandy/simple-memory`，三个 workspace：`memory-core`、`pi-memory`、`dsh-memory` |
+| core 入口 | `./dist/index.js` + `dist/index.d.ts`（`tsc -p tsconfig.build.json`，`prepublishOnly` 先 build）；`files` 同时带 `src/` |
+| 仓内解析 | `pi-memory` 的 vitest `resolve.alias` + tsconfig `paths` → `../memory-core/src/index.ts`；CI 的 `test-dist` job 用 `MEMORY_CORE_FROM_DIST=1` 关掉 alias 再跑一遍（打 `dist`） |
+| pi-memory 怎么依赖 | `dependencies: {"@yandy0725/memory-core": "^1.0.0"}`，仓内由 npm workspaces link；发布后解析到 registry 上的 1.0.0 |
+| 发布 | `publish.yml`（Release tag `memory-core-v*` / `pi-memory-v*`）；顺序见该仓 `docs/guides/release.md` |
+| 破坏性 | 对用户有：D3 的数据根迁移（磁盘格式未变，迁移是一条 `mv`） |
 
 ---
 
@@ -104,7 +103,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ 适配层（每个 harness 一个）                                     │
-│  pi-memory 3.0            │  dsh-auto-memory（本轮不做）        │
+│  pi-memory 3.0            │  dsh-memory（占位，未实现）        │
 │  ─ extension 事件装配      │  ─ cordis apply(ctx, config)      │
 │  ─ /memory /dream 命令     │  ─ cordis.patch.yml 行配置         │
 │  ─ typebox schema + 渲染   │  ─ schemastery DSL + output.render │
@@ -115,7 +114,7 @@
 └───────────────┬─────────────────────────┬───────────────────┘
                 │  实现 2 个端口            │
 ┌───────────────▼─────────────────────────▼───────────────────┐
-│ core：@yandy0725/auto-memory（零 harness 依赖）                │
+│ core：@yandy0725/memory-core（零 harness 依赖）                │
 │  ① 存储层 1638 行：格式 / MemoryStore / 两级锁 / 快照 / 路径    │
 │  ② LLM 编排：dream · extract · surfacing 的流程 + prompt 文本  │
 │  ③ 注入纯策略：截断 / capacity / 格式化 / scanEntries          │
@@ -192,9 +191,10 @@ export interface ExtractMessage {
 ## 5. core 的模块布局与公开 API
 
 ```
-auto-memory/
-├── package.json                @yandy0725/auto-memory · type:module · 阶段1 入口 src/index.ts · 无任何 harness 依赖
-├── tsconfig.json               阶段1 只做 --noEmit 类型检查；阶段2 加 tsconfig.build.json 编译到 dist/
+memory-core/
+├── package.json                @yandy0725/memory-core · type:module · exports → dist/ · 无任何 harness 依赖
+├── tsconfig.json               仓内 `--noEmit` 类型检查（src + tests）
+├── tsconfig.build.json         `tsc` 编译到 dist/（declaration + maps，nodenext）
 ├── biome.json  vitest.config.ts
 ├── README.md / README.zh.md
 ├── LICENSE                     MIT
@@ -238,11 +238,11 @@ auto-memory/
 export function defaultMemoryRoot(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
   const xdg = env.XDG_DATA_HOME?.trim();
   const base = xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "share");
-  return join(base, "auto-memory");
+  return join(base, "simple-memory");
 }
 ```
 
-**我的决定（minor）**：所有平台走同一条 XDG 规则，不为 darwin/win32 加分支。理由：单一代码路径与单一测试矩阵；`XDG_DATA_HOME` 相对路径按规范忽略；Windows 用户得到 `C:\Users\<u>\.local\share\auto-memory`，功能正确，且 `memoryDir` 配置项始终可以覆盖。`env` 与 `home` 做成参数以便单测（沿用 `paths.ts` 的注入缝风格）。
+**我的决定（minor）**：所有平台走同一条 XDG 规则，不为 darwin/win32 加分支。理由：单一代码路径与单一测试矩阵；`XDG_DATA_HOME` 相对路径按规范忽略；Windows 用户得到 `C:\Users\<u>\.local\share\simple-memory`，功能正确，且 `memoryDir` 配置项始终可以覆盖。`env` 与 `home` 做成参数以便单测（沿用 `paths.ts` 的注入缝风格）。
 
 ### 5.3 `loadConfigFrom()`
 
@@ -294,7 +294,7 @@ export function createMemoryActionHandler(
 
 | | 现在（2.5.2） | 3.0.0 |
 |---|---|---|
-| 数据根 | `~/.pi/memory/` | `$XDG_DATA_HOME/auto-memory`（默认 `~/.local/share/auto-memory`） |
+| 数据根 | `~/.pi/memory/` | `$XDG_DATA_HOME/simple-memory`（默认 `~/.local/share/simple-memory`） |
 | 项目子路径 | `<git\|local>/<projectDirName>/` | **不变** |
 | 目录内布局 | `MEMORY.md` · `*.md` · `.lock` · `.backups/` · `.dream-meta.json` · `sessions/` | **不变** |
 | 全局配置 | `~/.pi/agent/memory.json` | 不变（pi 适配层拥有），但 `memoryDir` 默认值改了 |
@@ -303,14 +303,14 @@ export function createMemoryActionHandler(
 **迁移动作 = 用户手动一行**（README「Migrating from 2.x」一节）：
 
 ```sh
-mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}" && mv ~/.pi/memory "${XDG_DATA_HOME:-$HOME/.local/share}/auto-memory"
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}" && mv ~/.pi/memory "${XDG_DATA_HOME:-$HOME/.local/share}/simple-memory"
 ```
 
 pi 适配层的提示（**不在 core**，D4）：`session_start` 之后，若解析出的记忆目录不存在**且** `~/.pi/memory/<kind>/<projectDirName>` 存在，则 `/memory` 的输出末尾追加一行：
 
 ```
 Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
-  mkdir -p ~/.local/share && mv ~/.pi/memory ~/.local/share/auto-memory
+  mkdir -p ~/.local/share && mv ~/.pi/memory ~/.local/share/simple-memory
 ```
 
 只提示、不读写、不搬动。判定用现有的 `projectIdentity` + `projectDirName`，不新增路径逻辑。
@@ -323,7 +323,7 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 
 | 文件 | 动作 |
 |---|---|
-| `index.ts`(646) | **保留**。import 改指 `@yandy0725/auto-memory`；新增旧目录提示（§6）；`loadConfig` 调用改为组装文件列表后调 core 的 `loadConfigFrom` |
+| `index.ts`(646) | **保留**。import 改指 `@yandy0725/memory-core`；新增旧目录提示（§6）；`loadConfig` 调用改为组装文件列表后调 core 的 `loadConfigFrom` |
 | `src/agent-runner.ts`(153) | **保留**，改为实现 `HeadlessAgentPort`：把 `HeadlessRunRequest` 翻译成 `createAgentSession` 参数（`builtinTools:'none'` → `tools: []`；`'file-io'` → `FILE_IO_TOOLS`；`memoryTool` → 用 core 的 handler + pi schema 建 `ToolDefinition`，并按 `builtinTools` 决定 `noTools: "builtin"`）。**现有那条警告必须继续成立**：`tools: []` 是白名单会连 customTools 一起滤掉，所以「关 builtin、留 memory 工具」只能走 `noTools: "builtin"` |
 | `src/agent-config.ts`(2) | **保留**（`FILE_IO_TOOLS` 是 pi 的 builtin 工具名） |
 | `src/model-resolver.ts`(69) | **保留**（`ModelRegistry` 解析是 pi 专属） |
@@ -336,7 +336,7 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 | `src/dream.ts`(132) | **搬走**，pi 侧不再有对应文件；`customTools` 参数消失，改由端口请求里的 `memoryTool.actions` 表达 |
 | `src/extract.ts`(422) | **拆分**：`renderConversation` `buildExtractTask` `runExtract` `ExtractMessage` `ConversationLimits` → core；`toExtractMessages`（认 pi 的 `AgentMessage` 形状）→ 适配层，成为 `HostTranscriptPort.toExtractMessages` 的 pi 实现 |
 | 存储层 11 文件 | **删除**（搬到 core） |
-| `tests/`(8819) | 按同一边界拆分。存储层与编排测试搬到 `auto-memory/`（编排测试把 `runHeadlessAgent` 的 stub 换成假端口）；pi 专属测试留在 `pi-memory/`。**拆分后两个包的测试文件数之和不得少于 31 个**，且不允许删用例 |
+| `tests/`(8819) | 按同一边界拆分。存储层与编排测试搬到 `memory-core/`（编排测试把 `runHeadlessAgent` 的 stub 换成假端口）；pi 专属测试留在 `pi-memory/`。**拆分后两个包的测试文件数之和不得少于 31 个**，且不允许删用例 |
 
 ---
 
@@ -346,30 +346,36 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 
 ```
 @yandy0725/pi-memory@3.0.0
-  dependencies:        @yandy0725/auto-memory ^1.0.0     ← 新增（阶段1 = workspace link，阶段2 = registry）
+  dependencies:        @yandy0725/memory-core ^1.0.0     ← 新增（仓内 = workspace link，发布后 = registry）
   peerDependencies:    @earendil-works/pi-coding-agent, pi-ai, pi-tui, typebox   ← 不变
 
-@yandy0725/auto-memory@1.0.0
+@yandy0725/memory-core@1.0.0
   dependencies:        （空）
   peerDependencies:    （空）
   devDependencies:     @biomejs/biome, typescript, @types/node, vitest（版本串与根逐字一致）
 ```
 
-`@yandy0725/auto-memory` **不属于** `check-host-deps.mjs` 的 `HOST_PROVIDED_PACKAGES`，所以把它放在 pi-memory 的 `dependencies`（而不是 `peerDependencies`）是合规的，也正是应该的：它不是宿主提供的运行时，而是本包自己带的库。
+`@yandy0725/memory-core` **不属于** `check-host-deps.mjs` 的 `HOST_PROVIDED_PACKAGES`，所以把它放在 pi-memory 的 `dependencies`（而不是 `peerDependencies`）是合规的，也正是应该的：它不是宿主提供的运行时，而是本包自己带的库。
 
-### 8.2 阶段 1 的 package.json（core）
+### 8.2 core 的 package.json
 
 ```jsonc
 {
-  "name": "@yandy0725/auto-memory",
+  "name": "@yandy0725/memory-core",
   "version": "1.0.0",
-  "private": true,                    // 阶段1 不发布；阶段2 搬出时删掉这一行并改 publishConfig
   "description": "Harness-agnostic file-system memory layer: one memory = one Markdown file, a MEMORY.md index, two-level locking, snapshots, and the LLM orchestration around them.",
   "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/yandy/simple-memory", "directory": "memory-core" },
   "type": "module",
-  "main": "./src/index.ts",           // 阶段2 → ./dist/index.js + types + exports + files
+  "engines": { "node": ">=20.16.0" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist/", "src/", "README.md", "README.zh.md", "LICENSE"],
+  "publishConfig": { "access": "public" },
   "keywords": ["agent-memory", "memory", "harness-agnostic"],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json", "prepublishOnly": "npm run build",
     "test": "vitest run", "test:watch": "vitest",
     "typecheck": "tsc --noEmit", "lint": "biome lint .", "format": "biome format --write ."
   },
@@ -377,26 +383,20 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 }
 ```
 
-**对 `docs/guides/pi-package-spec.md` 的两处刻意偏离**（阶段 1 有效，搬出后自然消失）：
-
-1. 目录名不是 `pi-<name>`，`keywords` 里**没有** `"pi-package"`。core 不是 pi package——它不认识任何 harness，把它标成 pi package 是错的。
-2. `package.json` 里**没有** `pi` 字段，所以 `check-dev-deps.mjs` 会把它归为 `unclassified` 并**跳过**（只打印提示，不算失败，见该脚本的「其他 workspace 跳过」分支）。共享的 4 个 devDependencies 仍按根版本声明，保持一致。
-
-阶段 2 搬出时补：`publishConfig: {"access": "public"}`、`repository`、`build` 脚本、`exports`/`files` 指向 `dist/`（`src/` 一并发布，便于 source map 对齐与调试）。
+core 不是 pi package：`package.json` 里**没有** `pi` 字段，`keywords` 里**没有** `"pi-package"`，目录名也不是 `pi-<name>`——它不认识任何 harness。`npm run check:host-deps` 对它等于自动通过（它不 import 任何宿主包），对 `pi-memory` 才起作用。
 
 ### 8.3 monorepo 集成点（穷举）
 
-| 位置 | 改动 |
+| 位置 | 内容 |
 |---|---|
-| 根 `package.json` → `workspaces` | 追加 `"auto-memory"`（按字母序放最前） |
-| 根 `package.json` → `scripts.test:windows` | 追加 `-w auto-memory`：`fs-retry.win32` / `windows-names` / `paths` 的 win32 分支必须在 windows runner 上真跑，否则阶段 2 搬出去才暴露 |
-| `.github/workflows/test.yml` → `dorny/paths-filter` 的 `filters` | 追加 `auto-memory: - "auto-memory/**"`，否则改动 core 不会触发 `test-packages` |
-| `.github/workflows/test.yml` → `test-packages.exclude` | **不加**排除项：core 是平台中立的，ubuntu 与 windows 都跑 |
-| `package-lock.json` | 新增 workspace 必然改动它 → `lockfile-sync` job 要求提交后的 lockfile 与 `npm install --package-lock-only` 结果零 diff |
-| `scripts/check-host-deps.mjs` | 无需改。core 不 import 任何宿主包；pi-memory 新增的 `dependencies` 项不在 `HOST_PROVIDED_PACKAGES` 里 |
-| `scripts/check-dev-deps.mjs` | 无需改（见 8.2 的 `unclassified` 分支） |
-| `docs/guides/pi-package-spec.md` | 本轮**不改**。core 是临时住户，为它改规范会在阶段 2 再改回来；偏离项记在本文件 8.2 |
-| `.gitignore` / `tsconfig.base.json` / `biome.json` / `vitest.config.ts` | core 沿用根的 `tsconfig.base.json` 与 `biome.json`（阶段 1）；搬出时自带一份 |
+| 根 `package.json` → `workspaces` | `["dsh-memory", "memory-core", "pi-memory"]` |
+| 根 `package.json` → `scripts` | `test` / `typecheck` / `lint` / `format` 走 `--workspaces --if-present`；另有 `check:host-deps`。**不设** `test:windows`：两个包都是平台中立的，Windows 上跑全量 |
+| 根 `vitest.config.ts` → `projects` | `["memory-core", "pi-memory"]`（`dsh-memory` 无测试） |
+| `.github/workflows/test.yml` | `lockfile-sync`（`npm install --package-lock-only` + `git diff --exit-code`）、`test`（ubuntu + windows）、`test-dist`（build 后 `MEMORY_CORE_FROM_DIST=1 npm test -w pi-memory`）、`pack-smoke`（Node 20.16 + 24，两版都打 tarball 并在干净目录跑 `scripts/pack-smoke.mjs`） |
+| `.github/workflows/publish.yml` | `release: published` → 按 tag 前缀选 workspace → `npm publish --provenance` |
+| `scripts/check-host-deps.mjs` | 沿用 pi-packages 的同名脚本（宿主包必须在 `peerDependencies`）；错误文案里的规范路径改成 `AGENTS.md` |
+| `scripts/pack-smoke.mjs` | 只装 core tarball 的干净目录里验证：数据根、`<root>/git/<project>` 形状、写入 → 读回、安装树无宿主包 |
+| `tsconfig.base.json` / `biome.json` / `.gitattributes` / `.gitignore` | 逐字沿用 pi-packages（`.gitattributes` = `* text=auto eol=lf`，Windows runner 默认 CRLF 检出会污染 prompt 模板字面量） |
 
 **CI 影响**：动到根 `package.json` 与 `package-lock.json` → `has_root == true` → 走 `test-full`（全 workspace，ubuntu + windows），`test-packages` 被跳过。已知后果：pi-memory 有两个时序敏感用例（`index-wiring.test.ts` 的 notify 断言、`fs-retry.win32.test.ts` 的 Windows EBUSY）会随机红，`gh run rerun <run> --failed` 重跑即绿；ubuntu 若报 `The strategy configuration was canceled because "test-full.windows-latest" failed`，说明 ubuntu 并未真失败。
 
@@ -404,14 +404,14 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 
 ## 9. 验证计划
 
-1. **core（阶段 1，workspace 内）**：`npm test -w auto-memory`、`npm run typecheck -w auto-memory`、`npm run lint -w auto-memory` 全绿；中立性断言 `grep -rn "@earendil-works\|typebox\|pi-tui\|schemastery" auto-memory/src/` **零命中**（阶段 2 搬出后这条进 core 自己的 CI）。
-2. **core 中立性的机器验证**：`npm pack -w @yandy0725/auto-memory` 得到 tarball，在一个**没有安装任何 harness 包**的干净临时目录里装它并 `node -e "import('@yandy0725/auto-memory').then(m => console.log(Object.keys(m).length))"` 成功。阶段 1 的 tarball 装的是 `src/*.ts`（无 `dist/`），所以这一步只能验证「依赖声明中立」（package.json 里没有 harness 包）；**真正的可 import 验证必须在阶段 2 加上 build 后重跑一次**，它是阶段 2 的发布前门槛。
+1. **core**：`npm test -w memory-core`、`npm run typecheck -w memory-core`、`npm run lint -w memory-core` 全绿；中立性断言 `grep -rnE "from \"(@earendil-works|typebox|pi-tui|schemastery)" memory-core/src/` **零命中**（`tests/neutrality.test.ts` 是同一约束的机器门，也进仓内 CI）。
+2. **core 中立性的机器验证**：`npm pack -w @yandy0725/memory-core` 得到 tarball，在一个**没有安装任何 harness 包**的干净临时目录里装它并 `node -e "import('@yandy0725/memory-core').then(m => console.log(Object.keys(m).length))"` 成功。tarball 里带的是 `dist/`（JS + `.d.ts`）与 `src/`，所以这一步同时验证两件事：「依赖声明中立」与「发布形态真的能被 import」——CI 的 `pack-smoke` job 就是它的常驻版。
 3. **pi-memory**：`npm test -w pi-memory` 全绿，测试文件数不少于拆分前该留的数量；`npm run typecheck -w pi-memory`。
 4. **行为等价（不可协商）**：在一个真实 repo 里，用 3.0.0 跑一遍 `/memory`、写一条 memory、`/dream`、`memory search scope=sessions`，与 2.5.2 的输出逐项对照。索引行格式、frontmatter 字段、`.backups/<ts>-<label>/` 命名必须逐字节一致。
-5. **共享性验证（本轮的验收核心）**：写一个 **不 import 任何 harness 包**的 30 行脚本，直接 `import { MemoryStore, resolveMemoryDir } from "@yandy0725/auto-memory"`，对同一个 repo 解析出与 pi-memory 3.0.0 **完全相同**的目录，读到 pi 刚写的那条 memory。这就是「dsh 侧能共享」的最小可执行证明——不需要真的写 dsh 插件。
+5. **共享性验证（本轮的验收核心）**：写一个 **不 import 任何 harness 包**的 30 行脚本，直接 `import { MemoryStore, resolveMemoryDir } from "@yandy0725/memory-core"`，对同一个 repo 解析出与 pi-memory 3.0.0 **完全相同**的目录，读到 pi 刚写的那条 memory。这就是「dsh 侧能共享」的最小可执行证明——不需要真的写 dsh 插件。
 6. **旧目录提示**：造一个只有 `~/.pi/memory/<kind>/<proj>` 的环境，确认 `/memory` 打出提示且**没有**任何文件被创建/移动/修改（`find -newer` 断言）。
 7. **迁移一行命令**：在临时 HOME 上执行 §6 的 `mv`，确认 pi 3.0.0 随后能读到全部 52 条。
-8. **阶段 2 额外验收**（本轮不执行，列出以免遗忘）：搬出后的 repo 里 `npm run build && npm test` 全绿；§9.2 的可 import 验证通过；`npm pack` 的 tarball 里确实包含 `dist/`；pi-memory 删掉 workspace link、改吃 registry 1.0.0 后 `npm ci && npm test -w pi-memory` 仍全绿；§9.5 的中立脚本在只装了发布版 core 的目录里仍能读到 pi 刚写的 memory。
+8. **仓内就验证发布形态**：`npm run build -w memory-core` 后 `MEMORY_CORE_FROM_DIST=1 npm test -w pi-memory`（alias 关掉，打 `dist`）仍全绿；`npm pack` 的 tarball 里确实包含 `dist/` 与 `.d.ts`；干净目录里 `node scripts/pack-smoke.mjs` 能写入→读回。这条不让首次发布去承担一套从没跑过的形状。
 
 ---
 
@@ -424,9 +424,9 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 | 端口设计对 dsh 不够用（本轮不写 dsh 插件，无实测） | §3.2 的对照表已按 dsh 真实 `.d.ts` 逐项落点；`HeadlessRunRequest` 的字段全部是 dsh `GenerateOptions` / `subagents.start` 能表达的量（`model`/`effort` 为 opaque string 正是为此）。残留风险：dsh 的 `output.render` 与工具结果形状可能需要 handler 返回结构化 `details`——已经返回了 |
 | core 的公开 API 面过大，日后难改 | 1.0.0 只导出适配层实际用到的符号；`src/index.ts` 是唯一入口，子路径不导出（`exports` 里没有 `./store/*`） |
 | 拆分把测试拆丢 | §7 末行的硬约束：两个包的测试文件数之和 ≥ 31，不允许删用例 |
-| 阶段 1 的 core 因为住在 monorepo 里而意外沾上宿主依赖（比如图方便 import 一个 pi 工具函数） | §9.1 的 grep 断言是硬门，且 core 的 `package.json` 里根本没有任何 harness 包可 import（monorepo 的 hoisting 会让 `node_modules` 里看得到它们，所以光靠「编译不过」拦不住，必须靠 grep） |
-| 阶段 2 搬迁丢掉 `auto-memory/` 的开发历史 | **我的决定（minor）**：新 repo 用单个 initial commit，不用 `git filter-repo` 保留历史，README 里给一行指回 pi-packages 的拆分 PR。理由：filter-repo 抽子目录后 commit SHA 全变，两边的交叉引用（spec 里的 `2026-09-30-pi-sandbox-package-split-design.md` 这类）一样对不上；而新包的 lineage 确实从发布那一刻开始，版本历史由 npm 与 GitHub Release 承担 |
-| 回滚 | 阶段 1：PR 不合即回滚，零外部影响（core 是 `private: true`，不可能误发）。阶段 2：已发布后回滚 = pi-memory 发 3.0.1 把 `memoryDir` 默认值改回 `~/.pi/memory`（磁盘格式从未变过，所以两个方向的迁移都只是 `mv`） |
+| core 因为住在共享 `node_modules` 的仓里而意外沾上宿主依赖（比如图方便 import 一个 pi 工具函数） | §9.1 的 grep 断言是硬门，且 core 的 `package.json` 里根本没有任何 harness 包可 import（hoisting 会让宿主的包在 `node_modules` 里看得到，所以光靠「编译不过」拦不住，必须靠 grep 与 `tests/neutrality.test.ts`） |
+| 搬迁丢掉 `pi-memory`/`memory-core` 的开发历史 | **我的决定（minor）**：新 repo 用单个 initial commit，不用 `git filter-repo` 保留历史，README 里给一行指回 pi-packages。理由：filter-repo 抽子目录后 commit SHA 全变，两边的交叉引用（spec 里的 `2026-09-30-pi-sandbox-package-split-design.md` 这类）一样对不上；而新包的 lineage 确实从发布那一刻开始，版本历史由 npm 与 GitHub Release 承担 |
+| 回滚 | 未发布前：回滚该 PR 即可（core 未上 registry，零外部影响）。已发布后回滚 = pi-memory 发 3.0.1 把 `memoryDir` 默认值改回 `~/.pi/memory`（磁盘格式从未变过，所以两个方向的迁移都只是 `mv`） |
 
 ---
 
@@ -438,7 +438,7 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 - `prompts.ts` 是否把三段 prompt 文本拆成独立文件（现有 `buildDreamTask` 41 行、`buildExtractTask` 68 行、`buildSideQueryTask` 37 行，合起来约 150 行）
 - 假端口在测试里的构造方式（现有测试已有大量 stub 先例可沿用）
 - 31 个测试文件逐个归哪个 repo：按 §7 的模块归属表推导（例：`index-wiring` `prompt-meta` `agent-*` `model-resolver` `index-source` `nudge` `session-search` `memory-tool` 留 pi；其余跟着自己的模块走）
-- core repo 的 CI 具体形态（阶段 2；建议：`build + test + typecheck + lint + 中立性 grep`，ubuntu 单 runner，加一个 windows job 只跑 `fs-retry.win32` / `windows-names` / `paths` 的 win32 分支）
+- core 仓的 Windows CI 覆盖哪些文件（现在整仓在两个 runner 上跑全量；将来若变慢，可收窄到 `fs-retry.win32` / `windows-names` / `paths` 的 win32 分支）
 - README 的语言与结构（建议沿用 pi-memory 现有的双语 + 章节顺序，删掉所有 pi 专属章节，新增「Adapting to a new harness」一节讲两个端口）
 
 以下是我已定的 minor（可在评审时推翻）：
@@ -449,4 +449,4 @@ Note: found pre-3.0 memories at ~/.pi/memory/<kind>/<project>. Move them with:
 - **`runExtract` 经端口拿 `ExtractMessage`**：新签名为 `runExtract(opts, ports: { headless, transcript })`，`opts.messages` 仍是宿主原始形状，core 内部调 `ports.transcript.toExtractMessages(raw)`（§4.1）
 - **surfaced 条目的渲染也是 core 的纯函数**：`renderSurfacedBlock(entries, limits) → string`（读正文、按 `maxEntryBytes`/`maxInjectionBytes` 截断、拼 `<relevant_memories>` 形状）进 core；适配层只负责「把这段字符串放进哪个通道」与「本 session 已注入过哪些文件」的去重状态
 - **新 repo 用单个 initial commit**，不用 `git filter-repo` 保留子目录历史（§10）
-- **包名 `auto-memory` 与数据目录 `auto-memory` 同名**，两者都来自 D3/D5；`XDG_DATA_HOME` 下的目录名与包名一致是刻意的，便于用户从 `ls ~/.local/share` 反查是哪个包写的
+- **数据目录名与仓库名同为 `simple-memory`**（包名是 `memory-core`）：`XDG_DATA_HOME` 下的目录名对齐仓库，便于用户从 `ls ~/.local/share` 反查是哪个仓写的；包名对齐职责，避免与 pi 语境里的「auto-memory 机制」混淆
