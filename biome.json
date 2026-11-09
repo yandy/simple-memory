@@ -30,5 +30,5 @@
 			}
 		}
 	},
-	"files": { "includes": ["**/*.ts", "**/*.json", "!**/tests/**"], "ignoreUnknown": true }
+	"files": { "includes": ["**/*.ts", "**/*.json", "!**/tests/**", "!**/dist/**"], "ignoreUnknown": true }
 }

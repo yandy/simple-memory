@@ -21,6 +21,23 @@
 `CreateAgentSessionOptions.modelRegistry` → `modelRuntime`/`model`），而当前代码是按 0.80.2
 写的。升级这三个 devDependency 必然连带改代码，必须当成一次独立变更来做。
 
+## dsh 宿主包
+
+`dsh-memory` 的宿主包是 `@deepseek-ai/*`（九个），处理规则比 pi 系更严格：
+
+- **只能出现在 `peerDependencies` 与 `devDependencies`**。九个 peer 全部在 `peerDependenciesMeta` 里标
+  `optional: true`：某个 profile 缺其中一个时，插件保持 inactive（fiber pending）而不是让整个安装失败。
+  它们绝不能进 `dependencies`（`npm run check:host-deps` 会拦）。
+- **devDependencies 钉精确版本**：`0.2.2-rc.1`，`@deepseek-ai/cordis` 例外为 `4.1.0`。这不是疏忽 ——
+  宿主 `0.2.0-rc.2` → `0.2.2-rc.1` 一个跨度就破坏了三处本仓已经对着宿主源码改正的接口
+  （见 `docs/superpowers/specs/2026-11-09-dsh-memory-adapter-design.md` §2.3），升级必须是一次
+  deliberate 的变更，与本仓对 `@earendil-works/*` 钉死的理由相同。
+- **运行时零宿主 import**：out-of-tree 插件无法静态解析宿主包，所以 `src/` 里 `@deepseek-ai/*` 只出现在
+  `src/host-types.ts`、且只以 `import type` 出现（tsc 擦除）。执行点是
+  `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 必须零命中（`.d.ts` 里命中是合法的，不算失败）。
+- **不导出 schemastery `Config`**：导出它需要运行时 import `@deepseek-ai/schemastery`，与零宿主 import
+  冲突。代价是没有宿主的 Settings-UI 页面，行 config 由插件自己校验（`src/row-config.ts`）。
+
 ## 依赖自动更新
 
 `.github/dependabot.yml` 的骨架与 `yandy/pi-packages` 保持一致（周更、限 5 个 PR、dev 依赖

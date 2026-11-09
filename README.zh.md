@@ -11,7 +11,7 @@
 |---|---|---|
 | [memory-core](./memory-core) | 与 harness 无关的基础层：磁盘格式、`MemoryStore`、两级锁、快照、项目路径、注入策略、dream/extract 编排，以及中立的 `memory` 工具契约（JSON Schema + handler）。只 import `node:*`。 | `@yandy0725/memory-core` |
 | [pi-memory](./pi-memory) | pi 适配层：extension 装配、`/memory` 与 `/dream`、typebox schema + pi-tui 渲染、prompt cache 的 section 冻结、headless 子会话、会话搜索。 | `@yandy0725/pi-memory` |
-| [dsh-memory](./dsh-memory) | DeepSeek harness（`@deepseek-ai/dsh`，cordis）适配层。**占位，尚未实现。** | `@yandy0725/dsh-memory` |
+| [dsh-memory](./dsh-memory) | DeepSeek harness（`@deepseek-ai/dsh`，cordis）适配层：cordis bundle 装配、`memory_index` 段、`memory` 工具与 `/memory`、每轮召回；`extractMemories`/`dream` 本轮未实现。 | `@yandy0725/dsh-memory` |
 
 宿主专属的那一半（何时注入、怎么渲染、调哪个模型）由适配层负责；`memory-core` 负责必须处处一致的
 那一半 —— 下面的文件是共享的，不是每个 harness 各存一份。
@@ -27,7 +27,9 @@ $XDG_DATA_HOME/simple-memory/<git|local>/<project>/
 `local/<转义后的绝对路径>`。
 
 每个项目目录下有 `MEMORY.md`（索引）、一条记忆一个 `*.md`、`.lock`、`.backups/`、`.dream-meta.json`
-与 `sessions/`。`memoryDir` 配置项可覆盖根目录；`~` 与 `~/` 会展开，相对路径按工作目录解析。
+与 `sessions/`。`memoryDir` 配置项可覆盖根目录；`~` 与 `~/` 会展开，相对路径按工作目录解析。`memoryDir` 是 **per-harness
+配置**（pi 从 `memory.json` 读，dsh 从自己的 cordis 行 `config:` 读）：覆盖了就要在**每个**宿主里都覆盖，
+否则两个宿主写进不同的目录，共享就静默失效。
 
 磁盘格式与 `pi-memory` 2.x 逐字节相同：YAML frontmatter 含 `name`/`description`/`type`/`created`/
 `modified`，索引每条记忆一行（`- [Name](file.md) — description`），回滚点是 `.backups/<ts>-<label>/`。
@@ -56,8 +58,8 @@ mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true    # 早年工�
 ## 开发
 
 ```bash
-npm ci                        # 根 + 两个可测 workspace
-npm test                      # memory-core 与 pi-memory
+npm ci                        # 根 + 三个 workspace
+npm test                      # memory-core、pi-memory 与 dsh-memory
 npm run typecheck && npm run lint
 npm run build -w memory-core  # dist/（ESM + .d.ts + maps）；CI 另外验证打包出来的 tarball
 npm run check:host-deps       # 宿主提供的包必须在 peerDependencies，不能进 dependencies
@@ -65,7 +67,5 @@ npm run check:host-deps       # 宿主提供的包必须在 peerDependencies，�
 
 `memory-core` 的 `src/**` 只许 import `node:*` 与相对路径 —— `memory-core/tests/neutrality.test.ts` 是这条
 约束的执行点，也是第二个 harness 能依赖这个包的唯一理由。
-
-`dsh-memory` 没有代码，因此没有 test 脚本；`npm test` 会跳过它。
 
 发布流程见 [docs/guides/release.md](./docs/guides/release.md)。

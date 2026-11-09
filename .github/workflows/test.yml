@@ -38,8 +38,8 @@ jobs:
       - run: npm test
 
   # 仓内解析走 memory-core 的源码（vitest alias + tsconfig paths），所以 `test` job 测的是逻辑。
-  # 这个 job 把 alias 关掉，让 pi-memory 的测试经包 exports 打到 memory-core/dist —— 用户拿到的
-  # 那条解析路径必须被真实执行一次，否则首次发布就是它的第一次运行。
+  # 这个 job 把 alias 关掉，让 pi-memory 与 dsh-memory 的测试经包 exports 打到 memory-core/dist ——
+  # 用户拿到的那条解析路径必须被真实执行一次，否则首次发布就是它的第一次运行。
   test-dist:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -50,8 +50,20 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci
-      - run: npm run build -w memory-core
+      - run: npm run build -w memory-core && npm run build -w dsh-memory
+      # dsh 宿主包只允许 `import type`（零运行时 import）：dist/**/*.js 里必须零 @deepseek-ai
+      # 命中。只 grep .js —— .d.ts 里出现宿主类型是合法的（type-only import 被 tsc 擦掉）。
+      - name: Assert no @deepseek-ai runtime imports in dsh-memory dist
+        run: |
+          if grep -rq "@deepseek-ai" dsh-memory/dist --include="*.js"; then
+            echo "::error::dsh-memory/dist contains a runtime @deepseek-ai import"
+            grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"
+            exit 1
+          fi
       - run: npm test -w pi-memory
+        env:
+          MEMORY_CORE_FROM_DIST: "1"
+      - run: npm test -w dsh-memory
         env:
           MEMORY_CORE_FROM_DIST: "1"
 

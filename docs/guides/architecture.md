@@ -6,7 +6,7 @@
 |------|------|------|
 | `memory-core` | `@yandy0725/memory-core` | 与 harness 无关的基础层 |
 | `pi-memory` | `@yandy0725/pi-memory` | pi 适配层 |
-| `dsh-memory` | 占位 | 无代码 |
+| `dsh-memory` | `@yandy0725/dsh-memory` | dsh（cordis）适配层：bundle 装配、行 `config:` 为唯一配置层、按 agent 注册工具 / 解析 store、`agent/pre-step` 每轮召回、会话日志扫描（`scope=sessions`） |
 
 依赖方向单向：适配层依赖 `memory-core`，反过来不允许。
 
@@ -20,6 +20,10 @@
 ## 公开 API 只从 `src/index.ts` 出
 
 `memory-core` 的 `exports` 里没有子路径，子路径也不该有。
+
+`dsh-memory` 遵循同一条规则：`exports` 只有 `.`（`dist/index.js`）、`cordis.patch.yml` 与
+`package.json`。宿主类型只从 `src/host-types.ts` 走，且只允许 `import type` —— tsc 擦除后
+`dist/**/*.js` 零宿主命中（`npm run build` 的验收点）。
 
 ## 用户契约
 
