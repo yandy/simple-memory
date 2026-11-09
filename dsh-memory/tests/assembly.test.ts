@@ -281,6 +281,33 @@ describe("apply — per-agent 生命周期", () => {
 		expect(result.text).toContain('unknown config key "bogus" — ignored');
 	});
 
+	it("tells the user in /memory when they configured a module this adapter does not implement", async () => {
+		// 白名单从 DEFAULT_CONFIG 派生，`dream` / `extractMemories` 能无声无息地通过校验却没有任何效果：
+		// 用户写了就得在状态块里看见，不能只有 README 里的一句披露。
+		const { fake } = await setup(
+			{},
+			rowConfig({ dream: { model: "prov/dream" }, extractMemories: { enabled: true } }),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		const result = await runMemoryCommand(fake, agent);
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("dream=not implemented in this adapter");
+		expect(result.text).toContain("extractMemories=not implemented in this adapter");
+		// 它们没配错，所以不该额外产生告警。
+		expect(result.text).not.toContain("Config:");
+
+		// 没写它们的用户看不到这两段（避免噪声）。
+		const quiet = createFakeCtx();
+		await apply(quiet.ctx, rowConfig());
+		const quietAgent = quiet.makeAgent({ id: "s2", cwd });
+		await quiet.emitter.agentCreated(quietAgent);
+		const quietResult = await runMemoryCommand(quiet, quietAgent);
+		expect(quietResult.text).not.toContain("not implemented in this adapter");
+	});
+
 	it("degrades instead of failing when the row config is not an object (D13)", async () => {
 		const { fake } = await setup({}, "nope");
 

@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DEFAULT_CONFIG, LOCK_FILE, MemoryStore, mergeConfig } from "@yandy0725/memory-core";
+import { join, resolve } from "node:path";
+import { DEFAULT_CONFIG, LOCK_FILE, MemoryStore, mergeConfig, projectDirName } from "@yandy0725/memory-core";
 import type { MemoryConfig } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createMemoryCommand, describeHolder, renderStatus } from "../src/commands.js";
@@ -14,9 +14,16 @@ let dir: string;
 
 beforeEach(async () => {
 	dir = await mkdtemp(join(tmpdir(), "am-cmd-"));
+	// unlock 的重试路径会调 core 的 `resolveMemoryDir`（= 一次 git 探测）。与 store-registry / assembly
+	// 同一套 hermetic 手法：绝不读开发者机器的 global / system git config。
+	const emptyGitConfig = join(dir, "gitconfig-empty");
+	await writeFile(emptyGitConfig, "", "utf8");
+	vi.stubEnv("GIT_CONFIG_GLOBAL", emptyGitConfig);
+	vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
 });
 
 afterEach(async () => {
+	vi.unstubAllEnvs();
 	await rm(dir, { recursive: true, force: true });
 });
 
@@ -172,6 +179,36 @@ describe("renderStatus", () => {
 		expect(text).toContain("Config: 2 warning(s)");
 		for (const w of warnings) expect(text).toContain(w);
 	});
+
+	it("names unimplemented modules in the Modules line, and only when the user configured them", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+
+		// 没配 dream / extractMemories 的用户不该看到它们（避免噪声）。
+		const quiet = await renderStatus(rt, []);
+		expect(quiet).toContain("Modules: autoSurfacing=on(no model)");
+		expect(quiet).not.toContain("not implemented");
+
+		// 配了就地报：白名单从 DEFAULT_CONFIG 派生，这两棵子树天生能通过校验却没有任何效果。
+		const loud = await renderStatus(rt, [], ["dream", "extractMemories"]);
+		expect(loud).toContain(
+			"Modules: autoSurfacing=on(no model), dream=not implemented in this adapter, extractMemories=not implemented in this adapter",
+		);
+	});
+
+	it("threads deps.unimplementedModules into the rendered status", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+
+		const result = await handlerFor(rt, [], { unimplementedModules: ["dream"] })({
+			agent: { session: { id: "s1" } },
+			rawInput: "",
+		});
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("dream=not implemented in this adapter");
+		expect(result.text).not.toContain("extractMemories=");
+	});
 });
 
 describe("misconfigured states", () => {
@@ -244,21 +281,77 @@ describe("unlock", () => {
 
 		expect(result.kind).toBe("error");
 		expect(result.text).toContain("Cannot unlock");
+		// 不能死路一条：文案要说清下一步去哪里。
+		expect(result.text).toContain("/memory");
 		expect(existsSync(lockPath)).toBe(true);
 	});
 
-	it("returns an error and touches nothing when the memory directory is unresolved", async () => {
+	it("re-resolves the directory from rt.cwd when the session started in the error state", async () => {
+		// 以配置错误启动的会话：store / memoryDir 都是 null，但 rt.cwd 有值。清锁是崩溃遗留 `.lock`
+		// 的唯一人工入口，所以这里按需重解一次目录（pi 在同类状态下也是这么做的）。
+		const root = join(dir, "mem-root");
+		const cwd = join(dir, "cwd");
+		await mkdir(cwd, { recursive: true });
+		// 与 store-registry 的解析同式（普通非 git 目录 → `<root>/local/<escaped cwd>`）—— 刻意不用
+		// `resolveMemoryDir` 自证：那会把实现里的错公式同时写进期望值。
+		const resolvedDir = join(resolve(root), "local", projectDirName(resolve(cwd)));
+		const lockPath = join(resolvedDir, LOCK_FILE);
+		await mkdir(resolvedDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+		// 同目录里放一个兄弟文件：「只删 .lock」在重试路径上同样成立。
+		const sibling = join(resolvedDir, "deadbeef.md");
+		await writeFile(sibling, "sibling entry body\n", "utf8");
+
+		const rt = makeRuntime(root, null, {
+			memoryDir: null,
+			cwd,
+			error: "dsh-memory row config must be an object",
+		});
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock --force" });
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("Memory lock removed.");
+		expect(existsSync(lockPath)).toBe(false);
+		expect(existsSync(sibling)).toBe(true);
+		expect(await readFile(sibling, "utf8")).toBe("sibling entry body\n");
+	});
+
+	it("still requires --force on the re-resolve path", async () => {
+		const root = join(dir, "mem-root");
+		const cwd = join(dir, "cwd");
+		await mkdir(cwd, { recursive: true });
+		const resolvedDir = join(resolve(root), "local", projectDirName(resolve(cwd)));
+		const lockPath = join(resolvedDir, LOCK_FILE);
+		await mkdir(resolvedDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+
+		const rt = makeRuntime(root, null, { memoryDir: null, cwd, error: "dsh-memory row config must be an object" });
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock" });
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain(`Lock is held by ${HELD_LOCK_DESCRIPTION}`);
+		expect(result.text).toContain("--force");
+		expect(existsSync(lockPath)).toBe(true);
+	});
+
+	it("returns an actionable error and touches nothing when the directory cannot be re-resolved either", async () => {
 		const memoryDir = join(dir, "mem");
 		const lockPath = join(memoryDir, LOCK_FILE);
 		await mkdir(memoryDir, { recursive: true });
 		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
-		// runtime 存在但目录没解析出来（store-registry 的失败态）：没有可以清的目录。
-		const rt = makeRuntime(memoryDir, null, { memoryDir: null, error: "resolve failed" });
+		// 目录没解出来、连 cwd 也没有（dirs.ensure 拒绕 + session.header.cwd 为空）：无从重试。
+		const rt = makeRuntime(memoryDir, null, { memoryDir: null, cwd: "", error: "resolve failed" });
 
 		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock --force" });
 
 		expect(result.kind).toBe("error");
 		expect(result.text).toContain("Cannot unlock");
+		// 说清下一步（先修行 config / 先用 /memory 确认 Dir:），而不是只报一个状态。
+		expect(result.text).toContain("row config");
+		expect(result.text).toContain("/memory");
+		expect(result.text).toContain("unlock --force");
 		expect(existsSync(lockPath)).toBe(true);
 	});
 
