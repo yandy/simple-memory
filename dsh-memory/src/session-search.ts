@@ -92,7 +92,7 @@ function contentText(content: unknown): string {
 /**
  * 单条事件的可搜文本抽取（内部纯函数，直接可单测）。可搜类型限定为四类：
  * `user/message` / `assistant/message` / `tool/call` / `tool/result`（spec §5.8 修订后）。
- * `todo`/`write` 与 `turn`/`end` 虽然在宿主的 `extractSessionEventText`
+ * `todo/write` 与 `turn/end` 虽然在宿主的 `extractSessionEventText`
  * （`dsh-session-query/lib/index.js`）里会被抽，但 pi 搜不到它们（pi 只扫 message 文本），
  * 为了跨宿主同语义（D14）这里**刻意不抽** —— 不要当"遗漏"补回来。
  * 其余类型（`turn/start`、`step/start`、`step/end`、`assistant/attempt`、`request/header` 等）

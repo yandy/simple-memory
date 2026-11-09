@@ -1,3 +1,4 @@
+import { ENTRY_TRUNCATION_MARKER } from "@yandy0725/memory-core";
 import { describe, expect, it, vi } from "vitest";
 import { createSessionSearch } from "../src/session-search.js";
 import { createFakeCtx } from "./helpers/fake-ctx.js";
@@ -227,6 +228,29 @@ describe("createSessionSearch", () => {
 
 		const matchedLine = out.split("\n").find((l) => l.includes("…matched:"));
 		expect(matchedLine).toBe(`…matched: "${longMatch.slice(0, 150)}"…`);
+	});
+
+	it("caps the output body at 50000 bytes (the byte arm of truncateForInjection)", async () => {
+		// 5 个命中，每个命中拿满 ±50 的上下文窗口（101 行 × 202 字节 ≈ 20 KB），合计 ≈ 102 KB ——
+		// 足以触发按字节削的 50000 上限（2000 行的那一臂在 maxMatches: 5 下到不了）。
+		const events: Array<{ type: string; data: unknown }> = [];
+		for (let region = 0; region < 5; region++) {
+			for (let i = 0; i < 50; i++) events.push(userMessage(`before-${region}-${i} ${"x".repeat(180)}`));
+			events.push(userMessage(`needle-${region}`));
+			for (let i = 0; i < 50; i++) events.push(userMessage(`after-${region}-${i} ${"y".repeat(180)}`));
+		}
+		const { ctx } = createFakeCtx({ sessions: [session("s1", events)] });
+
+		const out = await search(ctx, "needle");
+
+		expect(out).toContain("Found 5 match(es):");
+		// core 先按字节削到 50000，**再**追加 `\n` + 标记，所以整体是 50000 + 1 + 49 = 50050 字节。
+		// 这里 pin 住的是 core 的口径：正文（去掉标记行）不超过 50000 字节，且削得足够紧。
+		const markerLine = `\n${ENTRY_TRUNCATION_MARKER}`;
+		expect(out.endsWith(markerLine)).toBe(true);
+		const bodyBytes = Buffer.byteLength(out.slice(0, out.length - markerLine.length), "utf8");
+		expect(bodyBytes).toBeLessThanOrEqual(50_000);
+		expect(bodyBytes).toBeGreaterThan(49_900);
 	});
 
 	it("drops sessions whose header.cwd differs from the queried cwd even if the host filter returns them", async () => {
