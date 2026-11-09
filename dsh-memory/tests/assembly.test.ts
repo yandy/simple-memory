@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
 	buildIndexSection,
 	DEFAULT_CONFIG,
+	MEMORY_TOOL_GUIDELINES,
 	MEMORY_TOOL_SNIPPET,
 	MemoryStore,
 	mergeConfig,
@@ -76,6 +77,14 @@ async function expectedIndexBody(memoryDir: string): Promise<string> {
 	});
 	return buildIndexSection(store, cfg.memIndexInjectMaxLines, cfg.memIndexInjectMaxBytes);
 }
+
+/**
+ * `memory_index` section 的静态前缀期望值：snippet → guidelines，空行分隔。
+ *
+ * 刻意在测试里重新拼一遍（而不是从 src 导入一个现成常量）：两边同时变就丢了钉子的意义。
+ * guidelines 是字符串数组，渲染成 `- <rule>` 逐行 —— 与 pi 宿主对 `promptGuidelines` 的渲染同式。
+ */
+const EXPECTED_PREAMBLE = `${MEMORY_TOOL_SNIPPET}\n\n${MEMORY_TOOL_GUIDELINES.map((rule) => `- ${rule}`).join("\n")}`;
 
 /** 跑一次 `apply`：宿主的一次插件激活。 */
 async function setup(
@@ -323,9 +332,9 @@ describe("apply — per-agent 生命周期", () => {
 		await expect(tool?.execute({ action: "list" }, {})).rejects.toThrowError(/must be an object/);
 
 		const text = sectionText(fake);
-		// 错误态（store === null）仍要有 snippet（D13：工具仍然注册，只是降级；§2.6 推论 2）。
-		// 索引正文为空，所以 section 只有 snippet。
-		expect(text({ agent })).toBe(MEMORY_TOOL_SNIPPET);
+		// 错误态（store === null）仍要有工具文案：降级而不失败，工具仍然注册。
+		// 索引正文为空，所以 section 只有 snippet + guidelines。
+		expect(text({ agent })).toBe(EXPECTED_PREAMBLE);
 
 		const status = await runMemoryCommand(fake, agent);
 		expect(status.text).toContain("Memory: misconfigured");
@@ -380,17 +389,23 @@ describe("apply — per-agent 生命周期", () => {
 	});
 });
 
-describe("apply — MEMORY_TOOL_SNIPPET 落点（§2.6）", () => {
-	it("shows the tool snippet for a healthy session with zero memories", async () => {
+describe("apply — 三通道文案在 memory_index section 的落点", () => {
+	it("shows the snippet and every guideline for a healthy session with zero memories", async () => {
 		const { fake } = await setup();
 		const agent = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(agent);
 
-		// 新项目：索引为空，section 就只剩 snippet —— 这正是第一次该告诉模型「工具有」的时机。
-		expect(sectionText(fake)({ agent })).toBe(MEMORY_TOOL_SNIPPET);
+		// 新项目：索引为空，section 就只剩工具文案 —— 这正是第一次该告诉模型「工具有、怎么写」的时机。
+		const text = sectionText(fake)({ agent });
+		expect(text).toBe(EXPECTED_PREAMBLE);
+		// 顺序固定：snippet → guidelines（空行分隔，每条一行 `- ` 前缀）。
+		expect(text.startsWith(`${MEMORY_TOOL_SNIPPET}\n\n- `)).toBe(true);
+		// 7 条 guidelines 逐字落地：core 的提示词文本一个字都不改。
+		for (const rule of MEMORY_TOOL_GUIDELINES) expect(text).toContain(`- ${rule}`);
+		expect(text.match(/^- /gm)).toHaveLength(MEMORY_TOOL_GUIDELINES.length);
 	});
 
-	it("prepends the snippet to a byte-identical core index body", async () => {
+	it("prepends snippet + guidelines to a byte-identical core index body", async () => {
 		const memoryDir = memoryDirFor(cwd);
 		await seedEntry(memoryDir, "Alpha", "first note");
 		const { fake } = await setup();
@@ -398,21 +413,23 @@ describe("apply — MEMORY_TOOL_SNIPPET 落点（§2.6）", () => {
 		await fake.emitter.agentCreated(agent);
 
 		const body = await expectedIndexBody(memoryDir);
-		// 只 prepend，正文逐字不动（跨宿主字节恒等是硬要求，§2.6）。
-		expect(sectionText(fake)({ agent })).toBe(`${MEMORY_TOOL_SNIPPET}\n\n${body}`);
+		const text = sectionText(fake)({ agent });
+		// 只 prepend：索引正文逐字不动（跨宿主字节恒等是硬要求）—— 不二次净化、不二次截断。
+		expect(text).toBe(`${EXPECTED_PREAMBLE}\n\n${body}`);
+		expect(text.endsWith(body)).toBe(true);
 	});
 
-	it("keeps the snippet for a directory-failure session and still registers the degraded tool", async () => {
-		// D13 的另一分支：dirs.ensure 拒绝且 session.header.cwd 为空 → prepare 产出 store=null + error。
+	it("keeps the tool text for a directory-failure session and still registers the degraded tool", async () => {
+		// 降级而不失败的另一分支：dirs.ensure 拒绝且 session.header.cwd 为空 → prepare 产出 store=null + error。
 		const fake = createFakeCtx();
 		const ensure = vi.spyOn(fake.ctx.workingDirectory, "ensure").mockRejectedValue(new Error("ensure boom"));
 		await apply(fake.ctx, rowConfig());
 		const agent = fake.makeAgent({ id: "s1", session: { id: "s1", header: { cwd: "" } } });
 		await fake.emitter.agentCreated(agent);
 
-		// 错误态也要有 snippet（D13：工具仍注册，只是降级；§2.6 推论 2），索引正文为空。
+		// 错误态也要有工具文案（工具仍然注册，只是降级），索引正文为空。
 		const text = sectionText(fake);
-		expect(text({ agent })).toBe(MEMORY_TOOL_SNIPPET);
+		expect(text({ agent })).toBe(EXPECTED_PREAMBLE);
 
 		// 工具仍在、execute 拒绝并带上目录失败原因；/memory 报告 misconfigured。
 		const tool = memoryToolOf(fake, "s1");
@@ -423,7 +440,7 @@ describe("apply — MEMORY_TOOL_SNIPPET 落点（§2.6）", () => {
 		expect(status.text).toContain("Memory: misconfigured");
 		expect(status.text).toContain("ensure boom");
 
-		// 门禁只挡子 agent：它从没进 runtime，所以 snippet 也不该有（§2.6 推论 3）。
+		// 门禁只挡子 agent：它从没进 runtime，所以三通道文案一样都不该有。
 		const sub = fake.makeAgent({ id: "sub-1", subagent: true, cwd });
 		await fake.emitter.agentCreated(sub);
 		expect(text({ agent: sub })).toBe("");

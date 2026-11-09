@@ -1,4 +1,4 @@
-import { MEMORY_TOOL_SNIPPET } from "@yandy0725/memory-core";
+import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET } from "@yandy0725/memory-core";
 import { createMemoryCommand } from "./commands.js";
 import { createDshHeadless } from "./headless.js";
 import type { LlmLike } from "./headless.js";
@@ -59,6 +59,21 @@ interface SessionCleanup {
 	disposeTool(): void;
 	disposeEffect?(): void;
 }
+
+/**
+ * core 的 `MEMORY_TOOL_GUIDELINES` 是一个字符串数组（一条规则一项），而宿主只给我们一个纯文本
+ * 通道，所以得自己拼：一条一行、`- ` 前缀 —— 与 pi 侧模型看到的渲染同式（pi-memory 把数组
+ * 原样交给 `ToolDefinition.promptGuidelines`，pi 宿主再把每条渲染成 `- <rule>` 并逐行拼接）。
+ * 文本逐字来自 core：不 trim、不去重、不改写（提示词文本是用户契约，改一个字就同时改了两个宿主）。
+ */
+const GUIDELINES_BLOCK = MEMORY_TOOL_GUIDELINES.map((rule) => `- ${rule}`).join("\n");
+
+/**
+ * `memory_index` section 的静态前缀：snippet → guidelines。两个通道的出现判据完全相同，
+ * 所以合成一块；它是静态文本，能被宿主的 prompt cache 命中，相对于索引本身最多 16KB 的
+ * 注入预算占比很小。
+ */
+const PROMPT_PREAMBLE = `${MEMORY_TOOL_SNIPPET}\n\n${GUIDELINES_BLOCK}`;
 
 function messageOf(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
@@ -131,19 +146,22 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// text 必须是全函数：宿主每次装配都调它（诊断路径还会传一个没有 agent 的 `{}`），
 		// 查不到运行时（没 prepare 过、子 agent、诊断路径）就返回空串，永不抛错、永不返回 undefined。
 		//
-		// §2.6：`MEMORY_TOOL_SNIPPET` 的落点与出现判据。dsh 的 ToolSchema 没有 pi 的 `promptSnippet`
-		// 通道，这个 section 是唯一能把 snippet 递给模型的通道；判据是「该 session 有 runtime」
-		// （`registry.get(sessionId) !== undefined`），那正是 `agent/created` 给该 agent 注册工具的
-		// 条件 —— 工具在，snippet 就在，与 pi 一致。拼接规则：
+		// 三通道文案里有两个落在这里：dsh 的 ToolSchema 没有 pi 的 `promptSnippet` / `promptGuidelines`
+		// 通道，这个 section 是唯一能把它们递给模型的通道。**出现判据：该 session 有 runtime**
+		// （`registry.get(sessionId) !== undefined`），那正是 `agent/created` 给该 agent 注册工具的条件 ——
+		// 工具在，工具文案就在，与 pi 一致（子 agent 拿不到 runtime，自然两样都拿不到）。拼接规则：
 		//   无 runtime → ""
-		//   有 runtime 且索引空 → 只有 snippet（新项目第一次被告知工具存在的时机）
-		//   有 runtime 且索引非空 → snippet + "\n\n" + 索引正文
-		// 只在前面拼，正文本身逐字不动（跨宿主字节恒等是硬要求，见 index-cache.ts）。
+		//   有 runtime 且索引空 → snippet + guidelines（新项目第一次被告知工具存在的时机）
+		//   有 runtime 且索引非空 → snippet + guidelines + 索引正文（每段之间空一行）
+		// guidelines 也要落进来的理由：记忆目录是共享的，所以**写入质量是跨宿主的** —— guidelines
+		// 管的正是写入质量（「description 必须自足」及其正反例），dsh 会话写出含糊的 description 会
+		// 连带降低 pi 会话的召回质量。
+		// 只在前面拼，索引正文本身逐字不动（跨宿主字节恒等是硬要求，见 index-cache.ts）。
 		text: (context) => {
 			const sessionId = context.agent?.session.id ?? "";
 			if (registry.get(sessionId) === undefined) return "";
 			const indexBody = indexCache.read(sessionId);
-			return indexBody === "" ? MEMORY_TOOL_SNIPPET : `${MEMORY_TOOL_SNIPPET}\n\n${indexBody}`;
+			return indexBody === "" ? PROMPT_PREAMBLE : `${PROMPT_PREAMBLE}\n\n${indexBody}`;
 		},
 	};
 	ctx.systemPrompt.section(section);

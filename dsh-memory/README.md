@@ -16,7 +16,8 @@ pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样�
 本轮交付四件事：
 
 - **`memory_index` system prompt 段** —— 把索引（`MEMORY.md` 的最新一段窗口）注入进每个 session 的
-  system prompt，正文与 pi 注入的逐字相同。
+  system prompt，正文与 pi 注入的逐字相同；注册了工具的会话还会在正文之前看到 `memory` 工具的
+  snippet 与 guidelines（见下「提示词三通道」）。
 - **`memory` 工具** —— 五个 action：`add` / `replace` / `remove` / `list` / `search`，schema 与
   handler 直接来自 core，模型看到的线格式与 pi 一致。
 - **`/memory` 命令** —— 打印状态块（目录、索引容量、条目数、模块开关、锁持有者），`/memory unlock
@@ -132,11 +133,16 @@ model info 不带 `reasoning` 块，宿主会以 `UNSUPPORTED_REASONING_EFFORT` 
 core 的工具文案有三个通道，在 dsh 里的落点如下：
 
 - `MEMORY_TOOL_DESCRIPTION` → 工具 schema 的 `description`（模型可见）。
-- `MEMORY_TOOL_SNIPPET` → `memory_index` 段**开头**，且**恰好在该 session 注册了 `memory` 工具时**才出现
-  （没有 runtime 的 session、子 agent 都拿不到它）。
-- `MEMORY_TOOL_GUIDELINES` → **本轮在 dsh 没有落点**。宿主的 `ToolSchema` 只有
-  `{name, description, parameters, deferLoading?}`，没有 pi 的 `promptSnippet` 通道，也没有放 guidelines
-  的字段。这是与 pi 的一个已知差异。
+- `MEMORY_TOOL_SNIPPET` 与 `MEMORY_TOOL_GUIDELINES` → 同一个 `memory_index` 段，且**恰好在该 session
+  注册了 `memory` 工具时**才出现（没有 runtime 的 session、子 agent 两样都拿不到）。固定顺序：
+  snippet → guidelines → 索引正文，每段之间空一行；索引正文逐字不动。
+
+  宿主的 `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`，没有 pi 的
+  `promptSnippet` / `promptGuidelines` 两个专属通道，所以三通道里有两个搭的是 section 的车。
+  guidelines 是 7 条字符串，渲染成 `- <规则>` 逐行（与 pi 宿主对 `promptGuidelines` 的渲染同式），
+  文本逐字来自 core。代价是每轮 system prompt 多约 1143 字符（≈ 300 token），但它是**静态**文本，
+  能被 prompt cache 命中。为什么值得落：记忆目录是两个宿主共享的，guidelines 管的正是写入质量
+  （「description 必须自足」及其正反例）—— dsh 会话写出含糊的 description，会连带降低 pi 会话的召回质量。
 
 ## 开发
 
