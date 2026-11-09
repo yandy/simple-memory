@@ -1,5 +1,6 @@
 import type { MemoryConfig } from "@yandy0725/memory-core";
 import { modelConfigErrors, taskModel } from "@yandy0725/memory-core";
+import { errorCode, errorDetail } from "./errors.js";
 
 /**
  * dsh 侧模型引用：`provider` 与 `model` 两段，外加透传给宿主的 `reasoningEffort`。
@@ -67,10 +68,11 @@ const UNSUPPORTED_EFFORT_CODE = "UNSUPPORTED_REASONING_EFFORT";
  * `requested === undefined` 当成「用 `reasoning.defaultEffort`」，那会**打开**推理而不是避开错误。）
  */
 function hostRejectionReason(model: string, error: unknown): string {
-	const e = error as { code?: unknown; message?: unknown } | null | undefined;
-	const code = typeof e?.code === "string" && e.code !== "" ? e.code : null;
-	const message = typeof e?.message === "string" && e.message !== "" ? e.message : null;
-	const detail = message ?? (typeof error === "string" && error !== "" ? error : null);
+	// 两个提取都走 src/errors.ts：宿主抛的不保证是 `Error`（可能是带 `.code`/`.message` 的普通
+	// 对象、也可能就是一个字符串）。这里用 `errorDetail` 而不是 `errorMessage`：后者对「只有 code 没有
+	// message」的拒绝会退到 JSON 兜底，那会把刚打印过的 code 再抄一遍进用户文案。
+	const code = errorCode(error);
+	const detail = errorDetail(error);
 	let reason = `autoSurfacing model "${model}" was rejected by the host`;
 	if (code !== null) reason += ` (${code})`;
 	if (detail !== null) reason += `: ${detail}`;

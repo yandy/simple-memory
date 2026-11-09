@@ -1,5 +1,6 @@
 import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET } from "@yandy0725/memory-core";
 import { createMemoryCommand } from "./commands.js";
+import { errorMessage } from "./errors.js";
 import { createDshHeadless } from "./headless.js";
 import type { LlmLike } from "./headless.js";
 import type { Context, HostPreStepDecision, HostPromptSection, HostToolDefinition } from "./host-types.js";
@@ -75,10 +76,6 @@ const GUIDELINES_BLOCK = MEMORY_TOOL_GUIDELINES.map((rule) => `- ${rule}`).join(
  */
 const PROMPT_PREAMBLE = `${MEMORY_TOOL_SNIPPET}\n\n${GUIDELINES_BLOCK}`;
 
-function messageOf(e: unknown): string {
-	return e instanceof Error ? e.message : String(e);
-}
-
 function runCleanup(cleanup: SessionCleanup | undefined): void {
 	if (cleanup === undefined) return;
 	// 先撤注册本身，再撤我们 effect 里的副本。宿主的 undo 明确幂等（dsh-scope `NamedEntries.insert`
@@ -120,7 +117,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			AbortSignal.timeout(10_000),
 		);
 	} catch (e) {
-		surfacing = { available: false, reason: `autoSurfacing could not be resolved: ${messageOf(e)}` };
+		surfacing = { available: false, reason: `autoSurfacing could not be resolved: ${errorMessage(e)}` };
 	}
 
 	// 4. per-session 容器：全部挂在闭包里（apply 每进程只跑一次，会话却有很多）。
@@ -217,7 +214,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		} catch (e) {
 			// 我们的 fiber 正在卸载（`INACTIVE_EFFECT`），或 agent.ctx 已拒绝注册。在 `agent/created`
 			// 里抛错等于让宿主的 agent 创建失败 —— 宁可这个会话没有 memory 工具。
-			ctx.logger.warn("simple-memory: memory tool unavailable for session %s: %s", sessionId, messageOf(e));
+			ctx.logger.warn("simple-memory: memory tool unavailable for session %s: %s", sessionId, errorMessage(e));
 		}
 
 		if (rt.error !== null) ctx.logger.warn("simple-memory: %s", rt.error);

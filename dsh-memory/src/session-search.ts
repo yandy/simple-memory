@@ -1,4 +1,5 @@
 import { truncateForInjection } from "@yandy0725/memory-core";
+import { errorMessage } from "./errors.js";
 
 /**
  * `search scope=sessions` 的自己扫实现（spec §5.8 / D14）：对齐 `pi-memory/src/session-search.ts`
@@ -146,20 +147,6 @@ function formatDate(createdAt: number | undefined): string {
 function formatHeading(header: SessionHeaderLike): string {
 	const date = formatDate(header.createdAt);
 	return date === "" ? `## Session ${header.id}` : `## Session ${header.id} (${date})`;
-}
-
-function errorMessage(error: unknown): string {
-	if (typeof error === "string") return error;
-	if (error instanceof Error) return error.message;
-	if (typeof error === "object" && error !== null) {
-		const message = (error as { message?: unknown }).message;
-		if (typeof message === "string") return message;
-	}
-	try {
-		return JSON.stringify(error);
-	} catch {
-		return "unknown error";
-	}
 }
 
 /**

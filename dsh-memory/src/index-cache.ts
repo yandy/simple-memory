@@ -1,4 +1,5 @@
 import { buildIndexSection } from "@yandy0725/memory-core";
+import { errorMessage } from "./errors.js";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
@@ -28,10 +29,6 @@ export interface IndexCache {
 interface Snapshot {
 	text: string;
 	error: string | null;
-}
-
-function messageOf(e: unknown): string {
-	return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -68,7 +65,7 @@ export function createIndexCache(): IndexCache {
 			snapshot.error = null;
 		} catch (e) {
 			// 只记 error，绝不覆盖 text：旧的索引仍可注入，section 不会因此消失。
-			snapshot.error = messageOf(e);
+			snapshot.error = errorMessage(e);
 		}
 	}
 

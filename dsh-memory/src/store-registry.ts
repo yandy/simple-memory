@@ -1,5 +1,6 @@
 import { MemoryStore, resolveMemoryDir } from "@yandy0725/memory-core";
 import type { MemoryConfig } from "@yandy0725/memory-core";
+import { errorMessage } from "./errors.js";
 import type { ModuleAvailability } from "./model.js";
 import type { ResolvedConfig } from "./row-config.js";
 
@@ -63,10 +64,6 @@ export function isRootAgent(agent: { session?: { header?: Record<string, unknown
 	if (header.origin === "subagent") return false;
 	if (typeof header.delegationDepth === "number" && header.delegationDepth > 0) return false;
 	return true;
-}
-
-function messageOf(e: unknown): string {
-	return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -135,7 +132,7 @@ export function createStoreRegistry(dirs: HostDirLike): StoreRegistry {
 		try {
 			cwd = await dirs.ensure(agent, signal);
 		} catch (e) {
-			cwdError = messageOf(e);
+			cwdError = errorMessage(e);
 		}
 		if (!cwd) cwd = headerCwd;
 		if (!cwd) {
@@ -153,7 +150,7 @@ export function createStoreRegistry(dirs: HostDirLike): StoreRegistry {
 		try {
 			memoryDir = await resolveMemoryDir({ memoryDir: resolved.config.memoryDir }, cwd);
 		} catch (e) {
-			return fail(sessionId, cwd, resolved.config, surfacing, `Failed to resolve memory directory: ${messageOf(e)}`);
+			return fail(sessionId, cwd, resolved.config, surfacing, `Failed to resolve memory directory: ${errorMessage(e)}`);
 		}
 
 		let entry = byDir.get(memoryDir);

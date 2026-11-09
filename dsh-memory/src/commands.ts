@@ -10,6 +10,7 @@ import {
 	taskModel,
 	withFsRetry,
 } from "@yandy0725/memory-core";
+import { errorMessage } from "./errors.js";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
@@ -51,10 +52,6 @@ export function describeHolder(holder: { op: string; pid: number; hostname: stri
 	return `${holder.op} (pid ${holder.pid} on ${holder.hostname}, started ${holder.startedAt})`;
 }
 
-function messageOf(e: unknown): string {
-	return e instanceof Error ? e.message : String(e);
-}
-
 /**
  * `/memory` 的锁状态行。只读不碰 —— `.lock` **永不自动回收**（core 的 fs-lock 说明），
  * 人工清除只有 `unlock --force` 一个入口。带 hostname：`.lock` 是目录里的普通文件，
@@ -92,7 +89,7 @@ async function unlockMemory(memoryDir: string, force: boolean): Promise<{ kind: 
 	} catch (e) {
 		// check 到 unlink 之间锁自己消失了：那正是想要的结果
 		if ((e as NodeJS.ErrnoException).code === "ENOENT") return { kind: "success", text: "No lock present." };
-		return { kind: "error", text: `Failed to remove memory lock: ${messageOf(e)}` };
+		return { kind: "error", text: `Failed to remove memory lock: ${errorMessage(e)}` };
 	}
 }
 
