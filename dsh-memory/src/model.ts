@@ -3,13 +3,15 @@ import { modelConfigErrors, taskModel } from "@yandy0725/memory-core";
 import { errorCode, errorDetail } from "./errors.js";
 
 /**
- * dsh 侧模型引用：`provider` 与 `model` 两段，外加透传给宿主的 `reasoningEffort`。
- * 与 core 的单一不透明 `model: string` 对应；拆解见 `parseModelRef`。
+ * dsh 侧模型引用：`provider` 与 `model` 两段，与 core 的单一不透明 `model: string` 对应；
+ * 拆解见 `parseModelRef`（本类型就是它的返回类型）。
+ *
+ * 刻意**不**含推理档位：宿主的 `reasoningEffort` 直接透传 `autoSurfacing.thinkLevel`，
+ * 不经这里拆解，也不属于「模型引用」这个概念。
  */
 export interface DshModelRef {
 	provider: string;
 	model: string;
-	effort?: string;
 }
 
 /**
@@ -22,13 +24,15 @@ export interface DshModelRef {
  * - model id 自己含斜杠时按第一个斜杠拆：`"megcore/qwen/qwen3.8-max"` →
  *   `{ provider: "megcore", model: "qwen/qwen3.8-max" }`。
  */
-export function parseModelRef(value: string): { provider: string; model: string } | null {
+export function parseModelRef(value: string): DshModelRef | null {
 	const ref = value.trim();
 	const slash = ref.indexOf("/");
+	// `slash <= 0` 同时挡住了「无斜杠」与「斜杠在首位」（后者是 provider 为空的唯一可能），
+	// 所以下面只需要再判 model 那一段。
 	if (slash <= 0) return null;
 	const provider = ref.slice(0, slash);
 	const model = ref.slice(slash + 1);
-	if (provider === "" || model === "") return null;
+	if (model === "") return null;
 	return { provider, model };
 }
 

@@ -26,8 +26,6 @@ export interface SurfacingDeps {
 	headless: HeadlessAgentPort;
 	warn(message: string, ...args: unknown[]): void;
 	injected: Map<string, Set<string>>; // sessionId → 已注入的 entry 文件名
-	// brief 强制要求此字段；本轮无需时钟（没有测试依赖它），Task 16 接线时无现成时钟可传 undefined。
-	now?(): Date;
 }
 
 export interface UserMessageLike {
