@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # 宿主提供包，见 docs/guides/dependencies.md「pi 宿主包的版本」：三个 devDependency 精确钉死 0.80.2，
+      # 升级必然连带改源码，不能由自动 PR 代替决策。
+      - dependency-name: "@earendil-works/pi-ai"
+      - dependency-name: "@earendil-works/pi-coding-agent"
+      - dependency-name: "@earendil-works/pi-tui"
+      # workspace 内依赖：走符号链接，registry 出新版本时不应抬高 ^1.0.0（发布顺序见
+      # docs/guides/release.md）。
+      - dependency-name: "@yandy0725/memory-core"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
