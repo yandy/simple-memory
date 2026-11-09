@@ -109,6 +109,10 @@ describe("createPreStepListener", () => {
 	it("skips recall on step > 1 but still refreshes the index cache", async () => {
 		const memoryDir = join(dir, "mem");
 		const store = makeStore(memoryDir);
+		// 必须真的写一条 entry：core 的 `runSideQuery` 在候选清单为空时短路（memory-core/src/
+		// orchestration/surfacing.ts:53 `if (candidates.length === 0) return []`），根本不会调用侧查询
+		// 端口 —— 那时 `expect(headlessRun).not.toHaveBeenCalled()` 恒真，钉不住 step 门禁本身。
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
 		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
@@ -134,6 +138,8 @@ describe("createPreStepListener", () => {
 	it("skips recall when rt.surfacing.available is false", async () => {
 		const memoryDir = join(dir, "mem");
 		const store = makeStore(memoryDir);
+		// 同上：没有 entry 时 core 会在调用端口之前短路，这条断言就变成恒真的空转测试。
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store, { surfacing: { available: false, reason: "no model" } });
 		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
@@ -152,6 +158,41 @@ describe("createPreStepListener", () => {
 
 		expect(refresh).toHaveBeenCalledTimes(1);
 		expect(headlessRun).not.toHaveBeenCalled();
+	});
+
+	it("skips recall when the runtime has no store (error state) and returns the decision unchanged", async () => {
+		const memoryDir = join(dir, "mem");
+		// 错误态运行时：`store === null` 而 memoryDir 非空。这是门禁的第三个条件，与 step / 可用性
+		// 两条独立 —— 目录解析失败的会话绝不该把空 cwd 发给侧查询端口。
+		const rt = makeRuntime(memoryDir, null, { error: "Failed to resolve memory directory: boom" });
+		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const refresh = vi.fn(async () => {});
+		const warn = vi.fn();
+		const deps = makeDeps({
+			registry: { get: () => rt },
+			indexCache: { refresh },
+			headless: { run: headlessRun },
+			warn,
+		});
+		const listener = createPreStepListener(deps);
+
+		const user = createUserMsg("hi");
+		const messages = [user];
+		const inner = { kind: "enter" as const, messages };
+		const decision = await listener(
+			{ agent: { session: { id: "s1" } }, messages, turn: 1, step: 1, signal: new AbortController().signal },
+			async () => inner,
+		);
+
+		expect(decision).toBe(inner);
+		if (decision.kind !== "enter") throw new Error("expected an enter decision");
+		expect(decision.messages).toBe(messages);
+		expect(headlessRun).not.toHaveBeenCalled();
+		// 门禁在扫描候选之前就短路了：绝不能走成「把 null store 交给 scanEntries → 抛错 → catch 里记一行
+		// warn」，那会在每个错误态会话的每一轮刷一条噪声日志。
+		expect(warn).not.toHaveBeenCalled();
+		// 索引刷新与召回无关，错误态也照刷（index-cache 对 store === null 记空串）。
+		expect(refresh).toHaveBeenCalledTimes(1);
 	});
 
 	it("inserts the recall message after the last claimed user message", async () => {
