@@ -26,6 +26,7 @@ export interface SurfacingDeps {
 	headless: HeadlessAgentPort;
 	warn(message: string, ...args: unknown[]): void;
 	injected: Map<string, Set<string>>; // sessionId → 已注入的 entry 文件名
+	// brief 强制要求此字段；本轮无需时钟（没有测试依赖它），Task 16 接线时无现成时钟可传 undefined。
 	now?(): Date;
 }
 
@@ -81,13 +82,21 @@ export function humanPromptText(messages: Array<{ source?: { kind?: string }; co
 /**
  * 把 core 渲染好的块（已含 `<relevant_memories>` 包裹、已净化）包成 dsh 的 `UserMessage`。
  *
- * `form: "notice"` 对齐 pi 的 `display: false` + 一行 "Recalled: N entries"：正文对用户不可见、
- * 只显示 `summary` 一行（宿主 `CONTEXT_SUMMARY_MAX_CHARS = 120` 约束）。
+ * `form: "notice"` + 短 `summary` 对齐 pi 的 `display: false` + 一行 "Recalled: N entries"。
  *
- * **前提（未验证，待真宿主端到端任务确认）**：`form` 只影响渲染与归属，`content` 里完整的
- * `<relevant_memories>` 仍会进模型消息。单测只能钉住「消息的 content 含完整正文、summary 是短摘要」，
- * 无法证明真宿主把 notice 的 content 喂给模型。若实测发现 `notice` 会藏起正文，退回
- * `form: "snapshot"` 并接受「正文在 UI 里展开」的差异（记入 spec §9 痛点）。
+ * **前提（宿主声明支持，但真宿主行为待端到端任务确认）**：`form` 是「同一份模型可见内容」之上的
+ * **语义**呈现轴，不改变 `content` 进模型的事实 —— `message.d.ts:127` 把 `MessageBase.content` 定为
+ * "Exact model-facing blocks"（模型看到的就是 content）；`ContextForm` 的词汇是 "SEMANTIC, never
+ * visual … a consumer decides what that looks like"（`message.d.ts:39-41`），`notice` 只额外要求一行
+ * `summary`（"shown without expanding the row"，`message.d.ts:86-88`），并不折叠 content。单测只能
+ * 钉住「消息的 content 含完整正文、summary 是短摘要」，无法证明真宿主把 notice 的 content 喂给模型，
+ * 所以真宿主确认仍排在后一个任务。
+ *
+ * **若实测发现 `notice` 会藏起正文**，退回 `form: "recall"`（`message.d.ts:57-58`，"Material lifted
+ * out of another session's log"，语义正是「从别的会话日志里拎出来的材料」）或干脆**省略 `form`**
+ * （`message.d.ts:72-73` 与 `:76` 的 `{ form?: never }`：undeclared context 是文档默认）。**不要退回
+ * `form: "snapshot"`**：snapshot 意味着「同一生产者较新的快照**取代**较早的」（`message.d.ts:51-52`）
+ * 且**必须**带 `sections` 字段（`message.d.ts:82-84`），与逐轮**累加**的召回消息语义不合。
  */
 export function createRecallMessage(content: string, count: number): UserMessageLike {
 	return {
@@ -112,33 +121,40 @@ export function createPreStepListener(
 ): (payload: PreStepPayload, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision> {
 	return async (payload, next) => {
 		// 永远先 await next()：waterfall 语义，且内层监听器改过的 messages 才是我们要 splice 的形态。
+		// `next()` 刻意留在 try 之外：内层监听器的拒绝必须原样传播（那是别的插件的崩溃，吞掉它等于
+		// 捏造一个 decision 并掩盖真实故障 —— 比外抛更糟）。「绝不外抛」只承诺我们自己的失败。
 		const decision = await next();
 
-		if (decision.kind === "reject" || payload.signal.aborted) return decision;
+		// 从这里到结尾统一包一层 try：payload 违约（messages 不可迭代、next() 解析成非 decision）或
+		// 召回任一步失败，都记一行并原样返回 decision，而不是把 turn 弄崩 —— 召回是增强。
+		try {
+			if (decision.kind === "reject" || payload.signal.aborted) return decision;
 
-		const rt = deps.registry.get(payload.agent.session.id);
+			const rt = deps.registry.get(payload.agent.session.id);
 
-		// 每轮每个 step 都刷新索引快照（廉价路径）：这是长寿命会话最终看到其它进程写入记忆的途径。
-		// 与召回无关（索引 section 是另一条注入通道），所以放在 surfacing 可用性门之前。
-		if (rt) {
-			try {
-				await deps.indexCache.refresh(rt);
-			} catch (e) {
-				deps.warn("simple-memory: auto-surfacing skipped: %s", e);
+			// 每轮每个 step 都刷新索引快照（廉价路径）：这是长寿命会话最终看到其它进程写入记忆的途径。
+			// 与召回无关（索引 section 是另一条注入通道），所以放在 surfacing 可用性门之前。
+			if (rt) await deps.indexCache.refresh(rt);
+
+			// 只在 step === 1 召回：召回服务的是「这一轮的用户意图」，同一轮里模型自己发起的后续 step
+			// 不该再付一次侧查询的延迟与 token（spec §5.7）。`rt.memoryDir === null` 显式声明不变量
+			// （registry 只在解析出 memoryDir 时才给出非空 store；`fail()` 两者同空）—— 显式 return
+			// 而不是 `?? ""`，避免静默把空 cwd 发给侧查询端口。
+			if (
+				payload.step !== 1 ||
+				rt === undefined ||
+				rt.store === null ||
+				rt.memoryDir === null ||
+				!rt.surfacing.available
+			) {
 				return decision;
 			}
-		}
 
-		// 只在 step === 1 召回：召回服务的是「这一轮的用户意图」，同一轮里模型自己发起的后续 step
-		// 不该再付一次侧查询的延迟与 token（spec §5.7）。
-		if (payload.step !== 1 || rt === undefined || rt.store === null || !rt.surfacing.available) {
-			return decision;
-		}
+			const prompt = humanPromptText(
+				payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>,
+			);
+			if (prompt === "") return decision;
 
-		const prompt = humanPromptText(payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>);
-		if (prompt === "") return decision;
-
-		try {
 			const manifest = await scanEntries(rt.store);
 			const injectedFiles = deps.injected.get(rt.sessionId) ?? new Set<string>();
 			const selected = await runSideQuery(
@@ -149,8 +165,10 @@ export function createPreStepListener(
 					maxFiles: rt.config.autoSurfacing.maxFiles,
 					effort: rt.config.autoSurfacing.thinkLevel,
 					model: requiredModel(rt.config, "autoSurfacing"),
-					cwd: rt.memoryDir ?? "",
-					sessionPersistence: rt.config.autoSurfacing.sessionPersistence ?? rt.config.defaults?.sessionPersistence,
+					cwd: rt.memoryDir,
+					signal: payload.signal,
+					sessionPersistence:
+						rt.config.autoSurfacing.sessionPersistence ?? rt.config.defaults?.sessionPersistence,
 				},
 				{ headless: deps.headless },
 			);
@@ -164,12 +182,20 @@ export function createPreStepListener(
 			);
 			if (content === "") return decision;
 
+			// 复检取消：侧查询最长可跑 30s，用户可能在 await 期间取消了这一轮。若已取消，绝不标记
+			// injected、绝不 splice —— 这些文件根本没到模型眼前，标记了就白烧本会话再召回的机会。
+			if (payload.signal.aborted) return decision;
+
 			// 只在成功且非空渲染之后才标记 injected（与 pi 一致）：空渲染不消耗这些文件本会话再浮现的机会。
 			for (const file of selected) injectedFiles.add(file);
 			deps.injected.set(rt.sessionId, injectedFiles);
 
 			// 召回插在「最后一条仍来自本轮 claim 的消息」之后：用身份包含（而非 source.kind）判定，
 			// 因为内层监听器可能已经 append 了新消息，我们只关心原始 claim 里最后一条的落点。
+			// `findLastIndex` 找不到 → -1 → `toSpliced(0, 0, msg)` 会把块放到最前（在任何 compaction
+			// summary 之前）。这与 first-party 一致（`dsh-agent-instructions/lib/index.js:1493-1494`
+			// 同样的未加 guard 的 `-1 + 1`），且是理论场景（没有哪个被调研的监听器产出 identity-
+			// disjoint 消息）—— 不加 guard，在这里与 first-party 分叉本身是另一种风险。
 			const lastClaimed = decision.messages.findLastIndex((m) => payload.messages.includes(m));
 			const message = createRecallMessage(content, selected.length);
 			return { ...decision, messages: decision.messages.toSpliced(lastClaimed + 1, 0, message) };

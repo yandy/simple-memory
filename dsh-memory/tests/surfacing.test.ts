@@ -181,9 +181,22 @@ describe("createPreStepListener", () => {
 		expect(decision.messages).toHaveLength(3);
 		expect(decision.messages[0]).toBe(synthetic);
 		expect(decision.messages[1]).toBe(user);
-		expect(decision.messages[2]).toEqual(
-			expect.objectContaining({ role: "user", source: expect.objectContaining({ kind: "simple-memory" }) }),
-		);
+
+		// 钉住监听器 splice 出去的是 core `renderSurfacedBlock` 的**真实渲染正文**：不做二次包裹、
+		// 不再净化、不是空串；summary 是短摘要。
+		const recall = decision.messages[2] as {
+			role: string;
+			content: Array<{ type: string; text: string }>;
+			source: { kind: string; form: string; summary: string };
+		};
+		expect(recall.role).toBe("user");
+		expect(recall.content).toHaveLength(1);
+		const text = recall.content[0].text;
+		expect(text.startsWith("<relevant_memories>")).toBe(true);
+		expect(text.match(/<relevant_memories>/g)).toEqual(["<relevant_memories>"]);
+		expect(text).toContain("## Alpha");
+		expect(text).toContain("alpha body");
+		expect(recall.source).toEqual({ kind: "simple-memory", form: "notice", summary: "Recalled 2 memories" });
 	});
 
 	it("splices after the last original message when an inner listener appended its own", async () => {
@@ -339,6 +352,202 @@ describe("createPreStepListener", () => {
 		expect(headlessRun.mock.calls[0][0].task).toContain("Beta.md");
 		expect(headlessRun.mock.calls[1][0].task).not.toContain("Alpha.md");
 		expect(headlessRun.mock.calls[1][0].task).toContain("Beta.md");
+	});
+
+	it("forwards the turn's signal and the memoryDir cwd to the side query", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
+		const rt = makeRuntime(memoryDir, store);
+		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<string>>().mockResolvedValue(
+			selectJson(["Alpha.md"]),
+		);
+		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
+		const listener = createPreStepListener(deps);
+
+		const controller = new AbortController();
+		const user = createUserMsg("hi");
+		const decision = await listener(
+			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: controller.signal },
+			async () => ({ kind: "enter" as const, messages: [user] }),
+		);
+
+		expect(decision.kind).toBe("enter");
+		expect(headlessRun).toHaveBeenCalledTimes(1);
+		// 身份相等（不是「存在 signal 字段」）：证明 runSideQuery 透传的是本轮 payload 的同一个 signal。
+		expect(headlessRun.mock.calls[0][0].signal).toBe(controller.signal);
+		// cwd 就是 memoryDir（不是 `?? ""` 静默出的空串）。
+		expect(headlessRun.mock.calls[0][0].cwd).toBe(memoryDir);
+	});
+
+	it("returns the decision unchanged when the turn is aborted during the side query", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
+		const rt = makeRuntime(memoryDir, store);
+		const injected = new Map<string, Set<string>>();
+		let resolveRun: (value: string) => void = () => {};
+		// 一个「resolve 权在我们手上」的端口：resolve 前监听器一直挂在 runSideQuery 的 await 上。
+		const headlessRun = vi.fn(
+			() =>
+				new Promise<string>((resolve) => {
+					resolveRun = resolve;
+				}),
+		);
+		const warn = vi.fn();
+		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun }, warn, injected });
+		const listener = createPreStepListener(deps);
+
+		const controller = new AbortController();
+		const user = createUserMsg("hi");
+		const inner = { kind: "enter" as const, messages: [user] };
+
+		// 启动监听器，等它越过初始 abort 门、真正进入 headless.run 的 await。
+		const pending = listener(
+			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: controller.signal },
+			async () => inner,
+		);
+		await vi.waitFor(() => expect(headlessRun).toHaveBeenCalledTimes(1));
+
+		// 侧查询 in-flight 时取消；随后让被取消的侧查询「迟到」地返回选中结果（模拟 30s 窗口）。
+		controller.abort();
+		resolveRun(selectJson(["Alpha.md"]));
+		const decision = await pending;
+
+		if (decision.kind !== "enter") throw new Error("expected an enter decision");
+		expect(decision).toBe(inner);
+		expect(decision.messages).toHaveLength(1);
+		expect(injected.get("s1")).toBeUndefined();
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it("returns the decision unchanged when the signal is already aborted", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
+		const rt = makeRuntime(memoryDir, store);
+		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const refresh = vi.fn(async () => {});
+		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
+		const listener = createPreStepListener(deps);
+
+		const controller = new AbortController();
+		controller.abort();
+		const user = createUserMsg("hi");
+		const inner = { kind: "enter" as const, messages: [user] };
+		const decision = await listener(
+			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: controller.signal },
+			async () => inner,
+		);
+
+		expect(decision).toBe(inner);
+		expect(headlessRun).not.toHaveBeenCalled();
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
+	it("runs no side query when every claimed message is synthetic", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
+		const rt = makeRuntime(memoryDir, store);
+		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const refresh = vi.fn(async () => {});
+		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
+		const { ctx, emitter, makeAgent } = createFakeCtx();
+		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
+
+		const agent = makeAgent({ id: "s1" });
+		// TEXT 与人类消息测试逐字相同 —— source.kind 是唯一的决定变量。
+		const messages = [
+			createSyntheticMsg("agent-instructions", "what did I say about alpha?"),
+			createSyntheticMsg("some-future-kind", "what did I say about alpha?"),
+		];
+		const decision = await emitter.preStep({
+			agent,
+			messages,
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+
+		expect(headlessRun).not.toHaveBeenCalled();
+		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(decision.messages).toBe(messages);
+	});
+
+	it("does not mark injected when the render is empty, so turn 2 still offers the same files", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
+		await store.addEntry({ name: "Beta", description: "beta note", body: "beta body" });
+		// maxInjectionBytes: 0 让 renderSurfacedBlock 恒返回 ""（core/injection.ts:240,245）。
+		const config = mergeConfig(structuredClone(DEFAULT_CONFIG), {
+			memoryDir,
+			autoSurfacing: { model: "test/model", maxInjectionBytes: 0 },
+		});
+		const rt = makeRuntime(memoryDir, store, { config });
+		// 两轮都选中 Alpha + Beta，但渲染恒为空。
+		const headlessRun = vi
+			.fn<(req: HeadlessRunRequest) => Promise<string>>()
+			.mockResolvedValue(selectJson(["Alpha.md", "Beta.md"]));
+		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
+		const { ctx, emitter, makeAgent } = createFakeCtx();
+		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
+
+		const agent = makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+
+		const first = await emitter.preStep({
+			agent,
+			messages,
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		expect(first.messages).toHaveLength(1); // 空渲染 → 不 splice
+
+		const second = await emitter.preStep({
+			agent,
+			messages,
+			turn: 2,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		expect(second.messages).toHaveLength(1);
+
+		expect(headlessRun).toHaveBeenCalledTimes(2);
+		// 关键：第二轮候选里仍含 Alpha —— 空渲染没有把它标记为 injected。
+		expect(headlessRun.mock.calls[1][0].task).toContain("Alpha.md");
+		expect(headlessRun.mock.calls[1][0].task).toContain("Beta.md");
+	});
+
+	it("caps the side-query user prompt at 4000 chars", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
+		const rt = makeRuntime(memoryDir, store);
+		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<string>>().mockResolvedValue(
+			selectJson(["Alpha.md"]),
+		);
+		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
+		const listener = createPreStepListener(deps);
+
+		const user = createUserMsg("a".repeat(4000) + "TAIL_BEYOND_CAP");
+		await listener(
+			{
+				agent: { session: { id: "s1" } },
+				messages: [user],
+				turn: 1,
+				step: 1,
+				signal: new AbortController().signal,
+			},
+			async () => ({ kind: "enter" as const, messages: [user] }),
+		);
+
+		expect(headlessRun).toHaveBeenCalledTimes(1);
+		const task = headlessRun.mock.calls[0][0].task;
+		expect(task).toContain("a".repeat(4000));
+		expect(task).not.toContain("TAIL_BEYOND_CAP");
 	});
 });
 
