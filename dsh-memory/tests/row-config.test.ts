@@ -87,6 +87,46 @@ describe("resolveRowConfig", () => {
 		expect(config.autoSurfacing.model).toBe("deepseek-official/deepseek-flash");
 	});
 
+	it("warns about a model key nested one level too deep instead of merging it silently", () => {
+		// `lock` 不承载模型配置：把 `model` 嵌错一层正是「配错模型名的人」的典型写法。静默并进去
+		// 的后果是零告警 + `/memory` 反而说「你没配 model」，把唯一能暴露错误的那条诊断压掉了。
+		const { config, warnings } = resolveRowConfig({ lock: { model: "prov/mod" } });
+		expect(warnings).toEqual(['unknown config key "lock.model" — ignored']);
+		expect(config.lock).not.toHaveProperty("model");
+		expect(config.lock).toEqual(DEFAULT_CONFIG.lock);
+		// 它也没被当成顶层或共享模型并进去：`defaults.model` 仍是未配。
+		expect(config.defaults?.model).toBeUndefined();
+	});
+
+	it("warns about model and sessionPersistence outside the model-bearing subtrees", () => {
+		const { config, warnings } = resolveRowConfig({
+			sessionSearch: { model: "prov/mod", sessionPersistence: { enabled: true } },
+		});
+		expect(warnings).toEqual([
+			'unknown config key "sessionSearch.model" — ignored',
+			'unknown config key "sessionSearch.sessionPersistence" — ignored',
+		]);
+		expect(config.sessionSearch).not.toHaveProperty("model");
+		expect(config.sessionSearch).not.toHaveProperty("sessionPersistence");
+		expect(config.sessionSearch).toEqual(DEFAULT_CONFIG.sessionSearch);
+	});
+
+	it("still accepts model and sessionPersistence in every model-bearing subtree", () => {
+		const { config, warnings } = resolveRowConfig({
+			defaults: { model: "prov/shared", sessionPersistence: { enabled: true } },
+			dream: { model: "prov/dream" },
+			autoSurfacing: { model: "prov/surfacing" },
+			extractMemories: { model: "prov/extract", sessionPersistence: { enabled: false } },
+		});
+		expect(warnings).toEqual([]);
+		expect(config.defaults?.model).toBe("prov/shared");
+		expect(config.defaults?.sessionPersistence).toEqual({ enabled: true });
+		expect(config.dream.model).toBe("prov/dream");
+		expect(config.autoSurfacing.model).toBe("prov/surfacing");
+		expect(config.extractMemories.model).toBe("prov/extract");
+		expect(config.extractMemories.sessionPersistence).toEqual({ enabled: false });
+	});
+
 	it("warns about a wrongly-typed nested key and keeps the default", () => {
 		const { config, warnings } = resolveRowConfig({ autoSurfacing: { maxFiles: "3" } });
 		expect(warnings).toContain('config key "autoSurfacing.maxFiles" must be number, got string — ignored');

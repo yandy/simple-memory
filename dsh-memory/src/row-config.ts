@@ -20,6 +20,18 @@ export interface ResolvedConfig {
  */
 export const ROW_CONFIG_KEYS: readonly string[] = Object.freeze(Object.keys(DEFAULT_CONFIG));
 
+/**
+ * 用户在行 config 里**显式写过**的白名单顶层键（含值为 `null` 的子树），照用户写的顺序。
+ *
+ * 白名单外的键不在这里（它们已经进 warnings）。装配层用它判定「用户配了本适配层没实现的模块」，
+ * 好让 `/memory` 就地报出来 —— 白名单是从 `DEFAULT_CONFIG` 派生的，`dream` / `extractMemories`
+ * 天生能通过校验，不报就是「无告警、无效果、无提示」的静默失效。
+ */
+export function rowConfigSetKeys(row: unknown): readonly string[] {
+	if (row === null || typeof row !== "object" || Array.isArray(row)) return [];
+	return Object.keys(row as Record<string, unknown>).filter((key) => ROW_CONFIG_KEYS.includes(key));
+}
+
 function defaultConfig(platform?: NodeJS.Platform): MemoryConfig {
 	const config: MemoryConfig = { ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() };
 	config.memoryDir = expandTilde(config.memoryDir, platform);
@@ -40,9 +52,25 @@ function matchesType(value: unknown, expected: unknown): boolean {
 }
 
 /**
+ * `model` 与 `sessionPersistence` 只在**承载模型配置的四个子树**里合法。
+ *
+ * 这两个子键在 core 的类型里合法、但在 `DEFAULT_CONFIG` 里没有默认值，所以只能靠名字认。
+ * 光认名字不够：`lock.model` / `sessionSearch.sessionPersistence` 都是用户把 `model` 嵌套错一层的
+ * 典型写法，而那一层错正好落在「配错模型名的人」身上 —— 静默并进去的后果是零告警，而
+ * `/memory` 还会告诉他「你没配 model」，把他真做过的事否掉，并压掉唯一能暴露错误的那条诊断。
+ */
+const MODEL_BEARING_SUBTREES: readonly string[] = Object.freeze([
+	"defaults",
+	"dream",
+	"autoSurfacing",
+	"extractMemories",
+]);
+
+/**
  * 递归一层校验对象子键：已认识的子键按 `DEFAULT_CONFIG` 的 typeof 判型；`model` 与
  * `sessionPersistence` 是 core 类型里合法、但 `DEFAULT_CONFIG` 里没有默认值的可选子键，这里显式
- * 认它们（string / object）；其余子键进 warnings 而不是静默丢弃 —— 用户写错大小写
+ * 认它们（string / object）—— 但**只在 `MODEL_BEARING_SUBTREES` 里的父键下**，其他子树下的同名键
+ * 走普通的 unknown-key 告警；其余子键进 warnings 而不是静默丢弃 —— 用户写错大小写
  * （`autoSurfacing.maxfiles`）时能看见。
  */
 function sanitizeSubtree(
@@ -60,10 +88,10 @@ function sanitizeSubtree(
 			} else {
 				warnings.push(`config key "${subPath}" must be ${typeof expected[sub]}, got ${typeName(v)} — ignored`);
 			}
-		} else if (sub === "model") {
+		} else if (sub === "model" && MODEL_BEARING_SUBTREES.includes(path)) {
 			if (typeof v === "string") out[sub] = v;
 			else warnings.push(`config key "${subPath}" must be string, got ${typeName(v)} — ignored`);
-		} else if (sub === "sessionPersistence") {
+		} else if (sub === "sessionPersistence" && MODEL_BEARING_SUBTREES.includes(path)) {
 			if (matchesType(v, {})) out[sub] = v;
 			else warnings.push(`config key "${subPath}" must be object, got ${typeName(v)} — ignored`);
 		} else {
