@@ -26,10 +26,6 @@ function toolResult(content: string, error?: { name: string; code: string }): { 
 	return { type: "tool/result", data: { message: { content: [textBlock(content)] }, ...(error ? { error } : {}) } };
 }
 
-function todoWrite(status: string, content: string): { type: string; data: unknown } {
-	return { type: "todo/write", data: { todos: [{ status, content }] } };
-}
-
 function session(id: string, events: Array<{ type: string; data: unknown }>, createdAt?: number): FakeSessionInfo {
 	return { id, cwd: CWD, events, ...(createdAt !== undefined ? { createdAt } : {}) };
 }
@@ -82,33 +78,37 @@ describe("createSessionSearch", () => {
 		expect((out.match(/## Session /g) ?? []).length).toBe(1);
 	});
 
-	it("synthetic user/message (source.kind !== 'user') does not produce a match", async () => {
+	it("synthetic user/message with a real host kind (skill-invocation) is not searchable", async () => {
 		const { ctx } = createFakeCtx({
-			sessions: [session("s1", [userMessage("hello from agent-instructions", "agent-instructions")])],
+			sessions: [session("s1", [userMessage("hello from the harness", "skill-invocation")])],
 		});
 
 		expect(await search(ctx, "hello")).toBe("No matches in sessions.");
 	});
 
-	it("human user/message (source.kind === 'user') with the same text does match", async () => {
-		const { ctx } = createFakeCtx({ sessions: [session("s1", [userMessage("hello from user")])] });
+	it("human user/message (source.kind === 'user') with the identical text is searchable", async () => {
+		const { ctx } = createFakeCtx({
+			sessions: [session("s1", [userMessage("hello from the harness", "user")])],
+		});
 
 		expect(await search(ctx, "hello")).toContain("## Session s1");
 	});
 
-	it("falls through unknown source.kind instead of dropping the message", async () => {
+	it("unknown/future source.kind is not searchable (allowlist, not fall-through)", async () => {
 		const { ctx } = createFakeCtx({
 			sessions: [session("s1", [userMessage("hello from a future plugin", "future-plugin-kind")])],
 		});
 
-		expect(await search(ctx, "hello")).toContain("## Session s1");
+		expect(await search(ctx, "hello")).toBe("No matches in sessions.");
 	});
 
-	it("tool/result error.code is searchable text", async () => {
+	it("tool/result message content, error.name, and error.code are each searchable", async () => {
 		const { ctx } = createFakeCtx({
-			sessions: [session("s1", [toolResult("file not found", { name: "Error", code: "ENOENT" })])],
+			sessions: [session("s1", [toolResult("file not found", { name: "FSError", code: "ENOENT" })])],
 		});
 
+		expect(await search(ctx, "file not found")).toContain("## Session s1");
+		expect(await search(ctx, "FSError")).toContain("## Session s1");
 		expect(await search(ctx, "ENOENT")).toContain("## Session s1");
 	});
 
@@ -129,13 +129,17 @@ describe("createSessionSearch", () => {
 		expect(await search(ctx, "answer is 42")).toContain("## Session s1");
 	});
 
-	it("todo/write status and content are searchable text", async () => {
+	it("todo/write is not searchable even though the host extractor includes it", async () => {
 		const { ctx } = createFakeCtx({
-			sessions: [session("s1", [todoWrite("in_progress", "wire up session search")])],
+			sessions: [
+				session("s1", [
+					{ type: "todo/write", data: { todos: [{ status: "in_progress", content: "wire up session search" }] } },
+				]),
+			],
 		});
 
-		expect(await search(ctx, "in_progress")).toContain("## Session s1");
-		expect(await search(ctx, "session search")).toContain("## Session s1");
+		expect(await search(ctx, "in_progress")).toBe("No matches in sessions.");
+		expect(await search(ctx, "session search")).toBe("No matches in sessions.");
 	});
 
 	it("filters string content and only type === 'text' blocks", async () => {
@@ -181,6 +185,7 @@ describe("createSessionSearch", () => {
 	it("empty or whitespace-only query does not match everything", async () => {
 		const { ctx } = createFakeCtx({ sessions: [session("s1", [userMessage("hello")])] });
 
+		expect(await search(ctx, "")).toBe("No matches in sessions.");
 		expect(await search(ctx, "   ")).toBe("No matches in sessions.");
 	});
 
@@ -202,7 +207,38 @@ describe("createSessionSearch", () => {
 		expect(out).not.toContain("far away");
 	});
 
-	it("formats createdAt as YYYY-MM-DD and never emits NaN or empty parens", async () => {
+	it("truncates each context line to 200 characters (plus the two-space indent)", async () => {
+		const longContext = "x".repeat(300);
+		const { ctx } = createFakeCtx({
+			sessions: [session("s1", [userMessage(longContext), userMessage("needle here")])],
+		});
+
+		const out = await search(ctx, "needle");
+
+		const contextLine = out.split("\n").find((l) => l.startsWith("  x"));
+		expect(contextLine).toBe(`  ${"x".repeat(200)}`);
+	});
+
+	it("truncates the matched snippet to 150 characters", async () => {
+		const longMatch = `needle ${"y".repeat(300)}`;
+		const { ctx } = createFakeCtx({ sessions: [session("s1", [userMessage(longMatch)])] });
+
+		const out = await search(ctx, "needle");
+
+		const matchedLine = out.split("\n").find((l) => l.includes("…matched:"));
+		expect(matchedLine).toBe(`…matched: "${longMatch.slice(0, 150)}"…`);
+	});
+
+	it("drops sessions whose header.cwd differs from the queried cwd even if the host filter returns them", async () => {
+		const { ctx } = createFakeCtx({ sessions: [session("other", [userMessage("hello from another project")])] });
+		// 假 ctx 的 filterSessions 本来会按 cwd 过滤；stub 成"照单全收"以证明本模块自己的
+		// header.cwd 后置过滤仍然兜底。
+		ctx.sessionQuery.filterSessions = vi.fn(async () => [{ header: { id: "other", cwd: "/somewhere-else" } }]);
+
+		expect(await search(ctx, "hello")).toBe("No matches in sessions.");
+	});
+
+	it("formats createdAt as YYYY-MM-DD; the fake maps a missing createdAt to epoch 0 (1970-01-01)", async () => {
 		const { ctx } = createFakeCtx({
 			sessions: [
 				session("dated", [userMessage("hello")], new Date("2026-03-05T12:00:00Z").getTime()),
@@ -213,9 +249,22 @@ describe("createSessionSearch", () => {
 		const out = await search(ctx, "hello");
 
 		expect(out).toContain("## Session dated (2026-03-05)");
-		expect(out).toContain("## Session undated");
+		// 假 ctx 的 sessionHeader 把缺省 createdAt 填成 0（epoch），不是 formatDate 的空分支。
+		expect(out).toContain("## Session undated (1970-01-01)");
 		expect(out).not.toContain("NaN");
 		expect(out).not.toContain("()");
+	});
+
+	it("omits the parenthetical date when the host record truly has no createdAt", async () => {
+		const { ctx } = createFakeCtx({ sessions: [session("undated", [userMessage("hello")])] });
+		// 假 ctx 的 filterSessions 总是填 createdAt ?? 0；stub 掉它返回一个真正没有 createdAt 的
+		// header，让 formatDate 的空分支被真正走到（否则会被 epoch-0 默认值掩盖）。
+		ctx.sessionQuery.filterSessions = vi.fn(async () => [{ header: { id: "undated", cwd: CWD } }]);
+
+		const out = await search(ctx, "hello");
+
+		expect(out).toContain("## Session undated");
+		expect(out).not.toContain("## Session undated (");
 	});
 
 	it("filterSessions rejecting yields the unavailable string without throwing", async () => {

@@ -53,25 +53,20 @@ export interface SessionQueryLike {
 	readSession(sessionId: string): Promise<SessionLogSnapshotLike>;
 }
 
-/** 宿主会往 `user/message` 里注入合成内容的 `source.kind` 集合（多数 `user/message` 不是真人）。 */
-const SYNTHETIC_SOURCE_KINDS: ReadonlySet<string> = new Set([
-	"agent-instructions",
-	"runtime-context",
-	"time-context",
-	"skill",
-	"user-approval",
-	"compact-checkpoint",
-	"tool-registry",
-	"user-question-reply",
-]);
-
 /**
- * `user/message` 是否真人写的：`source.kind === "user"` 是真人；已知的合成 kind 是噪音；
- * 未知 kind **放行**（宿主 `MessageSourceMap` 是 merge-extensible，未来插件的 kind 不该成为丢弃
- * 真人消息的理由）。
+ * `user/message` 是否真人写的：白名单，只认 `source.kind === "user"`。
+ *
+ * 宿主 `MessageSourceMap`（`dsh-llm/lib/types/message.d.ts:101`）把真人来源声明为
+ * `user: { kind: 'user' }`，`user-rpc` 也复用 `kind: 'user'`；其余 kind 都是注入/工具/模型来源。
+ * 该映射是**可合并扩展**的（每个插件可声明自己的 kind），黑名单结构上不可能完备 —— 漏一项的后果
+ * 是把注入噪声当真人发言静默搜出来，正是本模块要避免的静默降精度。白名单的失败模式（宿主改了
+ * kind 名 → 搜索返回空）远比黑名单的（注入噪声静默变可搜）显眼。
+ *
+ * 完全没有 `source`、或 `kind` 非字符串的 `user/message` 归为非真人（宿主把 `source` 定为必填，
+ * 这只是防御）：缺失 source ⇒ 对搜索不可见，是一个刻意的静默召回决策。
  */
 function isHumanUserSource(kind: unknown): boolean {
-	return typeof kind === "string" && !SYNTHETIC_SOURCE_KINDS.has(kind);
+	return kind === "user";
 }
 
 function stringPart(value: unknown): string {
@@ -95,10 +90,13 @@ function contentText(content: unknown): string {
 }
 
 /**
- * 单条事件的可搜文本抽取（内部纯函数，直接可单测）。可搜类型对齐宿主 `extractSessionEventText`
- * （`dsh-session-query/lib/index.js`）：`user/message` / `assistant/message` / `tool/call` /
- * `tool/result` / `todo/write`；其余类型（含 `turn/start`、`step/start`、`step/end`、
- * `assistant/attempt`、`request/header`、`turn/end`）贡献空串。
+ * 单条事件的可搜文本抽取（内部纯函数，直接可单测）。可搜类型限定为四类：
+ * `user/message` / `assistant/message` / `tool/call` / `tool/result`（spec §5.8 修订后）。
+ * `todo`/`write` 与 `turn`/`end` 虽然在宿主的 `extractSessionEventText`
+ * （`dsh-session-query/lib/index.js`）里会被抽，但 pi 搜不到它们（pi 只扫 message 文本），
+ * 为了跨宿主同语义（D14）这里**刻意不抽** —— 不要当"遗漏"补回来。
+ * 其余类型（`turn/start`、`step/start`、`step/end`、`assistant/attempt`、`request/header` 等）
+ * 一律贡献空串。
  */
 function eventText(event: SessionEventLike): string {
 	const data = event.data;
@@ -127,18 +125,6 @@ function eventText(event: SessionEventLike): string {
 				stringPart(result?.error?.name),
 				stringPart(result?.error?.code),
 			]
-				.filter(Boolean)
-				.join(" ");
-		}
-		case "todo/write": {
-			const payload = data as { todos?: unknown } | null | undefined;
-			if (!Array.isArray(payload?.todos)) return "";
-			return payload.todos
-				.map((todo) => {
-					if (typeof todo !== "object" || todo === null) return "";
-					const t = todo as { status?: unknown; content?: unknown };
-					return [stringPart(t.status), stringPart(t.content)].filter(Boolean).join(" ");
-				})
 				.filter(Boolean)
 				.join(" ");
 		}
@@ -195,7 +181,12 @@ export function createSessionSearch(
 			// 空 / 全空白 query 不能匹配一切（core 的 handler 已挡在门外，本模块仍自保）。
 			if (q.trim() === "") return "No matches in sessions.";
 
-			const sessions = (await sq.filterSessions([{ kind: "cwd", values: [cwd] }])).slice(0, cfg.maxSessions);
+			const sessions = (await sq.filterSessions([{ kind: "cwd", values: [cwd] }]))
+				.slice(0, cfg.maxSessions)
+				// 纵深防御：宿主 cwd 过滤已经做过这事，但万一它哪天松了，失败模式是静默扫最近 N 个
+				// 会话（跨项目）并当成本项目结果展示。`SessionHeader.cwd` 可选，缺 cwd 的记录在这里被
+				// 丢弃 —— 那是安全方向（宁可少召回，不跨项目泄漏）。
+				.filter((record) => record.header.cwd === cwd);
 			const hits: string[] = [];
 			for (const record of sessions) {
 				const snapshot = await sq.readSession(record.header.id);
