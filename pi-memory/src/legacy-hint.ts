@@ -5,8 +5,8 @@ import { projectDirName, projectIdentity } from "@yandy0725/memory-core";
 /**
  * 2.x → 3.0 的数据根迁移提示。
  *
- * 3.0 把共享数据根从 `~/.pi/memory/` 搬到了 `$XDG_DATA_HOME/auto-memory`（默认
- * `~/.local/share/auto-memory`），好让别的宿主能读同一批文件。**不自动迁移**：静默搬动用户
+ * 3.0 把共享数据根从 `~/.pi/memory/` 搬到了 `$XDG_DATA_HOME/simple-memory`（默认
+ * `~/.local/share/simple-memory`），好让别的宿主能读同一批文件。**不自动迁移**：静默搬动用户
  * 数据比提示更危险（两个宿主同时启动、mv 中途失败、`.lock`/`.backups` 被一起搬走都要额外处理）。
  *
  * 这条逻辑住在 pi 适配层而不是 core —— core 对 `.pi` 一无所知。

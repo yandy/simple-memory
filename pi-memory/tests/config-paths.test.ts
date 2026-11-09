@@ -8,7 +8,7 @@ import { configFiles, loadConfig } from "../src/config";
 /**
  * pi 侧配置层的全部职责：**读哪些文件**。
  *
- * 合并语义、`~` 展开、默认值都在 core（钉在 `auto-memory/tests/config.test.ts`）；这里只钉
+ * 合并语义、`~` 展开、默认值都在 core（钉在 `memory-core/tests/config.test.ts`）；这里只钉
  * `configFiles` 的路径组装与信任门 —— 那是宿主知识，core 对 `.pi` 一无所知（spec D4）。
  */
 describe("configFiles", () => {

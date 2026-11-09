@@ -32,7 +32,7 @@ beforeEach(async () => {
 	cwd = join(base, "proj");
 	await mkdir(cwd, { recursive: true });
 	legacyRoot = join(base, ".pi", "memory");
-	newRoot = join(base, ".local", "share", "auto-memory");
+	newRoot = join(base, ".local", "share", "simple-memory");
 	const sub = await resolvedProjectSubpath(cwd);
 	legacyDir = join(legacyRoot, sub);
 	newDir = join(newRoot, sub);
@@ -114,7 +114,7 @@ describe("detectLegacyMemoryDir", () => {
 		const hint = await detectLegacyMemoryDir({ newDir: customDir, newRoot: customRoot, legacyRoot, cwd });
 
 		expect(hint).toContain(`mv ${legacyRoot} ${customRoot}`);
-		expect(hint).not.toContain("auto-memory");
+		expect(hint).not.toContain("simple-memory");
 	});
 
 	// `mv <src> <dst>` 在 dst 已存在时会把 src 塞**进** dst（得到 <dst>/memory/…）：

@@ -6,7 +6,7 @@ import { applyIndexSection, buildInjection } from "../src/inject-pi";
  * pi 专属的注入**机制**：往 `systemPromptOptions.sections` 里写、往 system prompt 上拼、
  * 以及经 pi 的 headless 会话跑侧查询。
  *
- * 「算出该注入什么字符串」的纯策略钉在 `auto-memory/tests/injection.test.ts`。
+ * 「算出该注入什么字符串」的纯策略钉在 `memory-core/tests/injection.test.ts`。
  */
 describe("applyIndexSection", () => {
 	it("writes memory_index into the mutable sections object and returns true", () => {

@@ -671,7 +671,7 @@ describe("index wiring (integration)", () => {
 		const onWrite = runExtractMock.mock.calls[0][0].onWrite;
 		onWrite({ action: "add", name: "A" });
 		onWrite({ action: "add", name: "B" });
-		// `list` 是读、不计数：这条规则在 core 的 WRITE_ACTIONS 里（auto-memory/tests/memory-handler.test.ts）。
+		// `list` 是读、不计数：这条规则在 core 的 WRITE_ACTIONS 里（memory-core/tests/memory-handler.test.ts）。
 		await flush();
 		expect(notify).not.toHaveBeenCalled();
 
@@ -1373,7 +1373,7 @@ describe("index wiring (integration)", () => {
 		expect(typeof args.store.tryWithLogicalLock).toBe("function");
 		// 计数通道：core 把它透进子会话的 memory 工具，pi 只负责累加与通知
 		expect(typeof args.onWrite).toBe("function");
-		// 「5 个 action + memory 工具」由 core 的 runExtract 决定（钉在 auto-memory/tests/extract.test.ts）；
+		// 「5 个 action + memory 工具」由 core 的 runExtract 决定（钉在 memory-core/tests/extract.test.ts）；
 		// pi 这一侧只提供两个端口。
 		const ports = runExtractMock.mock.calls[0][1];
 		expect(typeof ports.headless.run).toBe("function");
@@ -1452,7 +1452,7 @@ describe("index wiring (integration)", () => {
 				expect(args.memoryDir).toBe(dir);
 				expect(args.maxLines).toBe(200);
 				expect(typeof args.store.withLogicalLock).toBe("function");
-				// 「7 个 action + memory 工具」由 core 的 runDream 决定（钉在 auto-memory/tests/dream.test.ts）
+				// 「7 个 action + memory 工具」由 core 的 runDream 决定（钉在 memory-core/tests/dream.test.ts）
 				expect(typeof runDreamMock.mock.calls[0][1].headless.run).toBe("function");
 
 				// 成功回调（SessionManager.list → writeDreamMeta → notifyDream）必须在 unstub 前排空，
@@ -1586,7 +1586,7 @@ describe("index wiring (integration)", () => {
 
 	it("/memory appends the 2.x migration hint when the detector finds old data", async () => {
 		detectLegacyMemoryDirMock.mockResolvedValueOnce(
-			"Note: found pre-3.0 memories at /home/u/.pi/memory/local/x. Move them with:\n  mkdir -p /home/u/.local/share && mv /home/u/.pi/memory /home/u/.local/share/auto-memory",
+			"Note: found pre-3.0 memories at /home/u/.pi/memory/local/x. Move them with:\n  mkdir -p /home/u/.local/share && mv /home/u/.pi/memory /home/u/.local/share/simple-memory",
 		);
 		const notify = vi.fn();
 		const { pi, commands, handlers } = createFakePi();

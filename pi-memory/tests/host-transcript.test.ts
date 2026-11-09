@@ -5,7 +5,7 @@ import { toExtractMessages } from "../src/host-transcript";
  * pi 的消息形状 → core 的中立 `ExtractMessage`。
  *
  * 这一整个文件都是宿主知识：core 只认 `ExtractMessage`，对 pi 的 `AgentMessage`、bash 执行记录、
- * branch/compaction 摘要一无所知。渲染与预算钉在 `auto-memory/tests/extract.test.ts`。
+ * branch/compaction 摘要一无所知。渲染与预算钉在 `memory-core/tests/extract.test.ts`。
  */
 describe("toExtractMessages", () => {
 	it("maps a pi user message with string content", () => {

@@ -18,7 +18,7 @@ import { createMemoryTool, type MemoryToolDeps } from "../src/memory-tool";
 
 /**
  * pi 适配层只负责三件事：把 core 的 JSON Schema 转成 typebox、渲染、以及 `ctx.ui.notify`。
- * action 的语义与磁盘效果全部钉在 `auto-memory/tests/memory-handler.test.ts`，这里不重复。
+ * action 的语义与磁盘效果全部钉在 `memory-core/tests/memory-handler.test.ts`，这里不重复。
  */
 let dir: string;
 let store: MemoryStore;
