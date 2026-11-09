@@ -303,7 +303,8 @@ export function createMemoryActionHandler(
 **迁移动作 = 用户手动一行**（README「Migrating from 2.x」一节）：
 
 ```sh
-mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}" && mv ~/.pi/memory "${XDG_DATA_HOME:-$HOME/.local/share}/simple-memory"
+case "${XDG_DATA_HOME:-}" in /*) root="$XDG_DATA_HOME";; *) root="$HOME/.local/share";; esac
+mkdir -p "$root" && mv ~/.pi/memory "$root/simple-memory"
 ```
 
 pi 适配层的提示（**不在 core**，D4）：`session_start` 之后，若解析出的记忆目录不存在**且** `~/.pi/memory/<kind>/<projectDirName>` 存在，则 `/memory` 的输出末尾追加一行：

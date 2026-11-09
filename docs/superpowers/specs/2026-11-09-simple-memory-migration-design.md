@@ -236,9 +236,10 @@ PR 标题与正文改写为「删除 `pi-memory`（迁往 simple-memory）」，
 用户侧的数据迁移（一次性，两个方向都只是 `mv`）：
 
 ```sh
-root="${XDG_DATA_HOME:-$HOME/.local/share}"
+case "${XDG_DATA_HOME:-}" in /*) root="$XDG_DATA_HOME";; *) root="$HOME/.local/share";; esac
+mkdir -p "$root"
+mv ~/.pi/memory "$root/simple-memory" 2>/dev/null || true
 mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true
-mkdir -p "$root" && mv ~/.pi/memory "$root/simple-memory" 2>/dev/null || true
 ```
 
 README 与 `pi-memory` 的旧目录提示（`legacy-hint.ts`）覆盖 `~/.pi/memory` → 新根这一条；`auto-memory` → `simple-memory` 这一条只影响本轮之前的开发机，靠 README 说明，不写代码探测。

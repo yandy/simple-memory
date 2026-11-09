@@ -37,6 +37,11 @@ jobs:
 
       - run: npm ci
 
+      # 顺序闸门：pi-memory 的 dependencies 指向 @yandy0725/memory-core@^1.0.0。
+      # core 不在 registry 上就发 pi-memory，用户装到的是一个无法解析依赖的包。
+      - name: Assert the cross-package dependency is already on the registry
+        run: node scripts/assert-publish-order.mjs "${{ steps.info.outputs.dir }}"
+
       # memory-core 的 prepublishOnly 会先跑 build，所以 dist/ 不会来自过期产物。
       # 顺序约束：pi-memory 的 dependencies 指向 @yandy0725/memory-core@^1.0.0，
       # core 不在 registry 上就发 pi-memory，用户会装不上。见 docs/guides/release.md。

@@ -38,14 +38,20 @@ $XDG_DATA_HOME/simple-memory/<git|local>/<project>/
 （静默搬动用户数据比提示更危险），手动搬一次：
 
 ```sh
-root="${XDG_DATA_HOME:-$HOME/.local/share}"
+# 相对路径的 XDG_DATA_HOME 会被忽略（XDG 规范如此），与包的解析规则一致：
+case "${XDG_DATA_HOME:-}" in /*) root="$XDG_DATA_HOME";; *) root="$HOME/.local/share";; esac
 mkdir -p "$root"
-mv ~/.pi/memory "$root/simple-memory"
-# 只有用过早前工作名（auto-memory）的机器才需要这一条：
-mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true
+mv ~/.pi/memory "$root/simple-memory"                              # 2.x → 3.0
+mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true    # 早年工作名
 ```
 
+`$root/simple-memory` **已存在**时，上面这条 `mv` 会把源目录塞进目标里而不是合并。遇到这种情况
+（跑过一次 3.0、或第一条命令执行过两遍），改成按项目目录搬，并自己核对同名冲突：
+`mv ~/.pi/memory/* "$root/simple-memory"/`。
+
 `/memory` 发现在原地留着 pre-3.0 数据时会多打一行提示；它只报告，不搬动、不修改任何文件。
+它在 `session_start` 时**不**提示，且本项目的**新目录一旦出现就不再提示** —— 所以拿不准就先别用 3.0
+写任何东西，先看一眼提示。
 
 ## 开发
 

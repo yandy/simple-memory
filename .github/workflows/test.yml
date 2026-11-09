@@ -73,7 +73,12 @@ jobs:
       - run: npm run build -w memory-core
       - run: npm pack -w memory-core --pack-destination "$RUNNER_TEMP" --json > "$RUNNER_TEMP/pack.json"
       - name: Assert the tarball carries dist and types, and no tests
-        run: node scripts/assert-pack-manifest.mjs "$RUNNER_TEMP/pack.json"
+        run: node scripts/assert-pack-manifest.mjs "$RUNNER_TEMP/pack.json" memory-core
+      # pi-memory 以 TS 源码发布（`pi.extensions` 指向 index.ts），它是用户真正装的那个包；
+      # 少带 index.ts 或 src/，装上就是个加载不起来的扩展，而别的 job 全绿。
+      - run: npm pack -w pi-memory --pack-destination "$RUNNER_TEMP" --json > "$RUNNER_TEMP/pack-pi.json"
+      - name: Assert the pi-memory tarball carries its TS entry point and sources
+        run: node scripts/assert-pack-manifest.mjs "$RUNNER_TEMP/pack-pi.json" pi-memory
       # 必须在干净目录内执行 smoke：Node 的 ESM 解析跟随脚本位置，从仓库根执行会命中仓库自己的
       # workspace 符号链接（→ memory-core/dist），tarball 是空包也照样绿。
       # XDG_DATA_HOME 指向临时目录：defaultMemoryRoot() 在模块加载时求值，不设就会往真实数据根写。

@@ -42,15 +42,20 @@ The disk format is byte-for-byte the one `pi-memory` 2.x writes: YAML frontmatte
 Nothing migrates automatically — silently moving user data is worse than a prompt — so migrate once:
 
 ```sh
-root="${XDG_DATA_HOME:-$HOME/.local/share}"
+# a relative XDG_DATA_HOME is ignored (the XDG spec says so), exactly as the package resolves it:
+case "${XDG_DATA_HOME:-}" in /*) root="$XDG_DATA_HOME";; *) root="$HOME/.local/share";; esac
 mkdir -p "$root"
-mv ~/.pi/memory "$root/simple-memory"
-# only if this machine ran a pre-release build that used the old working name:
-mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true
+mv ~/.pi/memory "$root/simple-memory"                                    # 2.x -> 3.0
+mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true         # pre-release working name
 ```
 
+`mv` into an **existing** `$root/simple-memory` nests the source inside it instead of merging. If that
+directory is already there (a 3.0 run created it, or the first command ran twice), move the per-project
+directories instead and check for name clashes: `mv ~/.pi/memory/* "$root/simple-memory"/`.
+
 `/memory` prints a one-line hint when it finds pre-3.0 data still in place; it only reports, it never
-moves or modifies anything.
+moves or modifies anything. It prints nothing at `session_start` and nothing once this project's new
+directory exists — so check the hint *before* writing anything with 3.0 if you are unsure.
 
 ## Development
 
