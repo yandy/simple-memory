@@ -6,13 +6,22 @@ import { format } from "node:util";
  * 它刻意不 import 任何 `@deepseek-ai/*` 包：它模拟的是「我们观察到的宿主行为」，
  * 而不是「我们可能误读的宿主类型」。需要宿主形状的地方都在这里用本地结构化接口表达。
  *
- * 语义来源（recon notes，均已逐条核对宿主 `.d.ts`）：
+ * 语义来源（recon notes + 宿主 `.d.ts`/`.js`，均已逐条核对；§2.3 的三处修正以本文件为准）：
  * - `agent/pre-step` 是 waterfall：最内层 `next()` 产出 base `{ kind: "enter", messages }`；
  *   `{ prepend: true }` 的监听器 unshift 到最外层（先进入、最后看到 decision、返回值胜出）。
+ *   每个监听器拿到的 `next()` 只能调一次，第二次抛 `"next() called multiple times"`（cordis）。
  * - `agent/created` 串行且被 await，监听器抛出即创建失败；`agent/disposed` 是 fire-and-forget emit。
- * - 注册类方法（section/context/tools.register/commands.register/on）都返回普通 `() => void` disposer。
+ * - 注册类方法（section/context/tools.register/commands.register/on）都返回普通 `() => void` disposer；
+ *   同一层内重名注册抛错（tools 按 agent 作用域分层，agent 作用域合法遮蔽全局）。
+ * - `tools.register` 校验 `output`：必须存在、带 `schema`、`render` 是函数，否则 `TypeError`。
  * - cordis 4 没有 `ctx.on("dispose")`；清理走 `ctx.effect`（立即执行，拥有回调返回的 disposer）。
  * - 根 ctx 的 `tools.register` 是全局的；`agent.ctx.tools.register` 按 agent 隔离、遮蔽全局。
+ * - `ctx.llm.stream()` 的失败有两条通道：middleware/consumer 失败**真的抛**（`llmError`），
+ *   而 adapter 选择/派发/迭代失败被宿主转成**终止 `finish` chunk**（`llmStreamFailure` / `llmStreamAborted`）。
+ * - `sessionQuery.listSessions(signal?)` 返回**裸数组**、newest-first，只收 `AbortSignal`；
+ *   cwd 过滤走另一个方法 `filterSessions([{ kind: "cwd", values: [cwd] }], signal)`。
+ * - 子 agent 的官方分类字段是 `session.header.origin === "subagent"`；普通 fork 只带 `parentSession`，
+ *   不带 `origin`/`delegationDepth`，仍是根 agent（`parentSession` 存在不足以判定子 agent）。
  */
 
 export interface FakeAgent {
@@ -25,13 +34,29 @@ export interface FakeAgent {
 
 export interface FakeCtxOptions {
 	llmStream?: (opts: unknown) => AsyncIterable<unknown>;
+	/** middleware/consumer 失败：`llm.stream` 与 `llm.resolveCallConfig` 真的抛（host 两条通道之一）。 */
 	llmError?: { code: string; message: string };
+	/** adapter 失败：`llm.stream` yield 终止 chunk `{ type:"finish", reason:{ kind:"error", failure:{code,message} } }`。 */
+	llmStreamFailure?: { code: string; message?: string };
+	/** 让 `llm.stream` yield 终止 chunk `{ type:"finish", reason:{ kind:"aborted" } }`。 */
+	llmStreamAborted?: boolean;
 	sessions?: FakeSessionInfo[];
+	/**
+	 * 测试专用钩子：每次假 ctx 自己拥有的注册 disposer 执行时按注册种类（"section"/"context"/"tool"/"command"）
+	 * 回调，用于钉住 `disposeAll` 的逆序执行。effect 回调返回的 disposer 是用户代码，自行记录。
+	 */
+	onDispose?: (kind: string) => void;
 }
 
 export interface FakeSessionInfo {
 	id: string;
 	cwd: string;
+	/** Unix epoch ms；缺省时 listSessions/filterSessions 保持 fixture 顺序（稳定排序）。 */
+	createdAt?: number;
+	/** 是否当前在 `ctx.sessions` 里（宿主 `SessionRecord.live`）。缺省 true。 */
+	live?: boolean;
+	/** 是否被持久化后端列出（宿主 `SessionRecord.persisted`）。缺省 true。 */
+	persisted?: boolean;
 	events: Array<{ type: string; data: unknown }>;
 }
 
@@ -114,6 +139,14 @@ function emptyAsyncIterable(): AsyncIterable<unknown> {
 	};
 }
 
+function singleChunkIterable(chunk: unknown): AsyncIterable<unknown> {
+	return {
+		async *[Symbol.asyncIterator]() {
+			yield chunk;
+		},
+	};
+}
+
 interface ListenerEntry {
 	handler: (payload: any, next?: () => Promise<any>) => any;
 	prepend: boolean;
@@ -124,7 +157,13 @@ function runWaterfall(entries: ListenerEntry[], payload: unknown, base: unknown)
 	const dispatch = (index: number): Promise<any> => {
 		if (index >= entries.length) return Promise.resolve(base);
 		const { handler } = entries[index];
-		return Promise.resolve(handler(payload, () => dispatch(index + 1)));
+		let called = false;
+		const next = () => {
+			if (called) throw new Error("next() called multiple times");
+			called = true;
+			return dispatch(index + 1);
+		};
+		return Promise.resolve(handler(payload, next));
 	};
 	return dispatch(0);
 }
@@ -169,7 +208,7 @@ export function createFakeCtx(
 			modelSelection?: unknown;
 		}): Promise<any>;
 	};
-	makeAgent(over?: Partial<FakeAgent>): FakeAgent;
+	makeAgent(over?: Partial<FakeAgent> & { fork?: boolean }): FakeAgent;
 	cwdFor: Map<string, string>;
 	disposeAll(): void;
 	effects: Array<{ label: string }>;
@@ -186,12 +225,13 @@ export function createFakeCtx(
 	// 所有 disposer 的注册顺序总账；disposeAll 按逆序调用。
 	const disposers: Array<() => void> = [];
 
-	function registerDisposer(fn: () => void): () => void {
+	function registerDisposer(fn: () => void, kind?: string): () => void {
 		let called = false;
 		const disposer = () => {
 			if (called) return;
 			called = true;
 			fn();
+			if (kind !== undefined) opts.onDispose?.(kind);
 		};
 		disposers.push(disposer);
 		return disposer;
@@ -238,19 +278,25 @@ export function createFakeCtx(
 	const systemPrompt = {
 		section(section: any): () => void {
 			const rec: RecordedSection = { ...section };
+			if (sections.some((s) => s.name === rec.name)) {
+				throw new Error(`prompt section "${rec.name}" is already registered`);
+			}
 			sections.push(rec);
 			return registerDisposer(() => {
 				const i = sections.indexOf(rec);
 				if (i >= 0) sections.splice(i, 1);
-			});
+			}, "section");
 		},
 		context(context: any): () => void {
 			const rec = { ...context };
+			if (contexts.some((c) => c.name === rec.name)) {
+				throw new Error(`prompt context "${rec.name}" is already registered`);
+			}
 			contexts.push(rec);
 			return registerDisposer(() => {
 				const i = contexts.indexOf(rec);
 				if (i >= 0) contexts.splice(i, 1);
-			});
+			}, "context");
 		},
 		getSectionOrder(name: string): number | undefined {
 			return SECTION_ORDERS[name];
@@ -260,14 +306,26 @@ export function createFakeCtx(
 		},
 	};
 
+	function validateToolDefinition(definition: any): void {
+		const name = definition?.name;
+		const output = definition?.output;
+		if (output === undefined || output === null || typeof output !== "object" || output.schema === undefined || typeof output.render !== "function") {
+			throw new TypeError(`tool "${name}" must declare output { schema, render }`);
+		}
+	}
+
 	function makeGlobalToolsService() {
 		return {
 			register(definition: any): () => void {
+				validateToolDefinition(definition);
 				const rec: RecordedTool = { ...definition };
+				if (tools.has(rec.name)) {
+					throw new Error(`tool "${rec.name}" is already registered`);
+				}
 				tools.set(rec.name, rec);
 				return registerDisposer(() => {
 					if (tools.get(rec.name) === rec) tools.delete(rec.name);
-				});
+				}, "tool");
 			},
 		};
 	}
@@ -275,11 +333,15 @@ export function createFakeCtx(
 	function makeAgentToolsService(agentId: string) {
 		return {
 			register(definition: any): () => void {
+				validateToolDefinition(definition);
 				const rec: RecordedTool = { ...definition };
 				let arr = agentTools.get(agentId);
 				if (!arr) {
 					arr = [];
 					agentTools.set(agentId, arr);
+				}
+				if (arr.some((t) => t.name === rec.name)) {
+					throw new Error(`tool "${rec.name}" is already registered in this scope`);
 				}
 				arr.push(rec);
 				return registerDisposer(() => {
@@ -287,7 +349,7 @@ export function createFakeCtx(
 					if (!list) return;
 					const i = list.indexOf(rec);
 					if (i >= 0) list.splice(i, 1);
-				});
+				}, "tool");
 			},
 		};
 	}
@@ -295,17 +357,25 @@ export function createFakeCtx(
 	const commandsService = {
 		register(definition: any): () => void {
 			const rec: RecordedCommand = { ...definition };
+			if (commands.some((c) => c.name === rec.name)) {
+				throw new Error(`command "${rec.name}" is already registered`);
+			}
 			commands.push(rec);
 			return registerDisposer(() => {
 				const i = commands.indexOf(rec);
 				if (i >= 0) commands.splice(i, 1);
-			});
+			}, "command");
 		},
 	};
 
 	const llm = {
 		stream(options: unknown): AsyncIterable<unknown> {
 			if (opts.llmError) throw makeError();
+			if (opts.llmStreamFailure) {
+				const failure = { code: opts.llmStreamFailure.code, message: opts.llmStreamFailure.message ?? opts.llmStreamFailure.code };
+				return singleChunkIterable({ type: "finish", reason: { kind: "error", failure } });
+			}
+			if (opts.llmStreamAborted) return singleChunkIterable({ type: "finish", reason: { kind: "aborted" } });
 			if (opts.llmStream) return opts.llmStream(options);
 			return emptyAsyncIterable();
 		},
@@ -326,8 +396,31 @@ export function createFakeCtx(
 		},
 	};
 
+	/** 宿主 `SessionHeader`（`dsh-session/lib/types/types.d.ts:59-92`）的最小忠实子集。 */
 	function sessionHeader(s: FakeSessionInfo) {
-		return { id: s.id, cwd: s.cwd, createdAt: "1970-01-01T00:00:00.000Z" };
+		return {
+			version: 4,
+			id: s.id,
+			createdAt: s.createdAt ?? 0,
+			cwd: s.cwd,
+			isSeeded: false,
+		};
+	}
+
+	/** 宿主 `SessionRecord`（`dsh-session-query/lib/types/types.d.ts:14-31`）：header + live + persisted。 */
+	function sessionRecord(s: FakeSessionInfo) {
+		return { header: sessionHeader(s), live: s.live ?? true, persisted: s.persisted ?? true };
+	}
+
+	/** newest-first 稳定排序；缺 createdAt 的记录排在带日期的记录之后、保持 fixture 顺序。 */
+	function sortedSessionRecords(): any[] {
+		const records = (opts.sessions ?? []).map((s) => ({ record: sessionRecord(s), createdAt: s.createdAt }));
+		records.sort((a, b) => {
+			const ka = a.createdAt ?? Number.NEGATIVE_INFINITY;
+			const kb = b.createdAt ?? Number.NEGATIVE_INFINITY;
+			return kb === ka ? 0 : kb - ka;
+		});
+		return records.map((r) => r.record);
 	}
 
 	function extractText(event: { type: string; data: unknown }): string {
@@ -363,26 +456,34 @@ export function createFakeCtx(
 		return true;
 	}
 
-	// 简单、数据驱动的会话查询：形状对齐 Task 13 的 `SessionQueryLike`（`listSessions` 返回 `{ items }`
-	// 页对象、`readSession` 返回 `{ events }`），同时保留宿主真 `filterEvents` 的文档数组形态。
-	// `listSessions` 支持两种 cwd 过滤写法：`{ cwd }`（便利）与 `{ filters: [{ kind: "cwd", values: [cwd] }] }`。
+	// 忠实宿主：`listSessions(signal?)` 返回裸数组、newest-first；cwd 过滤在 `filterSessions(filters, signal)`。
 	const sessionQuery = {
-		async listSessions(
-			options?: { cwd?: string; limit?: number; filters?: readonly any[] } | AbortSignal,
-			_opts?: { signal?: AbortSignal },
-		): Promise<{ items: Array<{ header: { id: string; cwd?: string; createdAt?: string } }> }> {
-			const q = options && typeof options === "object" ? (options as { cwd?: string; limit?: number; filters?: readonly any[] }) : {};
-			const cwdFilter = q.filters?.find((f: any) => f?.kind === "cwd")?.values?.[0];
-			const cwd = q.cwd ?? cwdFilter;
-			let records = (opts.sessions ?? []).map((s) => ({ header: sessionHeader(s) }));
-			if (cwd !== undefined) records = records.filter((r) => r.header.cwd === cwd);
-			if (q.limit !== undefined && q.limit > 0) records = records.slice(0, q.limit);
-			return { items: records };
+		async listSessions(_signal?: AbortSignal): Promise<any[]> {
+			return sortedSessionRecords();
+		},
+		async filterSessions(filters?: readonly any[], _signal?: AbortSignal): Promise<any[]> {
+			const clauses = filters ?? [];
+			for (const f of clauses) {
+				if (f && typeof f === "object" && f.kind !== "cwd") {
+					throw new Error(`fake ctx: unsupported session filter kind "${String(f.kind)}"`);
+				}
+			}
+			const cwdClause = clauses.find((f: any) => f?.kind === "cwd");
+			let records = sortedSessionRecords();
+			if (cwdClause) {
+				const values: readonly any[] = cwdClause.values ?? [];
+				records = records.filter((r) => values.includes(r.header.cwd ?? null));
+			}
+			return records;
 		},
 		async readSession(sessionId: string, _opts?: { signal?: AbortSignal }): Promise<any> {
 			const s = (opts.sessions ?? []).find((x) => x.id === sessionId);
 			if (!s) throw new Error(`fake ctx: session not found: ${sessionId}`);
-			return { session: sessionHeader(s), events: s.events.map((e, i) => ({ ...e, seq: i, time: 0 })) };
+			return {
+				session: sessionHeader(s),
+				inheritedEventCount: 0,
+				events: s.events.map((e, i) => ({ ...e, seq: i, time: 0 })),
+			};
 		},
 		async filterEvents(sessionId: string, filters?: readonly any[]): Promise<any[]> {
 			const s = (opts.sessions ?? []).find((x) => x.id === sessionId);
@@ -447,15 +548,20 @@ export function createFakeCtx(
 	}
 
 	let nextId = 1;
-	function makeAgent(over: Partial<FakeAgent> = {}): FakeAgent {
+	function makeAgent(over: Partial<FakeAgent> & { fork?: boolean } = {}): FakeAgent {
 		const id = over.id ?? `agent-${nextId++}`;
 		const cwd = over.cwd ?? "/fake/workspace";
 		const subagent = over.subagent ?? false;
+		const fork = over.fork ?? false;
 		const session = over.session ?? {
 			id,
 			header: {
 				cwd,
-				...(subagent ? { parentSession: "session-parent-fake", delegationDepth: 1 } : {}),
+				...(subagent
+					? { parentSession: "session-parent-fake", origin: "subagent" as const, delegationDepth: 1 }
+					: fork
+						? { parentSession: "session-parent-fake" }
+						: {}),
 			},
 		};
 		const agent: any = {
