@@ -2,7 +2,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-export type ThinkLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+/**
+ * 宿主的思考/推理档位，**不透明字符串**：core 原样透传，不解释、不校验。
+ * pi 的合法值是 `off|minimal|low|medium|high|xhigh`；dsh 的合法值按 provider 路线是数据
+ * （DeepSeek 路线 `off|low|high|max`），所以 core 不能把它写成闭枚举。
+ * 合法性由适配层在启动期用宿主的 resolve 接口校验。
+ */
+export type EffortLevel = string;
+/** @deprecated pi 词汇，等价于 `EffortLevel`；保留是为了已发布适配层的类型重导出不破。 */
+export type ThinkLevel = EffortLevel;
 
 /** Session persistence configuration for headless memory-agent sub-sessions. */
 export interface SessionPersistenceConfig {
@@ -22,7 +30,7 @@ export interface DefaultsConfig {
 export interface AutoSurfacingConfig {
 	enabled: boolean;
 	model?: string;
-	thinkLevel: ThinkLevel;
+	thinkLevel: EffortLevel;
 	maxFiles: number;
 	/**
 	 * 单条 entry 注入正文的字节上限。
@@ -37,7 +45,7 @@ export interface ExtractMemoriesConfig {
 	/** 每轮自动提取。opt-in：默认 `false` —— 开启后每轮结束都会跑一次 headless 模型调用。 */
 	enabled: boolean;
 	model?: string;
-	thinkLevel: ThinkLevel;
+	thinkLevel: EffortLevel;
 	maxContextTokens: number;
 	/** 渲染进 extract prompt 时，单条 tool_result 的字符上限。 */
 	maxToolResultChars: number;
@@ -72,7 +80,7 @@ export interface MemoryConfig {
 		nudgeAfterSessions: number;
 		nudgeAfterHours: number;
 		model?: string;
-		thinkLevel: ThinkLevel;
+		thinkLevel: EffortLevel;
 		sessionPersistence?: SessionPersistenceConfig;
 	};
 	sessionSearch: { maxSessions: number; maxMatches: number };

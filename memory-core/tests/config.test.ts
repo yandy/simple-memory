@@ -11,7 +11,9 @@ import {
 	requiredModel,
 	requiredModels,
 	taskModel,
+	type EffortLevel,
 	type MemoryConfig,
+	type ThinkLevel,
 } from "../src/config.js";
 
 describe("DEFAULT_CONFIG", () => {
@@ -380,5 +382,13 @@ describe("mergeConfig", () => {
 		const viaFile = await loadConfigFrom([file]);
 		const viaMerge = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
 		expect(viaMerge).toEqual(viaFile);
+	});
+});
+
+describe("EffortLevel", () => {
+	it("EffortLevel 接受宿主的任意档位，ThinkLevel 是它的别名", () => {
+		const dshEffort: EffortLevel = "max"; // dsh 的 DeepSeek 路线档位，旧 ThinkLevel 表达不出
+		const piEffort: ThinkLevel = dshEffort; // 双向可赋值 = 同一类型
+		expect([dshEffort, piEffort]).toEqual(["max", "max"]);
 	});
 });
