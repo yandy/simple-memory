@@ -50,7 +50,36 @@ describe("runSideQuery", () => {
 			timeoutMs: 30_000,
 			builtinTools: "none",
 			memoryTool: null,
+			signal: undefined,
 		});
+		expect(result).toEqual(["a.md"]);
+	});
+
+	// 取消信号必须原样落到端口的请求上：适配层在宿主会 await 的钩子里调用本函数，
+	// 信号到不了端口，用户取消后就要等满 timeoutMs 才拿得到一个没人要的结果。
+	it("forwards the abort signal to the port verbatim", async () => {
+		headlessRun.mockResolvedValueOnce('{"selected_files":[]}');
+		const controller = new AbortController();
+
+		await runSideQuery(
+			{ ...base, manifest: [manifest("a.md")], userPrompt: "q", injectedFiles: new Set(), signal: controller.signal },
+			ports,
+		);
+
+		const captured: HeadlessRunRequest = headlessRun.mock.calls[0][0];
+		expect(captured.signal).toBe(controller.signal);
+	});
+
+	// 不传 signal 仍必须是合法调用：适配层可以不管取消，行为与加这个字段前完全一致。
+	it("still runs the round when no signal is given", async () => {
+		headlessRun.mockResolvedValueOnce('{"selected_files":["a.md"]}');
+		const result = await runSideQuery(
+			{ ...base, manifest: [manifest("a.md")], userPrompt: "q", injectedFiles: new Set() },
+			ports,
+		);
+		expect(headlessRun).toHaveBeenCalledTimes(1);
+		const captured: HeadlessRunRequest = headlessRun.mock.calls[0][0];
+		expect(captured.signal).toBeUndefined();
 		expect(result).toEqual(["a.md"]);
 	});
 

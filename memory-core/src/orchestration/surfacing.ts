@@ -16,6 +16,12 @@ export interface RunSideQueryOpts {
 	model: string;
 	/** 子会话 cwd；传 memoryDir。 */
 	cwd: string;
+	/**
+	 * 宿主那一轮的取消信号，原样透传给端口的 `HeadlessRunRequest.signal`。
+	 * 适配层通常在「宿主会 await 的钩子」里调用本函数（例如每轮开始前），此时不传 signal 意味着
+	 * 用户取消后，调用方仍要等满 `timeoutMs` 才拿得到一个没人要的结果。
+	 */
+	signal?: AbortSignal;
 	sessionPersistence?: SessionPersistenceConfig;
 }
 
@@ -55,6 +61,7 @@ export async function runSideQuery(
 			effort: opts.effort,
 			maxTurns: 1,
 			timeoutMs: 30_000,
+			signal: opts.signal,
 			// 零工具就是意图：侧查询只需要回一个 JSON，给它任何工具都是白烧 token。
 			builtinTools: "none",
 			memoryTool: null,
