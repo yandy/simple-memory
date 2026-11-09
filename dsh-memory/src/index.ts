@@ -1,3 +1,4 @@
+import { MEMORY_TOOL_SNIPPET } from "@yandy0725/memory-core";
 import { createMemoryCommand } from "./commands.js";
 import { createDshHeadless } from "./headless.js";
 import type { LlmLike } from "./headless.js";
@@ -84,7 +85,17 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// `LlmCallConfig`（`reasoningEffort?: ReasoningEffortId`，品牌化 string），而 model.ts 的接缝刻意
 		// 用裸 string 以便脱离宿主单测；运行时是同一个字符串，所以只在接线处收窄这一次。
 		const resolveCallConfig = ctx.llm.resolveCallConfig.bind(ctx.llm) as ResolveCallConfig;
-		surfacing = await resolveSurfacingAvailability(resolved.config, resolveCallConfig);
+		// 10s 上界是刻意的，不是防御性装饰：这个 await 发生在**任何**注册（索引 section、/memory、
+		// 三个 ctx.on）之前，而 `resolveCallConfig` 会进宿主的 capability 查找、自己没有任何 deadline。
+		// 一旦它挂起，`apply` 就永远不 settle —— 没有索引 section、没有 /memory、没有工具、没有监听器，
+		// 而且连一行日志都没有（因为根本没抛错）。这是比 D13 要防的「抛错型激活失败」更糟的静默失败。
+		// 有界之后，abort 会走 model.ts 既有的 try，降级成 `{ available: false, reason }` —— 正是 D13 的
+		// 路径，所以不需要任何新的错误处理。别把它当「多余」删掉。
+		surfacing = await resolveSurfacingAvailability(
+			resolved.config,
+			resolveCallConfig,
+			AbortSignal.timeout(10_000),
+		);
 	} catch (e) {
 		surfacing = { available: false, reason: `autoSurfacing could not be resolved: ${messageOf(e)}` };
 	}
@@ -110,9 +121,22 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// 遇到未知/畸形的 `{{...}}` 直接抛错 —— 一次写坏的索引就会让整个 system prompt 装配失败。
 		interpolate: false,
 		// text 必须是全函数：宿主每次装配都调它（诊断路径还会传一个没有 agent 的 `{}`），
-		// 查不到快照就返回空串（`IndexCache.read` 的契约：永不抛错、永不返回 undefined）。
-		// 子 agent 因此天然拿不到索引：它从没被 prepare 过。
-		text: (context) => indexCache.read(context.agent?.session.id ?? ""),
+		// 查不到运行时（没 prepare 过、子 agent、诊断路径）就返回空串，永不抛错、永不返回 undefined。
+		//
+		// §2.6：`MEMORY_TOOL_SNIPPET` 的落点与出现判据。dsh 的 ToolSchema 没有 pi 的 `promptSnippet`
+		// 通道，这个 section 是唯一能把 snippet 递给模型的通道；判据是「该 session 有 runtime」
+		// （`registry.get(sessionId) !== undefined`），那正是 `agent/created` 给该 agent 注册工具的
+		// 条件 —— 工具在，snippet 就在，与 pi 一致。拼接规则：
+		//   无 runtime → ""
+		//   有 runtime 且索引空 → 只有 snippet（新项目第一次被告知工具存在的时机）
+		//   有 runtime 且索引非空 → snippet + "\n\n" + 索引正文
+		// 只在前面拼，正文本身逐字不动（跨宿主字节恒等是硬要求，见 index-cache.ts）。
+		text: (context) => {
+			const sessionId = context.agent?.session.id ?? "";
+			if (registry.get(sessionId) === undefined) return "";
+			const indexBody = indexCache.read(sessionId);
+			return indexBody === "" ? MEMORY_TOOL_SNIPPET : `${MEMORY_TOOL_SNIPPET}\n\n${indexBody}`;
+		},
 	};
 	ctx.systemPrompt.section(section);
 	ctx.commands.register(createMemoryCommand({ registry, indexCache, warnings: resolved.warnings }));
@@ -135,8 +159,10 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			searchSessions,
 			// 写入成功后刷新索引快照。core 的 onWrite 是同步回调（handler.ts:183 不 await 它），
 			// 而宿主的 section text 必须同步 —— 所以这里只能 fire-and-forget；refresh 自己永不抛错，
-			// 失败也只是保留旧快照。
-			onWrite: () => void indexCache.refresh(rt),
+			// 失败也只是保留旧快照。不过「refresh 不 reject」的保证住在另一个模块（index-cache.ts），
+			// 这里就地吞掉，让「本文件绝不产生 unhandled rejection」本地成立、不被未来的改动打破
+			// （Node 里一次 unhandled rejection 就能在没有全局 handler 时杀死进程）。
+			onWrite: () => void indexCache.refresh(rt).catch(() => {}),
 		});
 
 		// 同一个 sessionId 可能再来一次 created（宿主的 clear / compact 会重建 agent）：先撤掉上一份，
@@ -190,7 +216,12 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	ctx.on(
 		"agent/pre-step",
 		// R6：surfacing.ts 的接缝把消息保持成 `unknown[]`（零宿主类型），宿主的 decision 里是
-		// `UserMessage[]`。同一份数组、同一份语义，只在接线处收窄这一次。
+		// `UserMessage[]`。这个 cast 不只担保宿主自己产出的消息（同一份数组、同一份语义）——
+		// 那份数组里还会混进**我们注入的召回消息**（surfacing.ts 的 `createRecallMessage`）：它的
+		// `source.kind: "simple-memory"` 不在宿主的 `MessageSourceMap` 里、`id` 是未品牌化的
+		// `randomUUID()` 而不是品牌化 `MessageId`。运行期因此可容忍（宿主 `MessageSourceMap` 可合并
+		// 扩展、未知 kind 消费者 fall-through；品牌只是类型面），所以这不是缺陷，但这个 cast 同样
+		// 在替我们的注入消息担保。只在接线处收窄这一次。
 		async (payload, next) => (await recall(payload, next)) as HostPreStepDecision,
 		{ prepend: true },
 	);

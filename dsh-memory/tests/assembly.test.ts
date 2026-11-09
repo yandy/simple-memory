@@ -2,7 +2,14 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { DEFAULT_CONFIG, MemoryStore, mergeConfig, projectDirName } from "@yandy0725/memory-core";
+import {
+	buildIndexSection,
+	DEFAULT_CONFIG,
+	MEMORY_TOOL_SNIPPET,
+	MemoryStore,
+	mergeConfig,
+	projectDirName,
+} from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { apply, inject, name } from "../src/index.js";
 import { createFakeCtx, createUserMsg } from "./helpers/fake-ctx.js";
@@ -55,6 +62,18 @@ async function seedEntry(memoryDir: string, entryName: string, description: stri
 		lock: cfg.lock,
 	});
 	await store.addEntry({ name: entryName, description, body: body ?? `body of ${entryName}` });
+}
+
+/** core 对同一份 memoryDir 会注入的索引正文（与 registry 的 store 同一套配置窗口，字节逐字一致）。 */
+async function expectedIndexBody(memoryDir: string): Promise<string> {
+	const cfg = mergeConfig(structuredClone(DEFAULT_CONFIG), { memoryDir });
+	const store = new MemoryStore({
+		memoryDir,
+		indexMaxLines: cfg.memIndexMaxLines,
+		indexMaxBytes: cfg.memIndexMaxBytes,
+		lock: cfg.lock,
+	});
+	return buildIndexSection(store, cfg.memIndexInjectMaxLines, cfg.memIndexInjectMaxBytes);
 }
 
 /** 跑一次 `apply`：宿主的一次插件激活。 */
@@ -276,7 +295,9 @@ describe("apply — per-agent 生命周期", () => {
 		await expect(tool?.execute({ action: "list" }, {})).rejects.toThrowError(/must be an object/);
 
 		const text = sectionText(fake);
-		expect(text({ agent })).toBe("");
+		// 错误态（store === null）仍要有 snippet（D13：工具仍然注册，只是降级；§2.6 推论 2）。
+		// 索引正文为空，所以 section 只有 snippet。
+		expect(text({ agent })).toBe(MEMORY_TOOL_SNIPPET);
 
 		const status = await runMemoryCommand(fake, agent);
 		expect(status.text).toContain("Memory: misconfigured");
@@ -328,6 +349,56 @@ describe("apply — per-agent 生命周期", () => {
 			signal: new AbortController().signal,
 		});
 		expect(decision).toEqual({ kind: "enter", messages });
+	});
+});
+
+describe("apply — MEMORY_TOOL_SNIPPET 落点（§2.6）", () => {
+	it("shows the tool snippet for a healthy session with zero memories", async () => {
+		const { fake } = await setup();
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		// 新项目：索引为空，section 就只剩 snippet —— 这正是第一次该告诉模型「工具有」的时机。
+		expect(sectionText(fake)({ agent })).toBe(MEMORY_TOOL_SNIPPET);
+	});
+
+	it("prepends the snippet to a byte-identical core index body", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "first note");
+		const { fake } = await setup();
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		const body = await expectedIndexBody(memoryDir);
+		// 只 prepend，正文逐字不动（跨宿主字节恒等是硬要求，§2.6）。
+		expect(sectionText(fake)({ agent })).toBe(`${MEMORY_TOOL_SNIPPET}\n\n${body}`);
+	});
+
+	it("keeps the snippet for a directory-failure session and still registers the degraded tool", async () => {
+		// D13 的另一分支：dirs.ensure 拒绝且 session.header.cwd 为空 → prepare 产出 store=null + error。
+		const fake = createFakeCtx();
+		const ensure = vi.spyOn(fake.ctx.workingDirectory, "ensure").mockRejectedValue(new Error("ensure boom"));
+		await apply(fake.ctx, rowConfig());
+		const agent = fake.makeAgent({ id: "s1", session: { id: "s1", header: { cwd: "" } } });
+		await fake.emitter.agentCreated(agent);
+
+		// 错误态也要有 snippet（D13：工具仍注册，只是降级；§2.6 推论 2），索引正文为空。
+		const text = sectionText(fake);
+		expect(text({ agent })).toBe(MEMORY_TOOL_SNIPPET);
+
+		// 工具仍在、execute 拒绝并带上目录失败原因；/memory 报告 misconfigured。
+		const tool = memoryToolOf(fake, "s1");
+		expect(tool).toBeDefined();
+		await expect(tool?.execute({ action: "list" }, {})).rejects.toThrowError(/ensure boom/);
+
+		const status = await runMemoryCommand(fake, agent);
+		expect(status.text).toContain("Memory: misconfigured");
+		expect(status.text).toContain("ensure boom");
+
+		// 门禁只挡子 agent：它从没进 runtime，所以 snippet 也不该有（§2.6 推论 3）。
+		const sub = fake.makeAgent({ id: "sub-1", subagent: true, cwd });
+		await fake.emitter.agentCreated(sub);
+		expect(text({ agent: sub })).toBe("");
 	});
 });
 
