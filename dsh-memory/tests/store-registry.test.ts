@@ -117,6 +117,11 @@ describe("createStoreRegistry", () => {
 		expect(registry.storeCount()).toBe(1);
 		expect(rt1.store).toBe(rt2.store);
 		expect(rt1.store).not.toBeNull();
+
+		// 索引是模块存在的理由：消费方同步读 get(sessionId)，而不是拿 prepare 返回的对象。
+		expect(registry.get("s1")).toBe(rt1);
+		expect(registry.get("s2")?.store).toBe(rt1.store);
+		expect(registry.get("nope")).toBeUndefined();
 	});
 
 	it("returns a null-store runtime and never calls dirs.ensure when the config is already in error", async () => {
@@ -168,7 +173,64 @@ describe("createStoreRegistry", () => {
 		expect(rt.store).toBeNull();
 		expect(rt.memoryDir).toBeNull();
 		expect(rt.error).not.toBeNull();
+		expect(rt.error).toContain("Failed to resolve the working directory for session s1: ");
 		expect(rt.error).toContain("ensure boom");
+
+		// 失败路径也必须进索引：消费方拿到的是这个 failed runtime，而不是 undefined。
+		expect(registry.get("s1")).toBe(rt);
+		expect(registry.get("s1")?.store).toBeNull();
+	});
+
+	it("returns a null-store runtime when resolveMemoryDir rejects on a non-string memoryDir", async () => {
+		const root = join(dir, "mem-root");
+		const { registry, makeAgent } = registryWithFakeDirs();
+		const cwd = join(dir, "plain");
+		await mkdir(cwd);
+
+		// node:path resolve() 对非字符串 memoryDir 抛 ERR_INVALID_ARG_TYPE，真实触发 resolveMemoryDir
+		// 的 reject 分支（不 mock core）。git probe 对普通临时目录先返回 { kind: "local" }，不会吞掉它。
+		const resolved: ResolvedConfig = {
+			config: { ...makeConfig(root), memoryDir: 123 as unknown as string },
+			warnings: [],
+			error: null,
+		};
+
+		const rt = await registry.prepare(makeAgent({ cwd, id: "s1" }), resolved, SURFACING);
+
+		expect(rt.store).toBeNull();
+		expect(rt.memoryDir).toBeNull();
+		expect(rt.error).not.toBeNull();
+		expect(rt.error).toContain("Failed to resolve memory directory: ");
+	});
+
+	it("treats a blank ensure rejection message as no cwd, yielding a non-empty error", async () => {
+		const ensure = vi.fn<HostDirLike["ensure"]>().mockRejectedValue(new Error(""));
+		const dirs: HostDirLike = { ensure, get: () => "/unused" };
+		const registry = createStoreRegistry(dirs);
+
+		const agent: AgentLike = { session: { id: "s1", header: {} } };
+		const rt = await registry.prepare(agent, makeResolved("/tmp/unused-root"), SURFACING);
+
+		expect(rt.store).toBeNull();
+		expect(rt.memoryDir).toBeNull();
+		expect(rt.error).not.toBeNull();
+		expect(rt.error).not.toBe("");
+		expect(rt.error).toContain("no working directory available");
+	});
+
+	it("treats a blank resolved.error as no error and proceeds to resolve the directory", async () => {
+		const root = join(dir, "mem-root");
+		const { registry, makeAgent } = registryWithFakeDirs();
+		const cwd = join(dir, "plain");
+		await mkdir(cwd);
+
+		const resolved: ResolvedConfig = { config: makeConfig(root), warnings: [], error: "" };
+
+		const rt = await registry.prepare(makeAgent({ cwd, id: "s1" }), resolved, SURFACING);
+
+		expect(rt.error).toBeNull();
+		expect(rt.store).not.toBeNull();
+		expect(rt.memoryDir).toBe(join(resolve(root), "local", projectDirName(resolve(cwd))));
 	});
 
 	it("forgets per-session and drops the shared store only when the last reference goes away", async () => {

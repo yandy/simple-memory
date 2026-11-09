@@ -123,8 +123,9 @@ export function createStoreRegistry(dirs: HostDirLike): StoreRegistry {
 		const existing = bySession.get(sessionId);
 		if (existing) releaseDir(existing.memoryDir);
 
-		if (resolved.error !== null) {
+		if (resolved.error !== null && resolved.error.trim() !== "") {
 			// 已处于错误态的 session 没理由再解析目录：跳过 dirs.ensure，直接给可读原因。
+			// 空白 error 视同无错（上游可能给出空字符串），照常解析目录。
 			return fail(sessionId, headerCwd, resolved.config, surfacing, resolved.error);
 		}
 
@@ -138,7 +139,14 @@ export function createStoreRegistry(dirs: HostDirLike): StoreRegistry {
 		}
 		if (!cwd) cwd = headerCwd;
 		if (!cwd) {
-			return fail(sessionId, "", resolved.config, surfacing, cwdError ?? "no working directory available");
+			const reason = cwdError?.trim() ? cwdError : "no working directory available";
+			return fail(
+				sessionId,
+				"",
+				resolved.config,
+				surfacing,
+				`Failed to resolve the working directory for session ${sessionId}: ${reason}`,
+			);
 		}
 
 		let memoryDir: string;
