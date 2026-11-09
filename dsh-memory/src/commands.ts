@@ -114,7 +114,7 @@ async function reResolveMemoryDir(rt: SessionMemoryRuntime): Promise<string | nu
 }
 
 /**
- * 状态块。内容口径与 pi 的 `/memory` 一致（同一套 core 窗口核心），去掉 dsh 本轮没有的行
+ * 状态块。内容口径与 pi 的 `/memory` 一致（同一套 core 窗口核心），去掉本适配层没实现的行
  * （dream / extractMemories / Last dream）—— 例外：用户真在行 config 里写了它们时，`Modules:` 行
  * 会就地报 `not implemented in this adapter`（否则白名单静默接受、效果为零、且没有任何提示）。
  * 三个「不是状态、而是诊断」的早退路径都返回可读文本：
@@ -153,7 +153,8 @@ export async function renderStatus(
 	].join(", ");
 
 	const lines = [
-		// Dir 必须打印：memoryDir 是 per-harness 配置（spec D4 —— 刻意没有共享配置文件）。
+		// Dir 必须打印：memoryDir 是 per-harness 配置 —— 刻意没有跨 harness 的共享配置文件（pi 读自己的
+		// memory.json，dsh 只读插件行 config）。
 		// 用户在 pi 里覆盖了它、在 dsh 里没覆盖时，两个宿主写不同目录，这一行是唯一能看见的地方。
 		`Dir: ${dir}`,
 		`Index: ${cap.lineCount}/${rt.config.memIndexMaxLines} lines, ${cap.byteLength}/${rt.config.memIndexMaxBytes} bytes, ${parseEntryIndex(indexRaw).unrecognized} unrecognized lines`,

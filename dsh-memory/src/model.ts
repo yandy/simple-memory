@@ -84,7 +84,7 @@ function hostRejectionReason(model: string, error: unknown): string {
 }
 
 /**
- * D13 的启动期降级判定：三种结果都**不抛给宿主**，缺模型只关掉需要它的那一个模块。
+ * 启动期降级判定（降级而不失败）：三种结果都**不抛给宿主**，缺模型只关掉需要它的那一个模块。
  *
  * 1. 模块被关掉（`autoSurfacing.enabled` falsy，含运行时合法的 `autoSurfacing: null`）→ 关。
  *    **必须先查**：`modelConfigErrors(cfg, () => true, ["autoSurfacing"])` 在「没配模型」与

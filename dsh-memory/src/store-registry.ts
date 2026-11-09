@@ -8,7 +8,7 @@ import type { ResolvedConfig } from "./row-config.js";
  * 本模块读到的最小宿主 agent 形状。
  *
  * 刻意不用宿主真正的 `Agent` 类型：这里只需要 `session.id` 与 `session.header` 里的 cwd /
- * 子 agent 判据字段，保持结构化、零宿主 import，好对着 fake 测试。Task 16 在接线边界把真
+ * 子 agent 判据字段，保持结构化、零宿主 import，好对着 fake 测试。装配层在接线边界把真
  * 宿主 agent 适配成这个形状。
  */
 export interface AgentLike {
@@ -36,7 +36,7 @@ export interface HostDirLike {
 }
 
 export interface StoreRegistry {
-	/** `agent/created` 里 await。**永不抛错**：失败也返回 `store: null` 的 runtime（D13）。 */
+	/** `agent/created` 里 await。**永不抛错**：失败也返回 `store: null` 的 runtime（降级而不失败）。 */
 	prepare(
 		agent: AgentLike,
 		resolved: ResolvedConfig,
@@ -51,7 +51,7 @@ export interface StoreRegistry {
 }
 
 /**
- * 根 agent 判据（spec §2.3 / D9）。
+ * 根 agent 判据：只有根 agent 才挂记忆层（索引 / 工具 / 召回）。
  *
  * 以 `origin === "subagent"` 为主判据，正的 `delegationDepth` 为辅助。**绝不读 `parentSession`**：
  * 宿主 `dsh-session/lib/types/types.d.ts` 在 `parentSession` 上明文警告「Presence alone does not
@@ -126,7 +126,7 @@ export function createStoreRegistry(dirs: HostDirLike): StoreRegistry {
 			return fail(sessionId, headerCwd, resolved.config, surfacing, resolved.error);
 		}
 
-		// cwd 来源：dirs.ensure(agent, signal)，异常回退 agent.session.header.cwd（spec §3 第 10 行）。
+		// cwd 来源：dirs.ensure(agent, signal)，异常回退 agent.session.header.cwd（宿主对同一件事的两个来源）。
 		let cwd = "";
 		let cwdError: string | null = null;
 		try {

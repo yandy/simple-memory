@@ -5,14 +5,14 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
 /**
  * 每个 session 一份的索引快照。
  *
- * 读侧（`read`）挂在宿主的 system prompt 装配路径上（spec §5.4 的 `text` 回调必须同步），
+ * 读侧（`read`）挂在宿主的 system prompt 装配路径上（section 的 `text` 回调必须同步返回字符串），
  * 而 `buildIndexSection` 是异步的（读 MEMORY.md + 截断 + 净化）。所以这里把两者拆开：
  * 刷新在 `agent/created`、memory 工具写入后、`/memory` 执行后、以及**每一个** `agent/pre-step`
  * 之前异步发生（不是「每轮第一个 step」：刷新点在召回门禁**之前**，所以每轮的每个 step 都刷一次
  * —— 这是一条**成本**属性：长会话里每轮的磁盘读次数 ≈ steps-per-turn，调优时别把它当成每轮一次），
  * 读则只是同步查一张 `Map`。
  *
- * 两条硬约束（spec §5.4）：
+ * 两条硬约束：
  * - `read` **永不抛错、永不返回 `undefined`**：一次读盘失败绝不能让 prompt 装配整体失败。
  * - `refresh` **永不抛错**，失败必须**保留旧值**：过期索引只是轻微降级，消失的索引是坏掉的会话。
  */
@@ -33,7 +33,7 @@ interface Snapshot {
 
 /**
  * 纯内存 `Map`：`sessionId → { text, error }`。没有 TTL、没有 watcher、没有失效事件 ——
- * 刷新时机由调用方（Task 16 的装配）决定，这里只管「异步写、同步读、失败保留旧值」。
+ * 刷新时机由调用方（index.ts 的装配）决定，这里只管「异步写、同步读、失败保留旧值」。
  * `forget` 由 `agent/disposed` 调用，删除整个快照，长驻宿主进程里不会按 session 无限增长。
  */
 export function createIndexCache(): IndexCache {
@@ -46,7 +46,7 @@ export function createIndexCache(): IndexCache {
 			bySession.set(rt.sessionId, snapshot);
 		}
 
-		// store === null 是「没初始化成功」的正常空态（D13），不是刷新失败：给空串、不记 error。
+		// store === null 是「没初始化成功」的正常空态（降级而不失败），不是刷新失败：给空串、不记 error。
 		if (rt.store === null) {
 			snapshot.text = "";
 			snapshot.error = null;
@@ -56,7 +56,7 @@ export function createIndexCache(): IndexCache {
 		try {
 			// core 出口已含截断与净化：这里原样透传，不做任何二次转义（byte-identical 是刻意的
 			// 跨 harness 属性 —— dsh 注入的索引与 pi 注入的逐字相同）。`{{...}}` 由 section 的
-			// `interpolate: false`（Task 16）负责，不在这里处理。
+			// `interpolate: false`（index.ts 注册 section 时设置）负责，不在这里处理。
 			snapshot.text = await buildIndexSection(
 				rt.store,
 				rt.config.memIndexInjectMaxLines,

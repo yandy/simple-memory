@@ -2,12 +2,12 @@ import { truncateForInjection } from "@yandy0725/memory-core";
 import { errorMessage } from "./errors.js";
 
 /**
- * `search scope=sessions` 的自己扫实现（spec §5.8 / D14）：对齐 `pi-memory/src/session-search.ts`
+ * `search scope=sessions` 的自己扫实现：对齐 `pi-memory/src/session-search.ts`
  * 的语义 —— 同一份记忆、同一个 query，在两个 harness 里搜出可比的结果。宿主的 SQLite FTS 默认关
  * （`dsh-base` 把 `session-query-sqlite` 配成 `openAt: never` + `path: ':memory:'`），打开它会让
  * dsh 的召回强于 pi，且会为每个会话建持久索引，所以这里纯扫，不碰宿主配置。
  *
- * 本模块零运行时宿主 import：`ctx.sessionQuery` 的形状用下面的结构化子集表达，由 Task 16 把真
+ * 本模块零运行时宿主 import：`ctx.sessionQuery` 的形状用下面的结构化子集表达，由装配层把真
  * `ctx.sessionQuery` 喂进来。
  */
 
@@ -92,10 +92,10 @@ function contentText(content: unknown): string {
 
 /**
  * 单条事件的可搜文本抽取（内部纯函数，直接可单测）。可搜类型限定为四类：
- * `user/message` / `assistant/message` / `tool/call` / `tool/result`（spec §5.8 修订后）。
+ * `user/message` / `assistant/message` / `tool/call` / `tool/result`。
  * `todo/write` 与 `turn/end` 虽然在宿主的 `extractSessionEventText`
  * （`dsh-session-query/lib/index.js`）里会被抽，但 pi 搜不到它们（pi 只扫 message 文本），
- * 为了跨宿主同语义（D14）这里**刻意不抽** —— 不要当"遗漏"补回来。
+ * 为了跨宿主同语义（同一份记忆、同一个 query，两边要搜出可比的结果）这里**刻意不抽** —— 不要当"遗漏"补回来。
  * 其余类型（`turn/start`、`step/start`、`step/end`、`assistant/attempt`、`request/header` 等）
  * 一律贡献空串。
  */

@@ -8,7 +8,7 @@ import {
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
- * dsh 侧 `memory` 工具的返回值 schema（spec §5.6）。
+ * dsh 侧 `memory` 工具的返回值 schema。
  *
  * **只有 `content`**：core 的 handler 返回 `{ text, details }`，而 `details` 里常规携带
  * `capacityWarning: string | undefined` —— dsh 的 `snapshotJsonValue` 拒绝值里**任何位置**的
@@ -29,7 +29,7 @@ export interface MemoryToolDeps {
 	searchSessions(cwd: string, query: string, cfg: { maxSessions: number; maxMatches: number }): Promise<string>;
 }
 
-/** 手搓的最小 `ToolDefinition`（spec §2 D8，Route A：不经 `defineTool`，零宿主 import）。 */
+/** 手搓的最小 `ToolDefinition`：刻意不经宿主的 `defineTool`，零宿主 import。 */
 export interface ToolDefinitionLike {
 	name: string;
 	description: string;
@@ -72,7 +72,7 @@ export function createMemoryTool(rt: SessionMemoryRuntime, deps: MemoryToolDeps)
 		async execute(args, _exec) {
 			// `_exec.signal` 仅为宿主接口兼容而被接受：core 的 handler 返回
 			// `(params: unknown) => Promise<...>`，没有 abort 入参，取消在本层无法落地；
-			// 要真正支持取消得先改 core，本轮不做。
+			// 要真正支持取消得先改 core 的端口签名（它没有取消入参），适配层自己做不到。
 			const r = await handler(args);
 			// 只保留 content：`r.details` 含 `capacityWarning: undefined`，进 output 会触发
 			// 宿主的 `snapshotJsonValue` 抛 `ToolOutputError`（见 OUTPUT_SCHEMA 上方的注释）。

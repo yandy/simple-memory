@@ -18,13 +18,13 @@ import { createPreStepListener } from "./surfacing.js";
 /**
  * dsh-memory 的 cordis 插件入口：把九个模块装配成一个 bundle。
  *
- * 装配顺序（spec §5.5）：行 config → auto-surfacing 可用性 → 四个 per-session 容器 →
+ * 装配顺序：行 config → auto-surfacing 可用性 → 四个 per-session 容器 →
  * 全局注册（section + `/memory`，每进程一次）→ per-agent 生命周期（created / disposed）→
  * 每轮召回（pre-step waterfall）。
  *
  * 两条贯穿全局的约束：
  *
- * - **`apply` 绝不抛错**（D13「降级，不失败」）。宿主把抛错的 `apply` 当成激活失败，于是配置写错的
+ * - **`apply` 绝不抛错**（原则：降级，不失败）。宿主把抛错的 `apply` 当成激活失败，于是配置写错的
  *   用户看到的是「插件没起来」而不是「哪一行写错了」。所以坏配置一律记进 `resolved.error`，
  *   照常注册 section 与命令，让 `/memory` 与 memory 工具的报错把原因说出来。
  * - **per-session 状态一律挂在闭包里，绝不挂模块级**：`apply` 每进程只跑一次（配置变更 / HMR 才重跑），
@@ -34,9 +34,9 @@ import { createPreStepListener } from "./surfacing.js";
 export const name = "simple-memory";
 
 /**
- * 用到的服务逐个列全（`practices.md`）：`inject` 里任一服务缺席时，插件保持 inactive（fiber pending）
- * 而不是在激活时抛错。所以精简 profile 里缺 `sessionQuery` 的表现是「记忆层整体不挂」——
- * 这正是想要的：宁可整体不挂，也不要半挂着（半挂意味着索引在、召回静默失效）。
+ * 用到的服务逐个列全（宿主插件实践文档 `practices.md`）：`inject` 里任一服务缺席时，插件保持
+ * inactive（fiber pending）而不是在激活时抛错。所以精简 profile 里缺 `sessionQuery` 的表现是
+ * 「记忆层整体不挂」—— 这正是想要的：宁可整体不挂，也不要半挂着（半挂意味着索引在、召回静默失效）。
  */
 export const inject = ["tools", "systemPrompt", "llm", "commands", "workingDirectory", "sessionQuery", "logger"] as const;
 
@@ -85,7 +85,7 @@ function runCleanup(cleanup: SessionCleanup | undefined): void {
 }
 
 export async function apply(ctx: Context, config: unknown): Promise<() => void> {
-	// 1. 行 config：唯一的配置来源（D4/D5 —— 刻意不读任何配置文件）。`resolveRowConfig` 永不抛错：
+	// 1. 行 config：唯一的配置来源（刻意不读任何配置文件）。`resolveRowConfig` 永不抛错：
 	//    非对象 → error 非空，类型不对的键 → warnings，两者都由 /memory 打印。
 	const resolved = resolveRowConfig(config);
 	if (resolved.error !== null) ctx.logger.warn("simple-memory: %s", resolved.error);
@@ -98,19 +98,19 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 
 	// 3. 启动期判定 auto-surfacing 是否可用。`resolveSurfacingAvailability` 自己兜住了「没配模型」与
 	//    「宿主拒绝该模型」，这里再兜一层「服务形状不是我们预期的」（含 bind 本身）：apply 抛错 =
-	//    整个 bundle 激活失败，而降级只是少一个模块（D13）。
+	//    整个 bundle 激活失败，而降级只是少一个模块。
 	let surfacing: ModuleAvailability;
 	try {
-		// `resolveCallConfig` 是方法，直接摘下来会丢掉 `this`，所以先 bind。R6：宿主签名收
+		// `resolveCallConfig` 是方法，直接摘下来会丢掉 `this`，所以先 bind。宿主签名收
 		// `LlmCallConfig`（`reasoningEffort?: ReasoningEffortId`，品牌化 string），而 model.ts 的接缝刻意
 		// 用裸 string 以便脱离宿主单测；运行时是同一个字符串，所以只在接线处收窄这一次。
 		const resolveCallConfig = ctx.llm.resolveCallConfig.bind(ctx.llm) as ResolveCallConfig;
 		// 10s 上界是刻意的，不是防御性装饰：这个 await 发生在**任何**注册（索引 section、/memory、
 		// 三个 ctx.on）之前，而 `resolveCallConfig` 会进宿主的 capability 查找、自己没有任何 deadline。
 		// 一旦它挂起，`apply` 就永远不 settle —— 没有索引 section、没有 /memory、没有工具、没有监听器，
-		// 而且连一行日志都没有（因为根本没抛错）。这是比 D13 要防的「抛错型激活失败」更糟的静默失败。
-		// 有界之后，abort 会走 model.ts 既有的 try，降级成 `{ available: false, reason }` —— 正是 D13 的
-		// 路径，所以不需要任何新的错误处理。别把它当「多余」删掉。
+		// 而且连一行日志都没有（因为根本没抛错）。这是比「抛错型激活失败」更糟的静默失败。
+		// 有界之后，abort 会走 model.ts 既有的 try，降级成 `{ available: false, reason }` —— 正是「降级而
+		// 不失败」要的路径，所以不需要任何新的错误处理。别把它当「多余」删掉。
 		surfacing = await resolveSurfacingAvailability(
 			resolved.config,
 			resolveCallConfig,
@@ -199,11 +199,11 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		cleanups.delete(sessionId);
 
 		try {
-			// R6：宿主 `ToolDefinition` 把 `parameters` 与 `output.schema` 钉成具体的 JSON Schema 类型，
+			// 宿主 `ToolDefinition` 把 `parameters` 与 `output.schema` 钉成具体的 JSON Schema 类型，
 			// 而 memory-tool.ts 刻意返回零宿主类型的结构化替身（这样它脱离宿主也能单测，且线格式由 core
-			// 独占）。按裁定只在注册处收窄一次，绝不为迎合宿主去放宽替身类型。
+			// 独占）。所以只在注册处收窄一次，绝不为迎合宿主去放宽替身类型。
 			const disposeTool = agent.ctx.tools.register(tool as HostToolDefinition);
-			// practices.md 规则 2（双 owner）：`agent.ctx` 上的注册同时属于 agent 的 fiber 和我们，
+			// 宿主插件实践文档 `practices.md` 的「双 owner」规则：`agent.ctx` 上的注册同时属于 agent 的 fiber 和我们，
 			// 所以把 disposer 也挂进我们自己的 effect —— 任一侧卸载都会撤掉它。
 			const effect = ctx.effect(() => () => disposeTool(), AGENT_EFFECT_LABEL);
 			// cordis 4 的 `ctx.effect` 返回该 effect 自己的 disposer（fiber.d.ts:「Calling the disposer
@@ -243,7 +243,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	});
 	ctx.on(
 		"agent/pre-step",
-		// R6：surfacing.ts 的接缝把消息保持成 `unknown[]`（零宿主类型），宿主的 decision 里是
+		// surfacing.ts 的接缝把消息保持成 `unknown[]`（零宿主类型），宿主的 decision 里是
 		// `UserMessage[]`。这个 cast 不只担保宿主自己产出的消息（同一份数组、同一份语义）——
 		// 那份数组里还会混进**我们注入的召回消息**（surfacing.ts 的 `createRecallMessage`）：它的
 		// `source.kind: "simple-memory"` 不在宿主的 `MessageSourceMap` 里、`id` 是未品牌化的
@@ -256,7 +256,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 
 	// 9. `apply` 的 disposer 只拥有 apply 自己创建的东西（per-session 账本）。宿主注册归 fiber：
 	//    它们在 `apply` 内部就已经被宿主的 `register()` 包进 `ctx.fiber.effect(...)`，fiber 卸载时
-	//    自动撤销，不经过这个返回值（裁定 R7）。这里的清理对宿主是幂等的重复。
+	//    自动撤销，不经过这个返回值。这里的清理对宿主是幂等的重复。
 	return () => {
 		for (const [sessionId, cleanup] of cleanups) {
 			runCleanup(cleanup);

@@ -4,7 +4,7 @@ import type { MemoryConfig } from "@yandy0725/memory-core";
 /**
  * dsh-memory 唯一的配置层。
  *
- * 设计（spec §2 D4/D5）：**不读任何配置文件**。配置只来自 cordis 行 `config:`，宿主在
+ * 设计：**不读任何配置文件**。配置只来自 cordis 行 `config:`，宿主在
  * `apply(ctx, config)` 里原样交给我们。合并语义借 core 的 `mergeConfig`（与 pi 的 `memory.json`
  * 同一份实现），所以「行 config」与「memory.json」可以逐字照抄。
  */
@@ -109,9 +109,9 @@ function sanitizeSubtree(
  *   合法部分经 `mergeConfig` 合并到 `{ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }` 上，
  *   最后展开 `memoryDir` 的 `~`。
  *
- * **共享引用注意**（Task 1 的 M3）：`mergeConfig` 返回新顶层对象，但 overlay 未触及的嵌套子树仍与
+ * **共享引用注意**：`mergeConfig` 返回新顶层对象，但 overlay 未触及的嵌套子树仍与
  * `DEFAULT_CONFIG` 共享引用。本函数只给顶层 `config.memoryDir` 赋值，绝不原地改写嵌套子树；
- * 消费方（Task 16）也**不得**原地改写 `config.autoSurfacing` 这类嵌套对象，否则会污染整个进程的
+ * 消费方（index.ts 的装配）也**不得**原地改写 `config.autoSurfacing` 这类嵌套对象，否则会污染整个进程的
  * `DEFAULT_CONFIG`。
  */
 export function resolveRowConfig(row: unknown, platform?: NodeJS.Platform): ResolvedConfig {

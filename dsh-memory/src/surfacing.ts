@@ -137,7 +137,7 @@ export function createPreStepListener(
 			if (rt) await deps.indexCache.refresh(rt);
 
 			// 只在 step === 1 召回：召回服务的是「这一轮的用户意图」，同一轮里模型自己发起的后续 step
-			// 不该再付一次侧查询的延迟与 token（spec §5.7）。`rt.memoryDir === null` 显式声明不变量
+			// 不该再付一次侧查询的延迟与 token。`rt.memoryDir === null` 显式声明不变量
 			// （registry 只在解析出 memoryDir 时才给出非空 store；`fail()` 两者同空）—— 显式 return
 			// 而不是 `?? ""`，避免静默把空 cwd 发给侧查询端口。
 			if (

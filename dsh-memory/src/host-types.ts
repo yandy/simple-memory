@@ -11,7 +11,7 @@
  *    `HostToolDefinition` / `HostPreStepDecision`（index.ts 里两处收窄的目标类型），以及
  *    `HostAgent` / `HostCommandDefinition`（边界文档；index.ts 靠上下文类型拿到它们，未显式命名）。
  *    其余模块一律用本地结构化接缝（`AgentLike` / `LlmLike` / `SessionQueryLike` / `ToolDefinitionLike` …），
- *    这样它们脱离宿主也能单测（裁定 R6）。
+ *    这样它们脱离宿主也能单测：宿主类型只在接线边界出现一次。
  * 2. **`inject` 里那七个服务在宿主侧的真身**。导出它们不只是为了文档化边界：宿主是用
  *    `declare module '@deepseek-ai/cordis' { interface Context { … } }` 的**增广**把服务挂到 `Context`
  *    上的，只有把对应包的类型拉进编译单元，`ctx.systemPrompt` / `ctx.tools` / `ctx.llm` … 才存在。

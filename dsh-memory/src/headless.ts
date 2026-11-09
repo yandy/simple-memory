@@ -5,10 +5,10 @@ import { parseModelRef } from "./model.js";
  * 零工具 `HeadlessAgentPort`：core 的编排把「跑一轮受限工具的 headless 会话」委托给适配层，
  * 本模块把它落到宿主的 `ctx.llm.stream()` 上，并自己累积 assistant 文本。
  *
- * 本轮只支持 auto-surfacing 的侧查询：它的 `builtinTools: "none"` 且 `memoryTool: null`
+ * 目前只支持 auto-surfacing 的侧查询：它的 `builtinTools: "none"` 且 `memoryTool: null`
  * 是**意图本身**（查询只是「给 manifest 与用户 prompt，选相关文件」，给它任何工具都是白烧 token）。
- * extract / dream 的 `builtinTools: "file-io"` 与 `memoryTool !== null` 是下一刀，请求一律返回
- * `null`（本轮没跑），**不抛错**。
+ * extract / dream 的 `builtinTools: "file-io"` 与 `memoryTool !== null` 尚未实现，那类请求一律返回
+ * `null`（= 没跑），**不抛错**。
  */
 
 /** 宿主 `ctx.llm` 里我们用到的那一小片，结构化描述、零宿主 import。 */
@@ -38,7 +38,7 @@ export type StreamChunkLike =
 export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 	return {
 		async run(req: HeadlessRunRequest): Promise<string | null> {
-			// 不支持的请求：本轮没跑，返回 null，不抛错。extract / dream 留给下一刀。
+			// 不支持的请求：没跑，返回 null，不抛错。extract / dream 尚未实现。
 			if (req.builtinTools !== "none" || req.memoryTool !== null) return null;
 
 			const ref = parseModelRef(req.model);
