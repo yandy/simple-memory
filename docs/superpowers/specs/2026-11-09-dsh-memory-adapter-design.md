@@ -52,7 +52,7 @@ section 里能看到、`memory` 工具能读到；反向同样成立。（`memor
 | **D11** | `private: true` 先留着；发布形态（去 private、`locale/*.json`、`icon`、`publish.yml` 的 `dsh-memory-v*` tag）等真宿主验证通过再翻 | 发布是独立决定，且 `docs/guides/release.md` 的发布顺序门目前只覆盖 core 与 pi-memory |
 | **D12** | 模型标识沿用 core 的 `model: string`，编码为 `"<provider>/<model>"`，**按第一个斜杠拆**；`thinkLevel` 原样当 `reasoningEffort` 透传 | dsh 的模型是 `{provider, model}` 两段，而 model id 自己可以含斜杠（本机 profile 的历史版本里就有 `megcore` + `qwen/qwen3.8-max`）。按第一个斜杠拆对它成立。core 把 `model` 当不透明字符串、运行时也不校验 `thinkLevel`，所以**不需要改 core** |
 | **D13** | **降级优先，不进全局错误态**：模型缺失或不可解析 → 只关掉需要它的那个模块（本轮只有 auto-surfacing），索引 section 与 `memory` 工具照常可用；原因在 `/memory` 里显示。只有「配置读不出来 / memoryDir 解析失败」才让该 session 进错误态，此时工具仍注册但走 core 的 unavailable 分支 | 用户定的方向（没配 model 时静默降级为关）。这也修掉了照抄 pi 会带来的问题：core 的 `requiredModels()` **恒包含 `dream`**，而本轮 dsh 不实现 dream —— 照抄就会要求用户配一个**永远用不到**的 `dream.model`，否则整个记忆层是暗的 |
-| **D14** | `search scope=sessions` 用**自己扫**：`ctx.sessionQuery.listSessions()`（按 cwd 过滤）+ `readSession()/filterEvents()` 拿解码后的 events，文本抽取与上下文窗口自己写，输出口径对齐 pi | pi 侧（`pi-memory/src/session-search.ts`）本来就是纯扫描、没有索引，所以自己扫 = 与 pi **同语义**；打开宿主的 SQLite FTS 反而会让 dsh 的召回强于 pi，同一份记忆在两个 harness 里搜出不同结果。dsh 的会话日志默认 zstd 压缩，不能直接 `readFile` 分行，解码交给宿主服务 |
+| **D14** | `search scope=sessions` 用**自己扫**：`ctx.sessionQuery.filterSessions([{kind:"cwd",values:[cwd]}])` 拿该项目的会话 + `readSession(id)` 拿解码后的 events，文本抽取与上下文窗口自己写，输出口径对齐 pi | pi 侧（`pi-memory/src/session-search.ts`）本来就是纯扫描、没有索引，所以自己扫 = 与 pi **同语义**；打开宿主的 SQLite FTS 反而会让 dsh 的召回强于 pi，同一份记忆在两个 harness 里搜出不同结果。dsh 的会话日志默认 zstd 压缩，不能直接 `readFile` 分行，解码交给宿主服务 |
 
 ### 2.1 本轮附带的 `memory-core` 1.1.0（只加不改）
 
@@ -96,6 +96,22 @@ memory-core-v1.1.0 --target <完整 SHA>` → 轮询 registry 到 200 + 比对 `
 
 **这个裁定带来的两条义务**（已归入 Task 3 的 fix round）：`requiredModels` 的文档注释必须把
 这个例外说清楚（不能继续写「逐字不变」），且新语义必须有一条测试钉住。
+
+### 2.3 实现期修订：三处对宿主的事实错误（Task 6 审阅发现）
+
+本文初版与实现计划里有三处对宿主 API 的描述是**错的**。它们是在审阅「迷你假 cordis ctx」时
+被发现的 —— 那个假 ctx 是后续十一个任务唯一的测试地基，它一旦对宿主说谎，十一个任务会全绿
+而插件上线即坏。三处均已对着宿主源码核实，本节是权威叙述，与下文任何描述冲突时以本节为准。
+
+| # | 错误的描述 | 宿主的事实（已核实） | 影响 |
+|---|---|---|---|
+| **1** | 「`ctx.llm.stream()` 失败时抛错，所以侧查询用 try/catch 包住、抛错就返回 `null`」 | `dsh-llm/lib/index.js:2355-2357` 的 catch 是 `yield adapterFailureChunk(error, options.signal)`；方法注释（:2390-2396）逐字写着「Adapter selection, dispatch, and iteration failures become terminal `error` or `aborted` finish chunks; middleware, nested-call, cleanup, and consumer failures **remain thrown**」。`NO_ADAPTER` 由 `registration()` 抛在 `adapterStream` 内部 → **被吞成终止 chunk** | §5.7 的 headless 端口必须**两条通道都覆盖**：`try/catch` 接住真的抛错，**且**识别 `{type:"finish", reason:{kind:"error"\|"aborted"}}` 终止 chunk。只包 try/catch 的话，生产里的宿主拒绝会被当成正常数据流处理 |
+| **2** | 「`ctx.sessionQuery.listSessions(...)` 按 cwd 过滤，返回 `{items, nextCursor}` 分页」 | `dsh-session-query/lib/types/index.d.ts:67` 是 `listSessions(signal?: AbortSignal): Promise<SessionRecord[]>` —— **裸数组**、newest-first、只接受一个 `AbortSignal`；cwd 过滤在**另一个方法** `filterSessions(filters, signal)`（:81）。宿主自己的 `dsh-tool-session-query` 也是 `sessionFilters.push({kind:"cwd", values:[cwd]})` | §5.8 改用 `filterSessions`。更险的是：若把 `AbortSignal` 传给一个期望查询对象的实现，`typeof signal === "object"` 为真、各字段全 `undefined` → **静默返回整个语料**，不过滤也不分页。这是无声偏差里最坏的一类 |
+| **3** | 「子 agent 判据的候选字段是 `delegationDepth` / `parentSession` / `origin`」 | `dsh-session/lib/types/types.d.ts:71-76` 在 `parentSession` 上明文警告：「Ordinary forks omit this field; historical ordinary forks may retain their source id here. **Presence alone does not classify a Session as a subagent; use `origin` for that distinction.**」`origin?: 'subagent'`（:83-87）才是官方分类字段；`delegationDepth`（:86-92）只对 subagent child 递增 | §5.5 的门禁以 `origin` 为主判据。用 `parentSession` 会把**普通 fork 会话**误判为子 agent，后果是那个会话的索引 / 工具 / 召回全部静默不挂 —— 而假 ctx 永远造不出这种会话，所以测试不会红 |
+
+这三条同时说明了一件事：**侦察笔记里的二手汇总不足以支撑实现级的接口定义**，尤其是「方法名对、
+签名错」与「字段存在、语义不是你想的那个」这两类错误。后续任务凡涉及宿主接口，以宿主
+`node_modules/@deepseek-ai/*/lib/types/*.d.ts` 与 `lib/*.js` 为准。
 
 ## 3. 宿主事实：pi 的原语在 dsh 里对应什么
 
@@ -331,9 +347,11 @@ ctx.systemPrompt.section({
   `ctx.agents.create`，根 ctx 的监听器会看到全部）。不过滤的后果是每个子 agent 都触发一次
   `workingDirectory.ensure` + git 探测 + 建 store，且子 agent 每轮多付一次侧查询。pi 侧同样对子 agent
   跳过 auto-surfacing（靠嗅探 system prompt 里的 `<active_agent name="`）。
-  dsh 侧用**结构化判据**而不是嗅探：从 `agent.session.header` 读委派深度 / 来源（建造者需从
-  `@deepseek-ai/dsh-session` 的 `SessionHeader` 类型确认确切字段名，候选：`delegationDepth`、
-  `parentSession`、`origin`），根 agent 才注册工具 / 解析 store / 跑 surfacing。
+  dsh 侧用**结构化判据**而不是嗅探：以 `agent.session.header.origin === "subagent"` 为主判据
+  （`delegationDepth` 作辅助），根 agent 才注册工具 / 解析 store / 跑 surfacing。
+  **不得用 `parentSession` 做判据** —— 宿主在该字段的文档里明文警告：「Presence alone does not
+  classify a Session as a subagent; use `origin` for that distinction」，普通 fork 也可能带
+  `parentSession`，误判的后果是该会话整个记忆注入被静默跳过（见 §2.3）。
   索引 section 因为是全局注册、`text` 回调查不到缓存就返回空串，子 agent 自然拿不到索引，无需额外门禁。
 - per-agent 注册（`agent/created` 是 serial 且在创建完成前被 await，是唯一的异步窗口）：
 
@@ -476,6 +494,9 @@ ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) =
   下一轮 extract / dream 才实现），**不抛错**。
   `null` 的语义要保住：宿主拒绝（`NO_ADAPTER` / `AUTH` / …）或 `signal.aborted` → `null`
   （core 靠它区分「跑了没选出来」与「根本没跑」）。
+  **但失败有两条通道，必须都覆盖**（见 §2.3）：adapter 选择/派发/迭代失败被宿主转成**终止
+  chunk**（`{type:"finish", reason:{kind:"error"|"aborted", failure}}`）而不是抛错，只有
+  middleware / nested-call / cleanup / consumer 失败才真的抛。只包 try/catch 会漏掉前者。
 - 召回消息的形状（`dsh-llm` 的 `UserMessage`）：
 
 ```ts
@@ -507,8 +528,9 @@ ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) =
 
 出口签名由 core 固定：`searchSessions(cwd, query, cfg): Promise<string>`（返回**已格式化好的文本**）。
 
-- 实现（D14）：`ctx.sessionQuery.listSessions(...)` 按 cwd 过滤 → 取前 `cfg.maxSessions`（默认 10）
-  → 对每个 session 用 `readSession()` / `filterEvents([{ kind: "text", text: query }])` 拿解码后的
+- 实现（D14）：`ctx.sessionQuery.filterSessions([{ kind: "cwd", values: [cwd] }], signal)` 拿该项目的
+  会话（**裸数组**，newest-first）→ 取前 `cfg.maxSessions`（默认 10）
+  → 对每个 session 用 `readSession(id)` 拿解码后的
   events → 自己写文本抽取（宿主的 `extractSessionEventText` 是宿主模块导出，运行时 import 不到；
   按 `user/message`、`assistant/message`、`tool/call`、`tool/result` 四类抽文本，其余类型贡献空串）
   → 每个命中输出 `## Session <id 或标题> (<日期>)` + `…matched: "<片段>"…` + 前后各 50 条消息的
@@ -668,8 +690,8 @@ SQLite 索引（磁盘与隐私面），而且会让 dsh 的召回强于 pi —�
 ## 11. 留给建造者的部分
 
 - 各模块内部的文件顺序、注释措辞、假 ctx 的组织方式（沿用 `pi-memory/tests` 的风格即可）。
-- 根 agent 判据的确切字段名（从 `@deepseek-ai/dsh-session` 的 `SessionHeader` 类型确认；候选
-  `delegationDepth` / `parentSession` / `origin`）。
+- 根 agent 判据的确切字段名已定（见 §2.3 与 §5.5）：以 `session.header.origin === "subagent"` 为主，
+  `delegationDepth` 为辅；**不得用 `parentSession`**。
 - `/memory` 状态块的确切行序与措辞（§5.6 给的是口径，不是逐字文案）。
 - 单测的具体用例切分，但下列几条是**必须**有的：
   1. `dist/` 里零 `@deepseek-ai` 命中（D2 的执行点）；
