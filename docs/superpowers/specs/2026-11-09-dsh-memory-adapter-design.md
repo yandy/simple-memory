@@ -115,6 +115,28 @@ memory-core-v1.1.0 --target <完整 SHA>` → 轮询 registry 到 200 + 比对 `
 签名错」、「字段存在、语义不是你想的那个」与「类型名看似合理、宿主根本不发」这三类错误。
 后续任务凡涉及宿主接口，以宿主 `node_modules/@deepseek-ai/*/lib/types/*.d.ts` 与 `lib/*.js` 为准。
 
+### 2.4 实现期修订：会话搜索只抽四类事件、只搜真人发言
+
+Task 13 审阅时发现本文初版对 §5.8 的两处描述不够严，已修订：
+
+**一、可搜索的事件类型限定为四类，`todo/write` 不搜。** 初版只说了「四类抽文本，其余贡献空串」，
+但没说明宿主自己的抽取器还含 `todo/write` 与 `turn/end`（`dsh-session-query/lib/index.js:551-552`）。
+实现时把 `todo/write` 加了进来，那会让 dsh 的召回**强于** pi（pi 只搜 message 文本）—— 正是 D14 要避开的分叉。
+已明确：只抽 `user/message`、`assistant/message`、`tool/call`、`tool/result`；`todo/write` 与 `turn/end`
+虽然宿主会抽，但为了跨宿主同语义，这里不抽。
+
+**二、`user/message` 的真人判定用白名单，不用黑名单。** 初版同时写了「按 `source.kind === "user"` 过滤」
+与「对未知 kind 要放行」，两者矛盾：前者是白名单，后者是黑名单。实现选了黑名单 + 一份只覆盖
+约 7/30 个真实 kind 的清单（其中 `"skill"` 在宿主里根本不存在，真名是 `skill-invocation` 与
+`skill-catalog`）。因为黑名单对未列项默认放行，那些漏掉的合成消息会被当成真人发言搜出来。
+
+定为白名单（只认 `source.kind === "user"`），理由：宿主的 `MessageSourceMap` 是**可合并扩展**的
+（任何插件都能声明自己的 kind），所以黑名单结构上不可能完备；而两种失败模式里，
+「静默搜出注入噪声」比「宿主改了 kind 名 → 搜索返回空」难发现得多。
+
+这两条与 §2.3 的四条同源：都是「看上去合理的宿主描述」与「宿主实际行为」的差。区别在于：
+§2.3 的四条是事实错误，本节两条是**约束自身不自洽 / 不够精确**。
+
 ## 3. 宿主事实：pi 的原语在 dsh 里对应什么
 
 这张表是本轮全部工作量的来源。**没有一行是记忆逻辑** —— 记忆逻辑在 core 里，一行都不用重写。
@@ -547,18 +569,33 @@ ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) =
 出口签名由 core 固定：`searchSessions(cwd, query, cfg): Promise<string>`（返回**已格式化好的文本**）。
 
 - 实现（D14）：`ctx.sessionQuery.filterSessions([{ kind: "cwd", values: [cwd] }], signal)` 拿该项目的
-  会话（**裸数组**，newest-first）→ 取前 `cfg.maxSessions`（默认 10）
-  → 对每个 session 用 `readSession(id)` 拿解码后的
-  events → 自己写文本抽取（宿主的 `extractSessionEventText` 是宿主模块导出，运行时 import 不到；
-  按 `user/message`、`assistant/message`、`tool/call`、`tool/result` 四类抽文本，其余类型贡献空串）
+  会话（**裸数组**，newest-first）→ 取前 `cfg.maxSessions`（默认 10，因宿主 newest-first 所以是「最近 N 个」）
+  → 对每个 session 用 `readSession(id)` 拿解码后的完整 events（`SessionLogSnapshot`，一次调用返回全量，
+  不需要分页；不要改用已废弃的 `session.snapshotEvents()` / `eventAt()`）
+  → 自己写文本抽取（宿主的 `extractSessionEventText` 是宿主模块导出，运行时 import 不到）：
+  **只抽四类** —— `user/message` 取 `data.content`、`assistant/message` 取 `data.message.content`、
+  `tool/call` 取 `data.name` + `data.arguments`（宿主的 `arguments` 已经是模型原样产出的 JSON **字符串**，
+  不要再 `JSON.stringify` 一次）、`tool/result` 取 `data.message.content` + `data.error?.name`/`data.error?.code`；
+  **其余类型一律贡献空串**。特别地，`todo/write` 与 `turn/end` 虽然在宿主自己的抽取器里，但 pi 不搜它们，
+  为了跨宿主同语义（D14）这里也不搜。
   → 每个命中输出 `## Session <id 或标题> (<日期>)` + `…matched: "<片段>"…` + 前后各 50 条消息的
   上下文窗口 → `cfg.maxMatches`（默认 5）封顶 → 整体截到 2000 行 / 50KB（口径对齐 pi 的
   `truncateHead`，用 core 的 `truncateForInjection` 实现同样效果）。
+- **只搜真人发言：`user/message` 按 `source.kind === "user"` 白名单过滤**（实现期修订，见 §2.4）。
+  宿主大多数 `user/message` 是它自己或其他插件注入的合成消息（`agent-instructions`、`runtime-context`、
+  `time-context`、`skill-invocation`、`skill-catalog`、`working-directory`、`goal`、`plan-mode`、
+  `subagent-settled` …），把它们搜出来等于把噪声当用户说过的话。**用白名单而不是黑名单**：
+  宿主的 `MessageSourceMap` 是可合并扩展的，黑名单结构上不可能完备，而漏一项的后果是
+  静默降级搜索精度。白名单的失败模式（宿主改了 kind 名 → 搜索返回空）比黑名单的
+  （静默搜出噪声）更容易被发现。完全没有 `source` 的 `user/message` 归为非真人
+  （宿主把 `source` 定为必填，这只是防御）。
 - 无命中返回 `"No matches in sessions."`（与 pi 逐字相同）。
-- 注意宿主的读取窗口上限：`readEvent` 的 `before`/`after` 各 50、sqlite 分页 `maxLimit = 100`
-  / `defaultLimit = 20`，所以要迭代 `observeSession().events` 而不是一把拉完。
-- `sessionQuery` 不可用（缺服务 / 抛错）时返回一句可读的失败文本，**不抛错**（工具调用的失败
-  应该让模型看见原因，而不是变成 `isError`）。
+- 失败不得抛错：`filterSessions` / `readSession` reject（包括 `SESSION_QUERY_SEARCH_DISABLED`，
+  即用户从未启用宿主 FTS 时得到的结果）→ 返回
+  `"Session search is unavailable in this host configuration: <message>"`。工具调用的失败应该让模型
+  看见原因，而不是变成 `isError`。
+- 纵深防御：拿到结果后再按 `header.cwd === cwd` 过一道。宿主的 `cwd` 过滤已经做了这件事，
+  但万一它哪天松了，失败模式是静默扫最近 10 个会话（**跨项目**）并当作本项目结果展示。
 
 ## 6. 仓库集成
 
