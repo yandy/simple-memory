@@ -134,6 +134,19 @@ for (const workspace of rootPkg.workspaces ?? []) {
 		);
 	}
 
+	// dsh 系宿主包按 scope 前缀识别，不落在上面的精确名集合里，但同样禁止进 dependencies：
+	// 整个设计（docs/guides/dependencies.md「dsh 宿主包」）要求宿主包只活在 peer/dev，装进
+	// dependencies 会绕开「peer optional → 缺失时插件保持 inactive」的降级路径。
+	for (const name of Object.keys(deps)
+		.filter((name) => HOST_PROVIDED_SCOPES.some((scope) => name.startsWith(scope)))
+		.sort()) {
+		problems.push(
+			`${label}: dependencies["${name}"] = "${deps[name]}"，宿主已提供该包（dsh 系）。` +
+				`请改为 peerDependencies["${name}"]（范围 ">=0.2.2-rc.1 <0.3.0"，@deepseek-ai/cordis 用 "~4.1.0"），` +
+				`不能进 dependencies（安装副本会造成重复运行时模块，且绕过 peer optional 的降级路径）`,
+		);
+	}
+
 	for (const name of collectHostImports(collectSourceFiles(workspaceDir))) {
 		const peerRange = peers[name];
 		if (peerRange === undefined) {
