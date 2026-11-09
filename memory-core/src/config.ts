@@ -133,13 +133,26 @@ export function taskModel(cfg: MemoryConfig, task: ModelTask): string | undefine
 	return cfg[task]?.model ?? cfg.defaults?.model;
 }
 
-/** 会执行的任务及其模型值。dream 恒在执行集合内（没有包级开关可以让它不跑）。 */
-export function requiredModels(cfg: MemoryConfig): Array<{ task: ModelTask; value: string | undefined }> {
-	const out: Array<{ task: ModelTask; value: string | undefined }> = [
-		{ task: "dream", value: taskModel(cfg, "dream") },
-	];
-	if (cfg.extractMemories.enabled) out.push({ task: "extractMemories", value: taskModel(cfg, "extractMemories") });
-	if (cfg.autoSurfacing.enabled) out.push({ task: "autoSurfacing", value: taskModel(cfg, "autoSurfacing") });
+/**
+ * 会执行的任务及其模型值。
+ *
+ * `tasks`：适配层声明自己实现了哪些任务（如 dsh 本轮不实现 dream，就传 `["autoSurfacing"]`）。
+ * 省略 = 既有行为逐字不变（dream 恒在执行集合内，另两个按 `enabled`）；给定则**只**考虑这些任务，
+ * dream 不再被强制加入，另两个仍按 `enabled` 过滤。顺序与调用方列举顺序无关，恒为
+ * dream → extractMemories → autoSurfacing。
+ */
+export function requiredModels(
+	cfg: MemoryConfig,
+	tasks?: readonly ModelTask[],
+): Array<{ task: ModelTask; value: string | undefined }> {
+	const order: readonly ModelTask[] = ["dream", "extractMemories", "autoSurfacing"];
+	const out: Array<{ task: ModelTask; value: string | undefined }> = [];
+	for (const task of order) {
+		if (tasks !== undefined && !tasks.includes(task)) continue;
+		// dream 没有包级开关：进了候选即在执行集合内（省略 `tasks` 时它恒是候选）。另两个看 `enabled`。
+		// 这里用 `?.`，与 `taskModel` 同理：`deepMerge` 会把用户写的 `"extractMemories": null` 原样带进来。
+		if (task === "dream" || cfg[task]?.enabled) out.push({ task, value: taskModel(cfg, task) });
+	}
 	return out;
 }
 
@@ -148,9 +161,13 @@ export function requiredModels(cfg: MemoryConfig): Array<{ task: ModelTask; valu
  * `resolve` 由调用方注入（生产时是 `(v) => resolveModel(v, ctx.modelRegistry) !== undefined`），
  * 因此本函数不依赖 SDK 的 registry 类型，可用假 resolve 单测。
  */
-export function modelConfigErrors(cfg: MemoryConfig, resolve: (value: string) => boolean): string[] {
+export function modelConfigErrors(
+	cfg: MemoryConfig,
+	resolve: (value: string) => boolean,
+	tasks?: readonly ModelTask[],
+): string[] {
 	const errors: string[] = [];
-	for (const { task, value } of requiredModels(cfg)) {
+	for (const { task, value } of requiredModels(cfg, tasks)) {
 		if (value === undefined) {
 			errors.push(`no model for ${task} — set "${task}.model" or "defaults.model" in memory.json`);
 		} else if (!resolve(value)) {

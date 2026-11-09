@@ -347,6 +347,27 @@ describe("model config", () => {
 	});
 });
 
+describe("modelConfigErrors 的 tasks 参", () => {
+	const cfg = { ...DEFAULT_CONFIG, autoSurfacing: { ...DEFAULT_CONFIG.autoSurfacing, enabled: true } } as MemoryConfig;
+	it("省略 tasks 时 dream 恒在集合内（既有行为不变）", () => {
+		expect(requiredModels(cfg).map((m) => m.task)).toEqual(["dream", "autoSurfacing"]);
+	});
+	it("给定 tasks 时只校验这些任务，dream 不再被强制", () => {
+		expect(requiredModels(cfg, ["autoSurfacing"]).map((m) => m.task)).toEqual(["autoSurfacing"]);
+		expect(modelConfigErrors(cfg, () => false, ["autoSurfacing"])).toHaveLength(1);
+		expect(modelConfigErrors(cfg, () => false, ["autoSurfacing"])[0]).toContain("autoSurfacing");
+	});
+	it("tasks 里的任务被 enabled=false 关掉时不产生错误", () => {
+		const off = { ...cfg, autoSurfacing: { ...cfg.autoSurfacing, enabled: false } } as MemoryConfig;
+		expect(modelConfigErrors(off, () => false, ["autoSurfacing"])).toEqual([]);
+	});
+	it("顺序仍固定为 dream → extractMemories → autoSurfacing", () => {
+		const all = { ...cfg, extractMemories: { ...cfg.extractMemories, enabled: true } } as MemoryConfig;
+		expect(requiredModels(all, ["autoSurfacing", "dream", "extractMemories"]).map((m) => m.task))
+			.toEqual(["dream", "extractMemories", "autoSurfacing"]);
+	});
+});
+
 describe("taskModel", () => {
 	it("prefers the per-task model and falls back to defaults.model", () => {
 		const shared = { ...DEFAULT_CONFIG, defaults: { model: "shared/model" } };
