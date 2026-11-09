@@ -66,12 +66,36 @@ section 里能看到、`memory` 工具能读到；反向同样成立。（`memor
 |---|---|---|
 | **导出纯函数 `mergeConfig`** | `export function mergeConfig(base: MemoryConfig, overlay: unknown): MemoryConfig` | 把 `config.ts` 里**已有的私有** `deepMerge` 提出来导出，并让 `loadConfigFrom` 内部改用它 —— 合并语义只有一份，不可能漂移。跳过 `undefined`、plain object 递归、数组整体替换的语义逐字不变 |
 | **思考档位类型变不透明** | `export type EffortLevel = string`（新增，中立名）；`export type ThinkLevel = EffortLevel`（保留别名） | 闭枚举 → `string` 是放宽，core 里**没有**任何 exhaustive switch。保留 `ThinkLevel` 别名是为了 `pi-memory/src/config.ts:29` 的重导出与已发布的 3.0.0 不破。pi-memory 的 typecheck 已核实不会变红：它交给 pi SDK 的边界本来就是 cast（`agent-runner.ts:95` 是 `thinkingLevel: opts.thinkLevel as any`，`:204` 是 `req.effort as ThinkLevel \| undefined`）。**配置键名 `thinkLevel` 不动**（那是用户契约，改名要迁移说明），只改类型 —— 键名的 pi 词汇归下一轮 |
-| **校验可指定任务集合** | `requiredModels(cfg, tasks?: readonly ModelTask[])` 与 `modelConfigErrors(cfg, resolve, tasks?: readonly ModelTask[])` 各加一个可选第三/第二参 | 缺省行为逐字不变（仍走 `requiredModels(cfg)` 那个「dream 恒在集合内」的规则）；传了 `tasks` 就只校验这些任务。dsh 传 `["autoSurfacing"]` |
+| **校验可指定任务集合** | `requiredModels(cfg, tasks?: readonly ModelTask[])` 与 `modelConfigErrors(cfg, resolve, tasks?: readonly ModelTask[])` 各加一个可选第三/第二参 | 缺省行为不变（仍走 `requiredModels(cfg)` 那个「dream 恒在集合内」的规则）；传了 `tasks` 就只校验这些任务。dsh 传 `["autoSurfacing"]`。**修订注（实现期裁定，见下）**：缺省路径上有一处已裁定的行为变更 —— 用户写了 `"extractMemories": null` 时，旧行为是抛 `TypeError`，新行为是跳过该任务 |
 
 发布顺序按 `docs/guides/release.md`：`npm version 1.1.0 --workspace=memory-core --no-git-tag-version`
 → 同时 add `memory-core/package.json` 与 `package-lock.json` → push → `gh release create
 memory-core-v1.1.0 --target <完整 SHA>` → 轮询 registry 到 200 + 比对 `dist.shasum` + 确认
 `dist-tags.latest`。**这是本轮唯一的不可逆动作**，排在 dsh 单测全绿之后、真宿主验证之前（§7）。
+
+### 2.2 实现期修订：`requiredModels` 对 `null` 子树的行为
+
+本节是实现对 §2.1「缺省行为逐字不变」那句的**一处修正**，在 Task 3 实现与审阅时被发现并裁定。
+
+**事实**：旧实现读 `cfg.extractMemories.enabled` / `cfg.autoSurfacing.enabled`，而 `deepMerge` 会把用户
+写的 `"extractMemories": null` 原样带进来 —— 所以旧行为是抛 `TypeError`。新实现统一用
+`cfg[task]?.enabled`，于是变成跳过该任务。
+
+**裁定：接受新行为**。三条证据：
+
+1. 没有任何测试钉住那个抛错。core 现有的 null 测试（`tests/config.test.ts`）针对的是 `dream: null`
+   配 `taskModel`；pi-memory 的 null 测试（`tests/index-wiring.test.ts`）针对的是 `moduleStatusLine`。
+2. **core 自己的书面意图相反**：`taskModel` 的注释写着「`deepMerge` 会把用户写的 `"dream": null`
+   原样带进来 —— 那时应该报「没有模型」，而不是抛 TypeError」，并为此用了 `cfg[task]?.model`；
+   pi-memory 的 `moduleStatusLine` 也用 `?.` 并注「不能因此抛错，把整个 `/memory` 命令带崩」。
+   旧的那个 `TypeError` 是潜在 bug：在 pi 侧被 `index.ts` 的 try/catch 吞成一个看不懂的 misconfigured 错误态。
+3. 两套测试全绿：core `484 passed | 4 skipped`、pi-memory `200 passed`（与基线逐字一致）。
+
+**净效果**：写了 `"extractMemories": null` 的用户从「一条看不懂的 misconfigured」变成
+「`extractMemories=off`」，与 `/memory` 状态行既有的显示口径一致。
+
+**这个裁定带来的两条义务**（已归入 Task 3 的 fix round）：`requiredModels` 的文档注释必须把
+这个例外说清楚（不能继续写「逐字不变」），且新语义必须有一条测试钉住。
 
 ## 3. 宿主事实：pi 的原语在 dsh 里对应什么
 
