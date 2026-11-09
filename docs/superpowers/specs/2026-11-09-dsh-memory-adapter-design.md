@@ -109,7 +109,7 @@ memory-core-v1.1.0 --target <完整 SHA>` → 轮询 registry 到 200 + 比对 `
 | **2** | 「`ctx.sessionQuery.listSessions(...)` 按 cwd 过滤，返回 `{items, nextCursor}` 分页」 | `dsh-session-query/lib/types/index.d.ts:67` 是 `listSessions(signal?: AbortSignal): Promise<SessionRecord[]>` —— **裸数组**、newest-first、只接受一个 `AbortSignal`；cwd 过滤在**另一个方法** `filterSessions(filters, signal)`（:81）。宿主自己的 `dsh-tool-session-query` 也是 `sessionFilters.push({kind:"cwd", values:[cwd]})` | §5.8 改用 `filterSessions`。更险的是：若把 `AbortSignal` 传给一个期望查询对象的实现，`typeof signal === "object"` 为真、各字段全 `undefined` → **静默返回整个语料**，不过滤也不分页。这是无声偏差里最坏的一类 |
 | **3** | 「子 agent 判据的候选字段是 `delegationDepth` / `parentSession` / `origin`」 | `dsh-session/lib/types/types.d.ts:71-76` 在 `parentSession` 上明文警告：「Ordinary forks omit this field; historical ordinary forks may retain their source id here. **Presence alone does not classify a Session as a subagent; use `origin` for that distinction.**」`origin?: 'subagent'`（:83-87）才是官方分类字段；`delegationDepth`（:86-92）只对 subagent child 递增 | §5.5 的门禁以 `origin` 为主判据。用 `parentSession` 会把**普通 fork 会话**误判为子 agent，后果是那个会话的索引 / 工具 / 召回全部静默不挂 —— 而假 ctx 永远造不出这种会话，所以测试不会红 |
 
-| **4** | 「侧查询自己累积 `content_block` 文本」 | `dsh-llm` 的 `StreamChunk` 联合（`lib/types/types.d.ts:458-487`）里**没有 `content-block` 这个类型**。实际只有：`block-start {index, blockType}`、`text-delta {index, text}`、`reasoning-delta {index, text}`、`tool-call-delta`、**`block-end {index, block: ContentBlock}`**、`usage`、`finish {reason, replayState?}` | §5.7 的文本累积必须按真实词汇写：`text-delta` 是增量流，**`block-end` 里的 `block` 才是权威终值**（两个 first-party 一次性调用都这么用：`dsh-experimental-translator/lib/index.js:745` 显式检查 `chunk.type === "block-end" && chunk.block.type !== "text"`）。`reasoning-delta` 是思维链，**绕不能累积进答案** |
+| **4** | 「侧查询自己累积 `content_block` 文本」 | `dsh-llm` 的 `StreamChunk` 联合（`lib/types/types.d.ts:458-487`）里**没有 `content-block` 这个类型**。实际只有：`block-start {index, blockType}`、`text-delta {index, text}`、`reasoning-delta {index, text}`、`tool-call-delta`、**`block-end {index, block: ContentBlock}`**、`usage`、`finish {reason, replayState?}`。而宿主自己的 `BlockAssembler`（`lib/index.js:954-1055`）用**首次出现顺序**（`order.push(index)` + `assembled()` 的 `this.order.map`），且 block-end 一旦设了权威 block 就**冻结该 index**（两个分支开头的 `if (partial.block) return;`） | §5.7 的文本累积必须按真实词汇与真实顺序语义写。`reasoning-delta` 被宿主累积成独立的 `{type:"reasoning"}` block，**绕不能并入答案** |
 
 这四条同时说明了一件事：**侦察笔记里的二手汇总不足以支撑实现级的接口定义**，尤其是「方法名对、
 签名错」、「字段存在、语义不是你想的那个」与「类型名看似合理、宿主根本不发」这三类错误。
@@ -491,9 +491,12 @@ ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) =
 - `dshHeadless(ctx)`（`headless.ts`）实现 core 的 `HeadlessAgentPort`，本轮只需支持零工具：
   `ctx.llm.stream({ provider, model, reasoningEffort, messages, system, signal })`，自己累积文本
   （不用宿主的 `BlockAssembler` —— 那是运行时宿主 import）。**累积规则按宿主真实的 chunk 词汇（§2.3 第 4 行）**：
-  按 `index` 维护缓冲区 —— `text-delta` 追加到该 index，`block-end` 且 `block.type === "text"` 时用它**覆盖**
-  该 index（权威终值），最后按 index 升序拼接。这与 `BlockAssembler` 的语义一致，且不会重复计数：
-  无论路线只发 delta、只发 block-end、还是两者都发，结果都正确。`reasoning-delta`（思维链）、
+  按 **首次出现顺序**维护缓冲区（与宿主 `BlockAssembler` 一致）—— `text-delta` 追加到该 index，
+  `block-end` 且 `block.type === "text"` 时用它作为该 index 的**权威终值并冻结它**（之后的 delta 忽略），
+  最后按首次出现顺序拼接。依据：`dsh-llm/lib/index.js:954-1055` 的 `order.push(index)`（block-start 或
+  `ensure()` 首次建 partial 时）、`assembled()` 的 `this.order.map(...)`，以及 text-delta / block-end
+  两个分支开头的 `if (partial.block) return;`。**不是数值升序**，也**不是覆盖后继续追加**。
+  `reasoning-delta`（宿主把它累积成独立的 `{type:"reasoning"}` block，不并入 text）、
   `tool-call-delta`、`usage`、`block-start` 一律忽略。
   `builtinTools: "none"` → `tools` 字段直接不给；`memoryTool: null`；
   收到 `builtinTools: "file-io"` 或 `memoryTool !== null` 的请求 → 返回 `null`（本轮不支持，
