@@ -1,250 +1,287 @@
 # dsh-memory
 
-给 [`@deepseek-ai/dsh`](https://github.com/deepseek-ai/dsh)（一个基于 cordis 的宿主）用的记忆插件：让 dsh
-会话与 pi 会话读写**同一份**磁盘记忆。
+English | [中文](./README.zh.md)
 
-它不自己实现记忆逻辑。磁盘格式、`MemoryStore`、锁、快照、注入截断、prompt 文案、`memory` 工具的
-JSON Schema 与 handler 全在 [`@yandy0725/memory-core`](https://www.npmjs.com/package/@yandy0725/memory-core)
-里；本插件只做宿主那一半 —— 什么时候注入、怎么注册工具、调哪个模型、怎么扫会话日志。
+A memory plugin for [`@deepseek-ai/dsh`](https://github.com/deepseek-ai/dsh) (a cordis-based harness):
+dsh sessions and pi sessions read and write the **same** on-disk memory.
 
-## 它做什么
+It implements no memory logic of its own. The disk format, `MemoryStore`, locking, snapshots, injection
+truncation, prompt text, and the `memory` tool's JSON Schema and handler all live in
+[`@yandy0725/memory-core`](https://www.npmjs.com/package/@yandy0725/memory-core); this plugin only does
+the harness half — when to inject, how to register the tool, which model to call, how to read session
+logs.
 
-落地目录与 `pi-memory` 逐字相同：`$XDG_DATA_HOME/simple-memory/<git|local>/<project>/`
-（`XDG_DATA_HOME` 未设置或为相对路径时是 `~/.local/share/simple-memory`）。默认 `memoryDir` 下，
-pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样成立。
+## What it does
 
-本轮交付五件事：
+It lands in exactly the same directory as `pi-memory`: `$XDG_DATA_HOME/simple-memory/<git|local>/<project>/`
+(`~/.local/share/simple-memory` when `XDG_DATA_HOME` is unset or relative). Under the default
+`memoryDir`, memories written by a pi session are visible to dsh's index and tool, and vice versa.
 
-- **`memory_index` system prompt 段** —— 把索引（`MEMORY.md` 的最新一段窗口）注入进每个 session 的
-  system prompt，正文与 pi 注入的逐字相同；注册了工具的会话还会在正文之前看到 `memory` 工具的
-  snippet 与 guidelines（见下「提示词三通道」）。
-- **`memory` 工具** —— 五个 action：`add` / `replace` / `remove` / `list` / `search`，schema 与
-  handler 直接来自 core，模型看到的线格式与 pi 一致。
-- **`/memory` 命令** —— 打印状态块（目录、索引容量、条目数、模块开关、锁持有者），`/memory unlock
-  --force` 是清除崩溃遗留 `.lock` 的唯一入口。即使会话是以配置错误启动的（启动时目录没解出来），
-  `unlock` 也会用会话的 cwd 按需重解一次目录再清锁 —— 它不能变成死路。
-- **每轮自动召回（auto-surfacing）** —— 每一轮第一步之前，用一次零工具侧查询挑出与用户输入相关的
-  条目，把正文包进 `<relevant_memories>` 插进进入该步的消息。
-- **每轮自动提取（extractMemories）** —— 开启 `extractMemories.enabled` 后，每一轮收口时
-  （`agent/turn-stopping`）起一个只带 `memory` 工具的**嵌套子会话**，让它从这一轮的对话里挑出值得
-  长期记住的东西写进同一份记忆。
-- **`/dream` 命令** —— 把整目录记忆交给同一个机制的子会话去合并、改名、清陈旧条目、重建索引。
-  整轮持逻辑锁，进入时对整目录拍一次快照（回滚点）。
+Six pieces:
 
-## 它不做什么（与 pi-memory 的真实差异）
+- **`memory_index` system-prompt section** — injects the index (the newest window of `MEMORY.md`) into
+  every session's system prompt, byte-identical to what pi injects. Sessions that registered the tool
+  also see the `memory` tool's snippet and guidelines before the index body (see "Three prompt channels").
+- **`memory` tool** — five actions: `add` / `replace` / `remove` / `list` / `search`. Schema and handler
+  come straight from core, so the model sees the same wire format as under pi.
+- **`/memory` command** — prints the status block (directory, index capacity, entry count, module
+  switches, lock holder). `/memory unlock --force` is the only manual way to clear a stale `.lock`. It
+  keeps working even for a session that started misconfigured (directory not resolved at startup): the
+  command re-resolves from the session's cwd — it must not become a dead end.
+- **Per-turn recall (auto-surfacing)** — before the first step of every turn, a zero-tool side query
+  picks the entries relevant to the user prompt and splices their bodies (wrapped in
+  `<relevant_memories>`) into the messages entering that step.
+- **Per-turn extraction (extractMemories)** — with `extractMemories.enabled`, each turn end
+  (`agent/turn-stopping`) feeds the turn's conversation to a sub-session that only has the `memory`
+  tool, so it can persist what is worth remembering for future sessions.
+- **`/dream` command** — hands the whole memory directory to the same kind of sub-session to merge,
+  rename, prune stale entries, and rebuild the index. The round holds the logical lock and takes a
+  whole-directory snapshot on entry (the rollback point).
 
-extract 与 dream 都靠**嵌套子会话**跑（dsh 里唯一能跑工具循环的机制），所以与 pi 有几处结构性差异。
-这里逐条写清，而不是假装对齐：
+## What it does not do (real differences from pi-memory)
 
-1. **子会话会被宿主落盘。** dsh 的 persistence 只看服务是否挂载，**没有 per-session 开关**
-   （主稿 §4.3），而 pi 的 `sessionPersistence.enabled: false` 在 dsh 侧不可兑现。所以 dsh 的会话日志会
-   多出这些子会话（每个都标 `origin: "subagent"`）。行为本身不受影响，但**磁盘上的会话条数会变多**。
-2. **没有轮数硬上限。** dsh 全树没有 `maxTurns` / `maxSteps`，`maxIterations` 那一类上限
-   （主稿 §4.2）。core 的 `maxTurns` 在这里是**尽力而为**：我们数 `agent/pre-step` 的步数，超了就把后
-   续 step 拒掉，那一轮按 `incomplete`（cause `turn-limit`）收口。这不是硬预算 —— 一个卡在单步里的
-   模型调用只能靠 `timeoutMs` 兜（extract 120s、dream 600s，均真的会打断子会话）。
-3. **`/dream` 没有确认框，也不等它跑完。** dsh 的命令处理器拿不到交互通道（pi 的 `ctx.ui.confirm`
-   没有对应物），而 dream 的 timeout 是 600s —— await 进去等于让宿主等十分钟。所以 `/dream` 立刻
-   返回「已开始」，摘要与失败写进**宿主日志**。
-4. **没有 dream 的 nudge 提示。** 「隔多少个会话 / 多少小时后提醒整理」是 pi 的宿主策略
-   （`PiHostConfig`），core 里已经没有这两个键，dsh 本轮也不实现：没有 nudge，只有你显式 `/dream`。
-5. **extract 的 prompt 里没有 AGENTS.md 块。** pi 从 system prompt 里按
-   `<project_instructions path="…">` 抠出这些块塞进 extract prompt；dsh 的 AGENTS.md 由
-   `dsh-agent-instructions` 拼成**不透明的 prompt 文本**，没有稳定标记可切。所以 `## AGENTS.md Rules`
-   那一段在 dsh 侧是空的 —— 指令本身对主 agent 依然可见，只是不会单独递给 extract。
+extract and dream both run through a **sub-session** (the only mechanism in dsh that can run a tool
+loop), which creates a few structural differences. They are listed here rather than papered over:
 
-除此之外，`dream` / `extractMemories` 两个配置子树与 pi 的 `memory.json` 逐字同名，可以照抄；
-它们的 `model` / `thinkLevel` / 预算值全部由 core 自己消费，本适配层一个都不读（除了 `/memory` 的
-展示与 `/dream` 的发起前检查）。
+1. **Sub-sessions are persisted by the host.** dsh persistence only asks whether the service is mounted;
+   there is **no per-session switch**, so pi's `sessionPersistence.enabled: false` cannot be honoured
+   here. These sub-sessions (each marked `origin: "subagent"`) therefore show up in the session log:
+   behaviour is unaffected, but **the number of sessions on disk grows**.
+2. **No hard turn cap.** dsh has no `maxTurns` / `maxSteps` / iteration limit. core's `maxTurns` is
+   **best effort** here: we count `agent/pre-step` steps and reject the next one past the cap, ending
+   that round as `incomplete` (cause `turn-limit`). It is not a hard budget — a model call stuck inside
+   one step is only bounded by `timeoutMs` (120s for extract, 600s for dream, and both really do
+   interrupt the sub-session).
+3. **`/dream` has no confirmation dialog and does not block.** dsh command handlers get no interactive
+   channel (pi's `ctx.ui.confirm` has no counterpart), and dream's timeout is 600s — awaiting it would
+   freeze the harness for ten minutes. So `/dream` returns "started" immediately and writes the summary
+   or failure to the **host log**.
+4. **No dream nudge.** "Remind me after N sessions / N hours" is a pi host policy (`PiHostConfig`); core
+   no longer carries those keys and dsh does not implement them. There is no nudge, only explicit
+   `/dream`.
+5. **No AGENTS.md blocks in the extract prompt.** pi lifts `<project_instructions path="…">` blocks out
+   of its system prompt and appends them to the extract prompt. In dsh, AGENTS.md is assembled by
+   `dsh-agent-instructions` into **opaque prompt text** with no stable marker, so the
+   `## AGENTS.md Rules` section is empty on this side — the instructions are still visible to the main
+   agent, they just are not handed to extract separately.
 
-不冻结索引的原因是 dsh 每一步都重新装配 system prompt（pi 是整个会话冻结索引、回放录制值来护住 prompt
-cache），所以索引是一份快照：在 `agent/created`、每次记忆写入成功后、`/memory` 执行后、每个 `pre-step`
-之前异步刷新，读侧同步查表。
+The `dream` / `extractMemories` config subtrees are named exactly as in pi's `memory.json`, so they can
+be copied over; their `model` / `thinkLevel` / budget values are consumed by core, not by this adapter
+(which only reads them for `/memory` display and the `/dream` pre-flight check).
 
-## 安装
+The index is not frozen for the session because dsh re-assembles the system prompt on every step (pi
+freezes the index for the whole session and replays the recorded value to protect the prompt cache), so
+the index is a snapshot: it is refreshed asynchronously on `agent/created`, after every successful
+memory write, after `/memory`, and before **every** `pre-step`; reads are a synchronous map lookup.
 
-一条命令。宿主会在包操作之后自动把包名写进 profile 的 `dsh.profile.bundles` 并应用 bundle 的
-`cordis.patch.yml`（`dsh-plugin-manager/lib/types/operations.js:101-135`），**不需要**手工编辑 profile
-的 `package.json`：
+## Install
+
+One command. After the package operation the host writes the package name into the profile's
+`dsh.profile.bundles` and applies the bundle's `cordis.patch.yml`
+(`dsh-plugin-manager/lib/types/operations.js:101-135`), so you do **not** edit the profile's
+`package.json` by hand:
 
 ```sh
-npm run build -w memory-core && npm run build -w dsh-memory   # 先产出 dist/
+npm run build -w memory-core && npm run build -w dsh-memory   # produce dist/ first
 dsh plugin --profile web add file:/abs/path/to/dsh-memory
 ```
 
-顺序不能反：`dsh-memory` 的 build 经 workspace 符号链接解析 core 的 `dist/`，而 `dist/` 不入库。
+The order matters: `dsh-memory`'s build resolves core's `dist/` through the workspace symlink, and
+`dist/` is not in git.
 
-`<spec>` 现在是本地目录（本包 `private: true`、版本 `0.0.0`，尚未发布）；将来发布后换成包名
-`@yandy0725/dsh-memory`。装完重启 dsh 生效。
+`<spec>` is a local directory for now (this package is `private: true` at version `0.0.0`); once
+published it becomes the package name `@yandy0725/dsh-memory`. Restart dsh to pick it up.
 
-改代码后的开发回路：重新 `npm run build -w dsh-memory` 然后重启 dsh。
+Development loop after code changes: `npm run build -w dsh-memory`, then restart dsh.
 
-> **限定**：这条回路假定安装是**软链**的（即 pnpm 把 `file:` 目录依赖当链接而不是拷贝处理）。
-> 这一点**尚未在真宿主上核实**；若实际是拷贝安装，每次改完代码都得重新跑一次 `dsh plugin … add`（或等价的
-> 重装命令）才能看到新产物，单重启不够。
+> **Caveat**: that loop assumes the install is a **symlink** (pnpm linking the `file:` directory rather
+> than copying it). Verified by hand: a `file:` install is copied, so a rebuild is **not** enough — you
+> must re-run `dsh plugin … add` (or the equivalent reinstall) to see the new `dist/`.
 
-卸载一条命令即可，同时摘掉 `dependencies` 与 `dsh.profile.bundles` 两处：
+Uninstall is one command and removes both the `dependencies` entry and the `dsh.profile.bundles` entry:
 
 ```sh
 dsh plugin --profile web remove @yandy0725/dsh-memory
 ```
 
-## 要求
+## Requirements
 
-- **宿主版本**：`engines.dsh` 声明 `>=0.2.2-rc.1 <0.3.0`。宿主在 **import 插件之前**就拿这个字段对当前
-  运行时版本做门（不匹配就直接拒绝加载，不是加载后报错）。注意预发布版本不满足 `^` 范围：`0.2.2-rc.1`
-  排序低于 `0.2.2`，所以 `^0.2.2` 匹配不到它 —— 范围必须写成带 rc 的形式。
-- **Node**：`engines.node` 声明 `>=24.9.0`。
+- **Host version**: `engines.dsh` declares `>=0.2.2-rc.1 <0.3.0`. The host gates on this field **before
+  importing** the plugin (a mismatch refuses to load rather than failing later). Note that pre-release
+  versions do not satisfy `^` ranges: `0.2.2-rc.1` sorts below `0.2.2`, so `^0.2.2` does not match it —
+  the range must spell out the rc form.
+- **Node**: `engines.node` declares `>=24.9.0`.
 
-## 配置
+## Configuration
 
-**唯一的配置层是 cordis 行 `config:`**，在 profile 自己的 `cordis.patch.yml` 里（或机器级的
-`~/.dsh/cordis.patch.yml`，对所有 profile 生效）。本插件**不读任何 JSON 配置文件** —— 既不读项目级
-文件，也不读 `$DSH_HOME/memory.json` 或任何 XDG 配置目录。改配置只改行 config 一处。
+**The only configuration layer is the cordis row `config:`** in the profile's own `cordis.patch.yml`
+(or the machine-level `~/.dsh/cordis.patch.yml`, which applies to every profile). This plugin reads **no
+JSON config file** — neither a project-level one nor `$DSH_HOME/memory.json` nor anything under XDG.
+Change the row config, and that is the whole story.
 
-行配置是**整体替换**的，所以覆盖时要连同 `id` 与 `name` 一起写（`config:` 之外的字段按你的需要填，
-键名与 core 的 `MemoryConfig` 逐字一致，见下）：
+Row config is **replaced wholesale**, so an override must restate `id` and `name` (plus whatever else
+you need); key names are identical to core's `MemoryConfig`:
 
 ```yaml
 # ~/.dsh/profiles/web/cordis.patch.yml
 - id: memory
   name: '@yandy0725/dsh-memory'
   config:
-    # memoryDir: ~/memories                                  # 可选；默认 $XDG_DATA_HOME/simple-memory
-    defaults: { model: "deepseek-official/deepseek-flash" }   # dsh 特有："<provider>/<model>"
+    # memoryDir: ~/memories                                  # optional; defaults to $XDG_DATA_HOME/simple-memory
+    defaults: { model: "deepseek-official/deepseek-flash" }   # dsh-specific: "<provider>/<model>"
     autoSurfacing:
       enabled: true
-      model: "deepseek-official/deepseek-flash"               # per-task 覆盖 defaults.model
-      thinkLevel: "high"                                      # 原样当 reasoningEffort 透传
+      model: "deepseek-official/deepseek-flash"               # per-task override of defaults.model
+      thinkLevel: "high"                                      # passed through as reasoningEffort
       maxFiles: 3
-    # 每轮结束自动提取（默认关闭：每轮一次模型调用）
+    # per-turn extraction (off by default: one model call per turn)
     extractMemories:
       enabled: true
       thinkLevel: "high"
-    # 只在你敲 /dream 时才跑（没有包级开关）
+    # only runs when you type /dream (no package-level switch)
     dream:
       model: "deepseek-official/deepseek-pro"
       thinkLevel: "high"
 ```
 
-键名与 `memory-core` 的 `MemoryConfig` **逐字相同**（`defaults` / `memoryDir` / `memIndex*` /
-`lock` / `sessionSearch` / `autoSurfacing` / `extractMemories` / `dream`），所以 pi 的 `memory.json`
-与 dsh 的行 config 可以照抄。白名单之外的键**不会被静默丢弃**：它们会收集成 `Config: N warning(s)`
-由 `/memory` 打印，让你看见「拼错的键没生效」。
+Key names are **byte-identical** to `memory-core`'s `MemoryConfig` (`defaults` / `memoryDir` /
+`memIndex*` / `lock` / `sessionSearch` / `autoSurfacing` / `extractMemories` / `dream`), so pi's
+`memory.json` and dsh's row config can be copied between hosts. Keys outside the whitelist are not
+silently dropped: they are collected into `Config: N warning(s)` and printed by `/memory`, so a typo is
+visible instead of silently inert.
 
-## memoryDir 警告（重要）
+## memoryDir warning (important)
 
-`memoryDir` 是 **per-harness 配置** —— 本设计刻意没有跨 harness 的共享配置文件。pi 从自己的
-`memory.json` 读它，dsh 从自己的行 config 读它。**如果你在 pi 里覆盖了 `memoryDir`，就必须在 dsh
-里也覆盖成同一个值**，否则两个宿主写进不同的目录，共享就静默失效了。
+`memoryDir` is **per-harness configuration** — this design deliberately has no cross-harness config
+file. pi reads it from its own `memory.json`, dsh from its own row config. **If you override `memoryDir`
+in pi, you must override it to the same value in dsh**, otherwise the two hosts write to different
+directories and the sharing fails silently.
 
-`/memory` 的第一行会打印解析出的 `Dir:`，这正是用来发现这种不一致的入口：两边的 `Dir:` 对不上，
-就是配置没对齐。
+The first line of `/memory` prints the resolved `Dir:` — that is the intended way to spot this: if the
+two `Dir:` lines disagree, the configuration is not aligned.
 
-## 模型
+## Models
 
-模型值沿用 core 的单一字符串，dsh 侧编码为 `"<provider>/<model>"`，按**第一个**斜杠拆开 —— 所以
-model id 自己含斜杠也没问题（如 `megcore/qwen/qwen3.8-max` → `provider=megcore`、
-`model=qwen/qwen3.8-max`）。
+The model value is core's single string; on the dsh side it is encoded as `"<provider>/<model>"` and
+split at the **first** slash, so a model id may itself contain slashes (`megcore/qwen/qwen3.8-max` →
+`provider=megcore`, `model=qwen/qwen3.8-max`).
 
-**缺模型或模型不可解析时，降级而不是关掉记忆**：只有拿到不到模型的那一个模块被关闭，`memory_index`
-段与 `memory` 工具照常可用；降级原因显示在 `/memory` 的 `Modules:` 行（`autoSurfacing=off(<原因>)`）。
+**A missing or unparsable model degrades instead of disabling memory**: only the module that cannot get
+a model is turned off; the `memory_index` section and the `memory` tool stay available, and the reason is
+shown in `/memory`'s `Modules:` line (`autoSurfacing=off(<reason>)`).
 
-三个任务各自的模型需求：
+Per-task model needs:
 
-- `autoSurfacing`：**启动期**就用宿主的 `resolveCallConfig` 探测一次，不可用只关掉召回。
-- `extractMemories`：默认关闭（每轮都跑一次模型调用，代价要你显式承担）。开了但没配模型时，每一轮
-  的抽取会以一条「extract failed」写进宿主日志 —— 它不阻塞对话。
-- `dream`：没有包级开关，只有你敲 `/dream` 才跑。缺模型时**命令结果**里就报
-  「set dream.model (or defaults.model)」，不会起个子会话再在后台失败。
+- `autoSurfacing`: probed **at startup** through the host's `resolveCallConfig`; if the host rejects it,
+  only recall is turned off.
+- `extractMemories`: off by default (one model call per turn — you opt into that cost). When enabled
+  without a model, each turn's extraction logs one "extract failed" line; it never blocks the
+  conversation.
+- `dream`: no package-level switch, only runs on `/dream`. When the model is missing the **command
+  result** says so ("set dream.model (or defaults.model)") instead of starting a sub-session that fails
+  in the background.
 
-`thinkLevel` 会原样当宿主的 `reasoningEffort` 透传（core 的默认值是 `"off"`）。若某条宿主路线的
-model info 不带 `reasoning` 块，宿主会以 `UNSUPPORTED_REASONING_EFFORT` 拒绕—— 这时 `Modules:` 行的
-原因会点名 `thinkLevel`（而不是 `model`）：要改的是档位，模型本身可能根本没毛病。
+`thinkLevel` is passed through as the host's `reasoningEffort` (core's default is `"off"`). If a host
+route has no `reasoning` block in its model info, the host rejects with `UNSUPPORTED_REASONING_EFFORT` —
+the `Modules:` reason then names `thinkLevel` rather than `model`, because the level is what needs
+changing.
 
 ## search scope=sessions
 
-`memory search scope=sessions` 由本插件**自己扫**：经 `ctx.sessionQuery.filterSessions` 取该项目最近
-的会话，再 `readSession` 拿解码后的事件，抽取文本、匹配、截断 —— 语义对齐 pi 的实现。**刻意不**用
-宿主的 SQLite 全文搜索：它在宿主里默认关，而且打开它会让 dsh 的召回强于 pi，同一份记忆在两个宿主里
-搜出不同结果，与「行为一致」的目标相冲。
+`memory search scope=sessions` scans sessions **itself**: `ctx.sessionQuery.filterSessions` lists the
+project's recent sessions, `readSession` returns decoded events, and it extracts text, matches and
+truncates — semantically aligned with pi's implementation. It deliberately does **not** use the host's
+SQLite full-text index: that is off by default, and turning it on would make dsh recall stronger than pi,
+so the same memory would return different results in the two harnesses.
 
-## 提示词三通道
+## Three prompt channels
 
-core 的工具文案有三个通道，在 dsh 里的落点如下：
+core exposes the tool text through three channels; on dsh they land like this:
 
-- `MEMORY_TOOL_DESCRIPTION` → 工具 schema 的 `description`（模型可见）。
-- `MEMORY_TOOL_SNIPPET` 与 `MEMORY_TOOL_GUIDELINES` → 同一个 `memory_index` 段，且**恰好在该 session
-  注册了 `memory` 工具时**才出现（没有 runtime 的 session、子 agent 两样都拿不到）。固定顺序：
-  snippet → guidelines → 索引正文，每段之间空一行；索引正文逐字不动。
+- `MEMORY_TOOL_DESCRIPTION` → the tool schema's `description` (visible to the model).
+- `MEMORY_TOOL_SNIPPET` and `MEMORY_TOOL_GUIDELINES` → the same `memory_index` section, and **only for a
+  session that registered the `memory` tool** (sessions without a runtime and sub-agents get neither).
+  Fixed order: snippet → guidelines → index body, one blank line between parts, index body untouched.
 
-  宿主的 `ToolSchema` 只有 `{name, description, parameters, deferLoading?}`，没有 pi 的
-  `promptSnippet` / `promptGuidelines` 两个专属通道，所以三通道里有两个搭的是 section 的车。
-  guidelines 是 7 条字符串，渲染成 `- <规则>` 逐行（与 pi 宿主对 `promptGuidelines` 的渲染同式），
-  文本逐字来自 core。代价是每轮 system prompt 多约 1143 字符（≈ 300 token），但它是**静态**文本，
-  能被 prompt cache 命中。为什么值得落：记忆目录是两个宿主共享的，guidelines 管的正是写入质量
-  （「description 必须自足」及其正反例）—— dsh 会话写出含糊的 description，会连带降低 pi 会话的召回质量。
+  The host's `ToolSchema` is just `{name, description, parameters, deferLoading?}` — it has no
+  equivalent of pi's `promptSnippet` / `promptGuidelines`, so two of the three channels ride the section
+  instead. The guidelines are seven strings rendered as `- <rule>` per line (matching how pi renders
+  `promptGuidelines`), text taken verbatim from core. The cost is ~1143 extra characters (≈300 tokens)
+  per assembled system prompt, but it is **static** text that the prompt cache can hit. It is worth it
+  because the memory directory is shared: guidelines govern write quality ("a description must be
+  self-contained", with examples), and a vague description written by a dsh session degrades recall for
+  pi sessions too.
 
-## 开发
+## Development
 
 ```sh
-npm run build -w memory-core && npm run build -w dsh-memory   # 顺序不能反：build 配置经 workspace 符号链接解析 core 的 dist/
+npm run build -w memory-core && npm run build -w dsh-memory   # order matters: build resolves core's dist/ through the workspace symlink
 npm test -w dsh-memory
 ```
 
-`@yandy0725/memory-core` 有两条解析路径，与 `pi-memory` 同口径：**开发**（`npm test` / `typecheck`）
-经 `vitest.config.ts` 的 alias 与 `tsconfig.json` 的 `paths` 指向 `../memory-core/src/index.ts`，
-**构建与运行时**经包 `exports` 解析 `dist/`，用户机器上就是从 registry 装的那个版本。
-`npm run check:memory-core-deps` 静态守这条，`npm run smoke:registry` 真装一次验证（见
-[docs/guides/dependencies.md](../docs/guides/dependencies.md)）。
+`@yandy0725/memory-core` has two resolution paths, same as `pi-memory`: **development** (`npm test` /
+`typecheck`) resolves `../memory-core/src/index.ts` through the `vitest.config.ts` alias and the
+`tsconfig.json` paths, while **build and runtime** resolve `dist/` through the package `exports` — the
+version installed from the registry on a user machine. `npm run check:memory-core-deps` guards this
+statically and `npm run smoke:registry` proves it by installing for real (see
+[docs/guides/dependencies.md](../docs/guides/dependencies.md)).
 
-设计保证：`dsh-memory/dist/**/*.js` 里 **零** `@deepseek-ai` 引用。宿主包全部只以 `import type`
-出现（tsc 擦除），运行时能力经 `inject` 进来的 `ctx` 服务拿 —— 所以产物 `.js` 里没有宿主 import。
-CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.d.ts` 里出现宿主类型是合法的，
-不算失败）。
+Design guarantee: `dsh-memory/dist/**/*.js` contains **zero** `@deepseek-ai` references. Host packages
+appear only as `import type` (erased by tsc) and runtime capabilities come from `inject`ed `ctx`
+services, so the emitted `.js` has no host imports. CI guards it with
+`grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` (host types in `.d.ts` are fine).
 
-`inject` 声明了八个服务：`tools` / `systemPrompt` / `llm` / `agents` / `commands` /
-`workingDirectory` / `sessionQuery` / `logger`。其中 **`agents` 是 extract / dream 必需的**（子会话的
-工具循环只能由它开）；精简 profile 里缺它时整个 bundle 保持 inactive —— 刻意不要「半边挂」的
-状态（召回在、`/dream` 静默不工作，那种半挂比整体不挂难查得多）。
+`inject` declares **seven** services: `tools` / `systemPrompt` / `llm` / `agents` / `commands` /
+`workingDirectory` / `sessionQuery`. Two notes:
 
-## 验证状态
+- **`agents` is required** by extract and dream (only it can open a sub-session's tool loop). A profile
+  missing it keeps the whole bundle inactive rather than half-mounted (recall working while `/dream`
+  silently does nothing is much harder to diagnose).
+- **`logger` must never be listed.** `ctx.logger` is a plain property assigned in cordis's `Context`
+  constructor, not a service; listing it leaves the fiber `pending (waiting for service: logger)` forever
+  and the plugin never activates.
 
-单元测试全绿（dsh-memory `281 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上端到端跑通（隔离
-`DSH_HOME` + `file:` 装包，流程见 [docs/guides/dsh-real-host-smoke.md](../docs/guides/dsh-real-host-smoke.md)）。
+## Verification status
 
-真机确认（web profile，长寿命宿主）：
+Unit tests are green (dsh-memory `282 passed`) and the plugin has been run **end-to-end on real dsh
+`0.2.2-rc.1`** (isolated `DSH_HOME`, `file:` install) — the notes below are that verification record.
 
-- 插件**真的会激活**（`inject` 里曾经多写了 `logger` —— 它是 `Context` 的普通属性、不是服务，
-  写进去会让 fiber 永久 `pending`，插件一次都不会生效）。
-- `memory_index` 段与 `memory` 工具在真会话里出现，模型主动 `add` 的记忆落盘正确。
-- **extract 端到端可用**：父会话被要求「不要调用任何工具」，仅 1 轮 1 步；`MEMORY.md` 仍出现两条
-  记忆，来自 extract 的子会话 —— 该子会话 `request/header` 里工具面只有 `["memory"]`，调用序列是
-  `memory list` → `memory add` ×2，`turn/end: completed`。
-- **`/dream` 端到端可用**：在预置 4 条（含两条互相冲突的「锁文件」记忆）的目录上执行 `/dream`，
-  子会话工具面是 `["memory"]`（7 个 action）、调用序列 `list → search ×2 → rebuild_index`，
-  `turn/end: completed`；结果是**真的合并了**两条冲突记忆（`lock-never-auto-reclaimed` +
-  `lock-files-stick-around` → `lock-files-never-auto-reclaimed`，旧文件已删除）、改写了另一条的
-  description、并把索引重建为 3 行。同时在 `<memoryDir>/.backups/` 留下了整目录快照（回滚点）。
-- `/memory`、`/dream` 两个命令注册成功（空 `input.hint` 会让宿主拒绝注册并回滚整个 bundle）。
+Confirmed on a real host (web profile, long-lived):
 
-### 子会话为什么是「常驻 worker」
+- The plugin **really activates** (see the `logger` note above — listing it was a real bug that made the
+  plugin a no-op on real hosts while all unit tests passed).
+- The `memory_index` section and the `memory` tool appear in a real session, and memories the model
+  writes land correctly on disk.
+- **extract works end to end**: the parent was told not to call any tool and ran 1 turn / 1 step, yet two
+  memories appeared — written by the extract sub-session, whose `request/header` lists exactly
+  `["memory"]` as its tool surface (`memory list` → `memory add` ×2, `turn/end: completed`).
+- **`/dream` works end to end**: seeded with four entries (two of them contradicting each other),
+  `/dream` merged the pair into one entry (old files gone), rewrote another entry's description, rebuilt
+  the index to three lines, and left a whole-directory snapshot under `<memoryDir>/.backups/`.
+- `/memory` and `/dream` register successfully (an empty `input.hint` makes the host reject the
+  registration and roll back the whole bundle).
 
-`AgentRegistry.create()` 用 `this.ctx` 作为子 agent 的 owner，而 cordis 的 traceable 机制把它解析成
-「访问服务时的调用方作用域」。在 `agent/turn-stopping` / `agent/status` 的派发里创建子会话会抛
-`cannot create effect on inactive context`（插件作用域绑定、agent 作用域绑定、宏任务延迟三种写法
-全部复现）；同样的调用在 `agent/created` 期间是成功的。
+### Why the sub-session is a long-lived worker
 
-所以本适配层在**会话启动阶段**为每个任务建一个常驻子会话（extract 5 个 action / dream 7 个 action，
-能力面不同不能共用），每轮只往里 `followup` 一条消息并等它的 `turn/end`。代价与门禁：
+`AgentRegistry.create()` uses `this.ctx` as the owner of the child agent, and cordis's traceable
+machinery resolves that to "the caller scope at the time the service was accessed". Creating a
+sub-session inside the `agent/turn-stopping` / `agent/status` dispatch throws
+`cannot create effect on inactive context` (reproduced with plugin-scope binding, agent-scope
+`agent.ctx.agents` binding, and a macrotask deferral); the same call during `agent/created` succeeds.
 
-- 只有 `extractMemories.enabled` 为真才建 extract worker；只有用户显式写了 `dream` 键才建 dream
-  worker。默认（两者都没开）**零额外子会话**。
-- 建了 worker 的会话会多出一条**空的**子会话记录（只有 followup 之后才会有轮次内容）。
+So this adapter creates one long-lived sub-session **per task at session start** (extract: 5 actions,
+dream: 7 — different capability surfaces, so they cannot share one) and only `followup`s a message into
+it per turn, waiting for its `turn/end`. Gates and cost:
 
-### 一次性宿主里的限制
+- The extract worker is created only when `extractMemories.enabled` is true; the dream worker only when
+  the user explicitly configured a `dream` key. Neither enabled means **zero extra sub-sessions**.
+- A session with a worker gains one **empty** sub-session record (it only has turn content after a
+  `followup`).
 
-`dsh headless` 是「答一轮就退出」的宿主：父轮结束即退出进程，后台在途的抽取会被 `aborted/disposed`
-打断（真机实测）。适配层在卸载/`agent/disposed` 时会 `drain()` 在途的抽取（最多 5s），但进程退出
-不会等我们。所以 **extract / dream 的完整语义只在长寿命宿主（web / TUI）里成立**；一次性 headless
-里它们是「尽力而为」。
+### Limitations in one-shot hosts
+
+`dsh headless` answers one task and exits: the parent turn ends, the process exits, and in-flight
+background extraction is interrupted with `aborted/disposed` (measured). The adapter `drain()`s in-flight
+extraction for up to 5s on unload / `agent/disposed`, but process exit does not wait for us. So
+**extract / dream only have their full semantics in a long-lived host (web / TUI)**; in one-shot headless
+they are best effort.
