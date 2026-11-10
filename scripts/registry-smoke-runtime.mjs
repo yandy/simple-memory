@@ -10,7 +10,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { DEFAULT_CONFIG, MemoryStore, loadConfigFrom } from "@yandy0725/memory-core";
+import { DEFAULT_CONFIG, MemoryStore } from "@yandy0725/memory-core";
 
 const [versionsJson, label, entry] = process.argv.slice(2);
 assert.ok(versionsJson && label && entry, "usage: node registry-smoke-runtime.mjs <versions-json> <label> <entry>");
@@ -37,8 +37,12 @@ assert.ok(
 );
 
 // 3. 真跑一次读写：解析成功不等于产物可用（漏带 dist、或发布的是空包，都在这一步暴露）。
-const cfg = await loadConfigFrom([]);
-assert.equal(cfg.memoryDir, join(process.env.XDG_DATA_HOME, "simple-memory"), "默认数据根必须跟随 XDG_DATA_HOME");
+//    默认数据根用 `DEFAULT_CONFIG.memoryDir` 验（core 不再读文件，也不再导出 `loadConfigFrom`）。
+assert.equal(
+	DEFAULT_CONFIG.memoryDir,
+	join(process.env.XDG_DATA_HOME, "simple-memory"),
+	"默认数据根必须跟随 XDG_DATA_HOME",
+);
 
 const memoryDir = await mkdtemp(join(tmpdir(), "registry-smoke-memory-"));
 const store = new MemoryStore({

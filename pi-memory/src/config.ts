@@ -1,19 +1,20 @@
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { type MemoryConfig, loadConfigFrom } from "@yandy0725/memory-core";
+import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, mergeConfig, type MemoryConfig } from "@yandy0725/memory-core";
 
 /**
- * pi 侧的配置层只负责一件事：把「配置文件在哪」这条宿主知识组装成 core 的 `loadConfigFrom` 入参。
+ * pi 侧的配置层负责两件事：把「配置文件在哪」这条宿主知识组装成文件列表，然后**自己读**它们。
  *
  * 默认值、deep-merge 语义、`~` 展开、模型校验（`modelConfigErrors` / `requiredModel` / `taskModel`）
  * 全部在 `@yandy0725/memory-core`，这里原样重导出，使 `index.ts` 与其余 pi 模块的 import 面不变。
+ * core 不认识任何宿主的配置文件路径（也不读文件）：读不读、读哪几个，由适配层决定。
  */
 export {
 	DEFAULT_CONFIG,
 	defaultMemoryRoot,
 	expandTilde,
-	loadConfigFrom,
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
@@ -57,8 +58,28 @@ export function configFiles(ctx: LoadConfigContext): string[] {
 	return files;
 }
 
+/** 缺文件、不可读、坏 JSON 一律返回 {} —— 与 core 1.x 的 readJsonSafe 同语义。 */
+async function readJsonFile(file: string): Promise<unknown> {
+	try {
+		return JSON.parse(await readFile(file, "utf8"));
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * 合并顺序即 `configFiles` 的顺序；`~` 展开在最后一步，`_platform` 只影响展开规则
+ * （`~\` 只在 win32 展开，POSIX 上它是合法文件名）。
+ *
+ * 起始值刻意用 `{ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }` 的浅展开：嵌套子树在 overlay
+ * 未触及处仍与 `DEFAULT_CONFIG` 共享引用（`mergeConfig` 只对真正被覆盖的子树建新对象）——
+ * 这正是 1.x 的语义，不要改成深拷贝。
+ */
 export async function loadConfig(ctx: LoadConfigContext): Promise<MemoryConfig> {
-	return loadConfigFrom(configFiles(ctx), { platform: ctx._platform });
+	let cfg: MemoryConfig = { ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() };
+	for (const file of configFiles(ctx)) cfg = mergeConfig(cfg, await readJsonFile(file));
+	cfg.memoryDir = expandTilde(cfg.memoryDir, ctx._platform ?? process.platform);
+	return cfg;
 }
 
 /**

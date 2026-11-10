@@ -52,12 +52,11 @@ export { sanitizeForInjection, stripInvisibleChars } from "./store/sanitize.js";
 export { escapeWindowsTrailing, isReservedWindowsName, windowsSafeName } from "./store/windows-names.js";
 
 // ── 配置（默认值、合并语义、模型校验、共享数据根）──────────────────────────────
-// 配置文件**在哪**是宿主知识，由适配层组装成 `loadConfigFrom` 的 `files` 入参。
+// core 只给默认值与合并语义；配置文件在哪、读不读，是适配层的事。
 export {
 	DEFAULT_CONFIG,
 	defaultMemoryRoot,
 	expandTilde,
-	loadConfigFrom,
 	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
@@ -69,7 +68,6 @@ export type {
 	DefaultsConfig,
 	EffortLevel,
 	ExtractMemoriesConfig,
-	LoadConfigFromOptions,
 	MemoryConfig,
 	ModelTask,
 	SessionPersistenceConfig,

@@ -3,13 +3,14 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { configFiles, loadConfig } from "../src/config";
+import { configFiles, loadConfig, modelConfigErrors, requiredModels } from "../src/config";
 
 /**
- * pi 侧配置层的全部职责：**读哪些文件**。
+ * pi 侧配置层的全部职责：**读哪些文件、怎么把它们合并成 `MemoryConfig`**。
  *
- * 合并语义、`~` 展开、默认值都在 core（钉在 `memory-core/tests/config.test.ts`）；这里只钉
- * `configFiles` 的路径组装与信任门 —— 那是宿主知识，core 对 `.pi` 一无所知（spec D4）。
+ * 默认值、深合并语义、`~` 展开仍由 core 提供（`DEFAULT_CONFIG` / `mergeConfig` / `expandTilde`），
+ * 但「文件在哪、读不读」是宿主知识（core 对 `.pi` 一无所知，spec D4），所以文件 IO 与下面这批
+ * 合并用例都归这里 —— 它们原本钉在 `memory-core/tests/config.test.ts` 的 `describe("loadConfigFrom")`。
  */
 describe("configFiles", () => {
 	it("lists the global file first and the project file second when trusted", () => {
@@ -90,6 +91,191 @@ describe("loadConfig", () => {
 
 	it("passes the platform seam through to the tilde expansion", async () => {
 		// `~\` 只在 win32 展开；POSIX 上它是合法文件名。两边各跑一次才能钉住「缝确实传下去了」。
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\mem" }));
+		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).memoryDir).toBe(join(homedir(), "mem"));
+		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).memoryDir).toBe("~\\mem");
+	});
+
+	// ── 以下用例迁自 memory-core/tests/config.test.ts 的 describe("loadConfigFrom") ────────────────
+	// 迁移只动了三处：入参从「文件列表」换成 pi 的注入缝、`platform` 换成 `_platform`、删掉
+	// `dream.nudgeAfter*` 断言（那两个键已归 pi）。**期望值一字不改** —— 这就是「行为逐字不变」的证词。
+	// 已在上面被覆盖、不再重复的迁移用例：「project overrides global」由
+	// 「lets the project config override the global one when trusted」覆盖；两条 `~\` 平台规则由
+	// 「passes the platform seam through to the tilde expansion」与下面的 `~` 用例覆盖。
+
+	it("returns defaults when no config files exist", async () => {
+		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(200);
+	});
+
+	// 包级 `enabled` 已不是 schema 的一部分。残留键会随 deepMerge 进入运行时对象（与 v1 的
+	// maxTopicBytes 同例），但不得影响任何行为 —— `requiredModels` 仍然列出 dream，
+	// 也就是「写 enabled: false 不再能免掉模型校验」。
+	it("ignores a leftover top-level enabled key", async () => {
+		await writeFile(
+			join(globalDir, "memory.json"),
+			JSON.stringify({ enabled: false, autoSurfacing: { enabled: false }, dream: { model: "test/dream" } }),
+		);
+		const cfg = await loadConfig(ctx(true));
+
+		expect(requiredModels(cfg)).toEqual([{ task: "dream", value: "test/dream" }]);
+		expect(modelConfigErrors(cfg, () => true)).toEqual([]);
+	});
+
+	it("merges global config over defaults", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memIndexMaxLines: 100 }));
+		const cfg = await loadConfig(ctx(true));
+		expect(cfg.memIndexMaxLines).toBe(100);
+		expect(cfg.memIndexMaxBytes).toBe(25600); // unchanged default
+	});
+
+	it("nested deep-merge preserves sibling fields when one nested field is overridden", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ dream: { model: "deepseek/deepseek-v4-flash" } }));
+		const cfg = await loadConfig(ctx(true));
+		expect(cfg.dream.model).toBe("deepseek/deepseek-v4-flash");
+		// 同层兄弟键没被覆盖掉（`nudgeAfter*` 已归 pi，这里钉的是留在 core 的兄弟键）。
+		expect(cfg.dream.thinkLevel).toBe("high");
+	});
+
+	it("expands ~ in memoryDir", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~/mymem" }));
+		expect((await loadConfig(ctx(true))).memoryDir).toBe(join(homedir(), "mymem"));
+	});
+
+	it("handles malformed JSON gracefully", async () => {
+		await writeFile(join(globalDir, "memory.json"), "this is not json");
+		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(200);
+	});
+
+	it("expands bare ~ to homedir", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~" }));
+		expect((await loadConfig(ctx(true))).memoryDir).toBe(homedir());
+	});
+
+	it("has autoSurfacing defaults", async () => {
+		const cfg = await loadConfig(ctx(false));
+		expect(cfg.autoSurfacing).toEqual({
+			enabled: true,
+			thinkLevel: "off",
+			maxFiles: 3,
+			maxEntryBytes: 3072,
+			maxInjectionBytes: 10240,
+		});
+	});
+
+	it("has extractMemories defaults", async () => {
+		const cfg = await loadConfig(ctx(false));
+		expect(cfg.extractMemories).toEqual({
+			enabled: false,
+			thinkLevel: "high",
+			maxContextTokens: 2000,
+			maxToolResultChars: 500,
+			maxAssistantChars: 2000,
+		});
+	});
+
+	it("lets memory.json opt back into extractMemories", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ extractMemories: { enabled: true } }));
+		const cfg = await loadConfig(ctx(true));
+		// 默认关闭只是默认值：显式 true 必须能覆盖它（deepMerge 的正路径）。
+		expect(cfg.extractMemories.enabled).toBe(true);
+		expect(cfg.extractMemories.thinkLevel).toBe("high");
+		// 模型校验跟着开关走：开启后 extract 也要模型。
+		expect(requiredModels(cfg).map((m) => m.task)).toContain("extractMemories");
+	});
+
+	it("propagates defaults.sessionPersistence to all tasks", async () => {
+		await writeFile(
+			join(globalDir, "memory.json"),
+			JSON.stringify({ defaults: { sessionPersistence: { enabled: true } } }),
+		);
+		const cfg = await loadConfig(ctx(true));
+		expect(cfg.defaults?.sessionPersistence).toEqual({ enabled: true });
+		expect(cfg.dream.sessionPersistence).toBeUndefined();
+		expect(cfg.autoSurfacing.sessionPersistence).toBeUndefined();
+		expect(cfg.extractMemories.sessionPersistence).toBeUndefined();
+	});
+
+	it("per-task sessionPersistence overrides defaults", async () => {
+		await writeFile(
+			join(globalDir, "memory.json"),
+			JSON.stringify({
+				defaults: { sessionPersistence: { enabled: true } },
+				dream: { sessionPersistence: { enabled: false } },
+			}),
+		);
+		const cfg = await loadConfig(ctx(true));
+		expect(cfg.defaults?.sessionPersistence).toEqual({ enabled: true });
+		expect(cfg.dream.sessionPersistence).toEqual({ enabled: false });
+	});
+
+	it("per-task model overrides defaults.model", async () => {
+		await writeFile(
+			join(globalDir, "memory.json"),
+			JSON.stringify({
+				defaults: { model: "deepseek/flash" },
+				dream: { model: "tencent/glm" },
+			}),
+		);
+		expect((await loadConfig(ctx(true))).dream.model).toBe("tencent/glm");
+	});
+
+	it("ships defaults.sessionPersistence disabled so headless sessions stay in memory", async () => {
+		const cfg = await loadConfig(ctx(true));
+		expect(cfg.defaults).toEqual({ sessionPersistence: { enabled: false } });
+		expect(cfg.dream.thinkLevel).toBe("high");
+		expect(cfg.dream.sessionPersistence).toBeUndefined();
+	});
+
+	// 模型没有默认值：必须由用户显式配置，否则启动即报错
+	it("ships no model default, so models must be configured explicitly", async () => {
+		expect((await loadConfig(ctx(true))).defaults?.model).toBeUndefined();
+	});
+
+	it("lets memory.json defaults.model provide the shared model", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ defaults: { model: "other/model" } }));
+		expect((await loadConfig(ctx(true))).defaults?.model).toBe("other/model");
+	});
+
+	it("has lock defaults", async () => {
+		expect((await loadConfig(ctx(false))).lock).toEqual({ timeoutMs: 5000, snapshotKeep: 5 });
+	});
+
+	it("deep-merges the lock section, keeping the untouched sibling", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ lock: { timeoutMs: 1000 } }));
+		expect((await loadConfig(ctx(true))).lock).toEqual({ timeoutMs: 1000, snapshotKeep: 5 });
+	});
+
+	// v1 的 autoSurfacing.maxTopicBytes 语义是「一个 topic 文件的注入上限」，v2 的 maxEntryBytes 是
+	// 「一条 entry 的注入上限」。旧键必须彻底失效：若它还生效，用户配置里的旧值会静默改变 v2 的注入预算。
+	it("ignores the legacy autoSurfacing.maxTopicBytes key", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ autoSurfacing: { maxTopicBytes: 999 } }));
+		expect((await loadConfig(ctx(true))).autoSurfacing.maxEntryBytes).toBe(3072);
+	});
+
+	it("deep-merges the new extractMemories char limits", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ extractMemories: { maxToolResultChars: 200 } }));
+		expect((await loadConfig(ctx(true))).extractMemories).toEqual({
+			enabled: false,
+			thinkLevel: "high",
+			maxContextTokens: 2000,
+			maxToolResultChars: 200,
+			maxAssistantChars: 2000,
+		});
+	});
+
+	// 坏文件**只**跳过它自己：后面的项目配置照旧生效（1.x 的 readJsonSafe 是逐文件 try/catch）。
+	it("skips a malformed file and keeps the other", async () => {
+		await writeFile(join(globalDir, "memory.json"), "{ not json");
+		await mkdir(join(projectDir, ".pi"), { recursive: true });
+		await writeFile(join(projectDir, ".pi", "memory.json"), JSON.stringify({ memIndexMaxLines: 42 }));
+		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(42);
+	});
+
+	it("expands ~ only for win32 backslash forms", async () => {
+		// 正斜杠形态两个平台都展开
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~/mem" }));
+		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).memoryDir).toBe(join(homedir(), "mem"));
+		// 反斜杠形态只在 win32 展开
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\mem" }));
 		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).memoryDir).toBe(join(homedir(), "mem"));
 		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).memoryDir).toBe("~\\mem");

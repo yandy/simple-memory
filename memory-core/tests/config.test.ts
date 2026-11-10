@@ -1,11 +1,7 @@
-import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
 	DEFAULT_CONFIG,
 	defaultMemoryRoot,
-	loadConfigFrom,
 	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
@@ -54,219 +50,6 @@ describe("DEFAULT_CONFIG", () => {
 	it("keeps the injection window smaller than the write capacity", () => {
 		expect(DEFAULT_CONFIG.memIndexInjectMaxLines).toBeLessThan(DEFAULT_CONFIG.memIndexMaxLines);
 		expect(DEFAULT_CONFIG.memIndexInjectMaxBytes).toBeLessThan(DEFAULT_CONFIG.memIndexMaxBytes);
-	});
-});
-
-describe("loadConfigFrom", () => {
-	let globalDir: string;
-	let projectDir: string;
-	beforeEach(async () => {
-		globalDir = await mkdtemp(join(tmpdir(), "mem-global-"));
-		projectDir = await mkdtemp(join(tmpdir(), "mem-proj-"));
-	});
-	afterEach(async () => {
-		await rm(globalDir, { recursive: true, force: true });
-		await rm(projectDir, { recursive: true, force: true });
-	});
-
-	/**
-	 * core 只认文件列表：这两个 helper 把测试造的临时目录翻成 `loadConfigFrom` 的入参。
-	 * 「该读哪些文件」是宿主知识 —— pi 侧由 `configFiles` 决定，钉在
-	 * `pi-memory/tests/config-paths.test.ts`。
-	 */
-	const globalOnly = (platform?: NodeJS.Platform) => loadConfigFrom([join(globalDir, "memory.json")], { platform });
-	const globalAndProject = (platform?: NodeJS.Platform) =>
-		loadConfigFrom([join(globalDir, "memory.json"), join(projectDir, ".agent", "memory.json")], { platform });
-
-	it("returns defaults when no config files exist", async () => {
-		const cfg = await globalAndProject();
-		expect(cfg.memIndexMaxLines).toBe(200);
-	});
-
-	// 本次移除的回归钉子：包级 `enabled` 已不是 schema 的一部分。残留键会随 deepMerge 进入运行时
-	// 对象（与 v1 的 maxTopicBytes 同例），但不得影响任何行为 —— `requiredModels` 仍然列出 dream，
-	// 也就是「写 enabled: false 不再能免掉模型校验」。
-	it("ignores a leftover top-level enabled key", async () => {
-		await writeFile(
-			join(globalDir, "memory.json"),
-			JSON.stringify({ enabled: false, autoSurfacing: { enabled: false }, dream: { model: "test/dream" } }),
-		);
-		const cfg = await globalAndProject();
-
-		expect(requiredModels(cfg)).toEqual([{ task: "dream", value: "test/dream" }]);
-		expect(modelConfigErrors(cfg, () => true)).toEqual([]);
-	});
-	it("merges global config over defaults", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memIndexMaxLines: 100 }));
-		const cfg = await globalAndProject();
-		expect(cfg.memIndexMaxLines).toBe(100);
-		expect(cfg.memIndexMaxBytes).toBe(25600); // unchanged default
-	});
-	it("nested deep-merge preserves sibling fields when one nested field is overridden", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ dream: { model: "deepseek/deepseek-v4-flash" } }));
-		const cfg = await globalAndProject();
-		expect(cfg.dream.model).toBe("deepseek/deepseek-v4-flash");
-		expect(cfg.dream.nudgeAfterSessions).toBe(5);
-		expect(cfg.dream.nudgeAfterHours).toBe(24);
-	});
-	it("project overrides global", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memIndexMaxLines: 100 }));
-		await mkdir(join(projectDir, ".agent"), { recursive: true });
-		await writeFile(join(projectDir, ".agent", "memory.json"), JSON.stringify({ memIndexMaxLines: 50 }));
-		const cfg = await globalAndProject();
-		expect(cfg.memIndexMaxLines).toBe(50);
-	});
-	it("expands ~ in memoryDir", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~/mymem" }));
-		const cfg = await globalAndProject();
-		expect(cfg.memoryDir).toBe(join(homedir(), "mymem"));
-	});
-	it("handles malformed JSON gracefully", async () => {
-		await writeFile(join(globalDir, "memory.json"), "this is not json");
-		const cfg = await globalAndProject();
-		expect(cfg.memIndexMaxLines).toBe(200);
-	});
-	it("expands bare ~ to homedir", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~" }));
-		const cfg = await globalAndProject();
-		expect(cfg.memoryDir).toBe(homedir());
-	});
-
-	it("expands ~\\ in memoryDir on win32", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\.agent\\memory" }));
-		const cfg = await globalAndProject("win32");
-		// 注入的 `_platform` 只改展开条件，拼接仍走宿主的 join（POSIX 上反斜杠是普通字符，不是分隔符）。
-		// 真 Windows 上本期望与 `join(homedir(), ".agent", "memory")` 逐字节相同。
-		expect(cfg.memoryDir).toBe(join(homedir(), ".agent\\memory"));
-	});
-
-	it("leaves ~\\ alone on POSIX (it is a legal file name there)", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\.agent\\memory" }));
-		const cfg = await globalAndProject("linux");
-		expect(cfg.memoryDir).toBe("~\\.agent\\memory");
-	});
-
-	it("has autoSurfacing defaults", async () => {
-		const cfg = await globalOnly();
-		expect(cfg.autoSurfacing).toEqual({
-			enabled: true,
-			thinkLevel: "off",
-			maxFiles: 3,
-			maxEntryBytes: 3072,
-			maxInjectionBytes: 10240,
-		});
-	});
-
-	it("has extractMemories defaults", async () => {
-		const cfg = await globalOnly();
-		expect(cfg.extractMemories).toEqual({
-			enabled: false,
-			thinkLevel: "high",
-			maxContextTokens: 2000,
-			maxToolResultChars: 500,
-			maxAssistantChars: 2000,
-		});
-	});
-
-	it("lets memory.json opt back into extractMemories", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ extractMemories: { enabled: true } }));
-		const cfg = await globalAndProject();
-		// 默认关闭只是默认值：显式 true 必须能覆盖它（deepMerge 的正路径）。
-		expect(cfg.extractMemories.enabled).toBe(true);
-		expect(cfg.extractMemories.thinkLevel).toBe("high");
-		// 模型校验跟着开关走：开启后 extract 也要模型。
-		expect(requiredModels(cfg).map((m) => m.task)).toContain("extractMemories");
-	});
-
-
-	it("propagates defaults.sessionPersistence to all tasks", async () => {
-		await writeFile(
-			join(globalDir, "memory.json"),
-			JSON.stringify({ defaults: { sessionPersistence: { enabled: true } } }),
-		);
-		const cfg = await globalAndProject();
-		expect(cfg.defaults?.sessionPersistence).toEqual({ enabled: true });
-		expect(cfg.dream.sessionPersistence).toBeUndefined();
-		expect(cfg.autoSurfacing.sessionPersistence).toBeUndefined();
-		expect(cfg.extractMemories.sessionPersistence).toBeUndefined();
-	});
-
-	it("per-task sessionPersistence overrides defaults", async () => {
-		await writeFile(
-			join(globalDir, "memory.json"),
-			JSON.stringify({
-				defaults: { sessionPersistence: { enabled: true } },
-				dream: { sessionPersistence: { enabled: false } },
-			}),
-		);
-		const cfg = await globalAndProject();
-		expect(cfg.defaults?.sessionPersistence).toEqual({ enabled: true });
-		expect(cfg.dream.sessionPersistence).toEqual({ enabled: false });
-	});
-
-	it("per-task model overrides defaults.model", async () => {
-		await writeFile(
-			join(globalDir, "memory.json"),
-			JSON.stringify({
-				defaults: { model: "deepseek/flash" },
-				dream: { model: "tencent/glm" },
-			}),
-		);
-		const cfg = await globalAndProject();
-		expect(cfg.dream.model).toBe("tencent/glm");
-	});
-
-	it("ships defaults.sessionPersistence disabled so headless sessions stay in memory", async () => {
-		const cfg = await globalAndProject();
-		expect(cfg.defaults).toEqual({ sessionPersistence: { enabled: false } });
-		expect(cfg.dream.thinkLevel).toBe("high");
-		expect(cfg.dream.sessionPersistence).toBeUndefined();
-	});
-
-	// 模型没有默认值：必须由用户显式配置，否则启动即报错
-	it("ships no model default, so models must be configured explicitly", async () => {
-		const cfg = await globalAndProject();
-		expect(cfg.defaults?.model).toBeUndefined();
-	});
-
-	it("lets memory.json defaults.model provide the shared model", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ defaults: { model: "other/model" } }));
-		const cfg = await globalAndProject();
-		expect(cfg.defaults?.model).toBe("other/model");
-	});
-
-	it("has lock defaults", async () => {
-		const cfg = await globalOnly();
-		expect(cfg.lock).toEqual({ timeoutMs: 5000, snapshotKeep: 5 });
-	});
-
-	it("deep-merges the lock section, keeping the untouched sibling", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ lock: { timeoutMs: 1000 } }));
-		const cfg = await globalAndProject();
-		expect(cfg.lock).toEqual({ timeoutMs: 1000, snapshotKeep: 5 });
-	});
-
-	// v1 的 autoSurfacing.maxTopicBytes 语义是「一个 topic 文件的注入上限」，v2 的 maxEntryBytes 是
-	// 「一条 entry 的注入上限」。旧键必须彻底失效：若它还生效，用户配置里的旧值会静默改变 v2 的注入预算。
-	it("ignores the legacy autoSurfacing.maxTopicBytes key", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ autoSurfacing: { maxTopicBytes: 999 } }));
-		const cfg = await globalAndProject();
-		expect(cfg.autoSurfacing.maxEntryBytes).toBe(3072);
-	});
-
-	it("deep-merges the new extractMemories char limits", async () => {
-		await writeFile(
-			join(globalDir, "memory.json"),
-			JSON.stringify({ extractMemories: { maxToolResultChars: 200 } }),
-		);
-		const cfg = await globalAndProject();
-		expect(cfg.extractMemories).toEqual({
-			enabled: false,
-			thinkLevel: "high",
-			maxContextTokens: 2000,
-			maxToolResultChars: 200,
-			maxAssistantChars: 2000,
-		});
 	});
 });
 
@@ -407,23 +190,8 @@ describe("mergeConfig", () => {
 		expect(out.lock.timeoutMs).toBe(DEFAULT_CONFIG.lock.timeoutMs); // undefined 被跳过
 		expect(base.memIndexMaxLines).toBe(DEFAULT_CONFIG.memIndexMaxLines); // base 未被改写
 	});
-	it("null 子树原样带入（与 loadConfigFrom 的既有语义一致）", () => {
+	it("null 子树原样带入", () => {
 		expect(mergeConfig(DEFAULT_CONFIG, { extractMemories: null }) as any).toMatchObject({ extractMemories: null });
-	});
-	it("与 loadConfigFrom 读同一份 JSON 的结果逐字相等", async () => {
-		const dir = await mkdtemp(join(tmpdir(), "mergecfg-"));
-		try {
-			const file = join(dir, "memory.json");
-			const overlay = { memIndexMaxBytes: 1234, autoSurfacing: { enabled: false, maxFiles: 2 } };
-			await writeFile(file, JSON.stringify(overlay));
-			const viaFile = await loadConfigFrom([file]);
-			const viaMerge = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
-			expect(viaMerge).toEqual(viaFile);
-		} finally {
-			// 本文件顶部的 afterEach 只清它自己建的两个目录；这里自建的临时目录要自己清，
-			// 否则断言失败时会在 tmpdir 里留下一堆 mergecfg-* 目录。
-			await rm(dir, { recursive: true, force: true });
-		}
 	});
 });
 
@@ -451,5 +219,12 @@ describe("公开出口", () => {
 		// index.ts 的 `export type { EffortLevel }` 真的把它放上了公开面。
 		const fromIndex: EffortLevelFromIndex = "max";
 		expect(fromIndex).toBe("max");
+	});
+
+	// 删除必须能被 CI 看见：`loadConfigFrom` 已下放给适配层，公开面里不得再有任何痕迹
+	// （哪怕是 deprecated 薄壳）。
+	it("no longer exposes loadConfigFrom", async () => {
+		const api = await import("../src/index.js");
+		expect("loadConfigFrom" in api).toBe(false);
 	});
 });
