@@ -203,7 +203,11 @@ describe("TASKS.autoSurfacing via runTask", () => {
 		});
 		const result = await runTask(
 			TASKS.autoSurfacing,
-			{ userPrompt: "q", injectedFiles: new Set<string>(), manifest: [manifest("a.md"), manifest("b.md"), manifest("c.md")] },
+			{
+				userPrompt: "q",
+				injectedFiles: new Set<string>(),
+				manifest: [manifest("a.md"), manifest("b.md"), manifest("c.md")],
+			},
 			ctx({
 				cfg: mergeConfig(DEFAULT_CONFIG, {
 					defaults: { model: "deepseek/deepseek-v4-flash" },

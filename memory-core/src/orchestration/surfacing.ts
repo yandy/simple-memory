@@ -2,7 +2,7 @@ import type { SessionPersistenceConfig } from "../config.js";
 import type { EntryManifest } from "../injection.js";
 import { buildSideQueryTask, renderSurfacedBlock } from "../injection.js";
 import type { HeadlessAgentPort } from "./ports.js";
-import { TASKS, buildRequest, type MemoryTask } from "./task.js";
+import { buildRequest, type MemoryTask } from "./task.js";
 
 export interface SurfacingInput {
 	/** 本轮的候选清单（`scanEntries` 的产出）。 */
@@ -110,7 +110,7 @@ export async function runSideQuery(
 		// 请求由 `buildRequest` 统一构造：plan 的取值（maxTurns / timeout / builtinTools / memoryTool）
 		// 与这里给的宿主参数合流，不再在 core 里写第二份。
 		const result = await ports.headless.run(
-			buildRequest(TASKS.autoSurfacing, task, {
+			buildRequest(autoSurfacing, task, {
 				cwd: opts.cwd,
 				model: opts.model,
 				effort: opts.effort,

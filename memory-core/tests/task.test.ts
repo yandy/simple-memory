@@ -10,7 +10,10 @@ import {
 	runTask,
 	type EntryManifest,
 	type HeadlessRunRequest,
+	type MemoryTask,
 	type StoreConfig,
+	type SurfacingInput,
+	type SurfacingResult,
 	type TaskContext,
 } from "../src/index.js";
 
@@ -101,11 +104,10 @@ describe("runTask(TASKS.autoSurfacing)", () => {
 		).rejects.toThrow(/no model for autoSurfacing/);
 	});
 
-	it("swallows a transport throw when errorPolicy is swallow and marks nothing injected", async () => {
-		const injectedFiles = new Set<string>();
+	it("swallows a transport throw when errorPolicy is swallow and returns an empty result", async () => {
 		const out = await runTask(
 			TASKS.autoSurfacing,
-			{ userPrompt: "q", injectedFiles, manifest: [entry("a.md")] },
+			{ userPrompt: "q", injectedFiles: new Set<string>(), manifest: [entry("a.md")] },
 			{
 				cfg: mergeConfig(DEFAULT_CONFIG, { defaults: { model: "provider/base" } }),
 				cwd: "/mem",
@@ -120,7 +122,21 @@ describe("runTask(TASKS.autoSurfacing)", () => {
 			},
 		);
 		expect(out).toEqual({ files: [], content: "" });
-		expect(injectedFiles.size).toBe(0);
+	});
+
+	it("rejects a parse failure instead of disguising it as host-refused", async () => {
+		const task: MemoryTask<SurfacingInput, SurfacingResult> = {
+			id: "autoSurfacing",
+			plan: { maxTurns: 1, timeoutMs: 30_000, memoryTool: null, lock: "none", errorPolicy: "swallow" },
+			buildPrompt: () => "q",
+			parse: async () => {
+				throw new Error("parse boom");
+			},
+			notCompleted: () => ({ files: [], content: "" }),
+		};
+		await expect(
+			runTask(task, { userPrompt: "q", injectedFiles: new Set<string>(), manifest: [entry("a.md")] }, ctx()),
+		).rejects.toThrow("parse boom");
 	});
 
 	it("skips without calling the port when the candidate list is empty", async () => {

@@ -7,6 +7,7 @@ import {
 import type { MemoryStore } from "../store/memory-store.js";
 import type { MemoryAction } from "../tool/actions.js";
 import type {
+	HeadlessOutcome,
 	HeadlessRunRequest,
 	HostTranscriptPort,
 	IncompleteOutcome,
@@ -173,10 +174,9 @@ export async function runTask<I, R>(task: MemoryTask<I, R>, input: I, ctx: TaskC
 			task.memoryToolHooks?.(input)?.onWrite,
 		);
 
+		let outcome: HeadlessOutcome;
 		try {
-			const outcome = await ctx.ports.headless.run(request);
-			if (outcome.status === "completed") return await task.parse(cfg, deps, input, outcome.text);
-			return task.notCompleted(cfg, deps, input, outcome);
+			outcome = await ctx.ports.headless.run(request);
 		} catch (e) {
 			if (task.plan.errorPolicy === "swallow") {
 				return task.notCompleted(cfg, deps, input, {
@@ -187,6 +187,8 @@ export async function runTask<I, R>(task: MemoryTask<I, R>, input: I, ctx: TaskC
 			}
 			throw e;
 		}
+		if (outcome.status === "completed") return await task.parse(cfg, deps, input, outcome.text);
+		return task.notCompleted(cfg, deps, input, outcome);
 	};
 
 	switch (task.plan.lock) {
