@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import type { MemoryConfig } from "./config";
+import type { PiHostConfig } from "./config";
 
 export interface DreamMeta {
 	lastDreamAt: string;
@@ -28,9 +28,13 @@ export function formatNudge(sessions: number, newEntries: number): string {
 	return `💡 ${sessions} sessions, ${newEntries} new entries since last dream. /dream`;
 }
 
+/**
+ * 是否该提醒用户 dream。阈值来自**宿主**配置（`host`），不是 core 的 `MemoryConfig`：
+ * 隔多少个会话 / 多少小时才提醒是 pi 的策略，dsh 没有这个概念。
+ */
 export async function shouldNudge(
 	memoryDir: string,
-	config: MemoryConfig,
+	host: PiHostConfig,
 	cwd: string,
 ): Promise<{ nudge: boolean; message: string; sessions: number; newEntries: number }> {
 	const sessions = (await SessionManager.list(cwd)).length;
@@ -38,10 +42,10 @@ export async function shouldNudge(
 	const newEntries = meta ? Math.max(0, sessions - meta.sessionCountAtDream) : sessions;
 	if (meta) {
 		const hoursSince = (Date.now() - new Date(meta.lastDreamAt).getTime()) / 3600_000;
-		if (hoursSince >= config.dream.nudgeAfterHours && newEntries >= config.dream.nudgeAfterSessions) {
+		if (hoursSince >= host.nudgeAfterHours && newEntries >= host.nudgeAfterSessions) {
 			return { nudge: true, message: formatNudge(sessions, newEntries), sessions, newEntries };
 		}
-	} else if (sessions >= config.dream.nudgeAfterSessions) {
+	} else if (sessions >= host.nudgeAfterSessions) {
 		return { nudge: true, message: formatNudge(sessions, newEntries), sessions, newEntries };
 	}
 	return { nudge: false, message: "", sessions: 0, newEntries: 0 };

@@ -19,7 +19,7 @@ import {
 } from "@yandy0725/memory-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { legacyMemoryRoot, loadConfig, modelConfigErrors, requiredModel, taskModel, type MemoryConfig, type SessionPersistenceConfig } from "./src/config";
+import { legacyMemoryRoot, loadConfig, modelConfigErrors, requiredModel, taskModel, type LoadedConfig, type MemoryConfig, type SessionPersistenceConfig } from "./src/config";
 import { readRecordedMemoryIndex } from "./src/index-source";
 import { detectLegacyMemoryDir } from "./src/legacy-hint";
 import { applyIndexSection, buildInjection } from "./src/inject-pi";
@@ -287,19 +287,19 @@ export default function (pi: ExtensionAPI) {
 		// `loadConfig` 抛错（`getAgentDir` / `isProjectTrusted` 属宿主契约）与初始化失败同一处理：
 		// 转成配置错误态，不把裸 reject 冒给宿主（spec §2.4）。用局部变量承接是为了让后面的收窄
 		// 不受 `config` 这个工厂作用域 let 影响。（nudge 块仍可能抛错，属既有暴露面，不在本次范围。）
-		let loaded: MemoryConfig;
+		let loaded: LoadedConfig;
 		try {
 			loaded = await loadConfig(ctx);
 		} catch (e) {
 			failConfig([`Failed to load memory config: ${e instanceof Error ? e.message : String(e)}`], ctx);
 			return;
 		}
-		config = loaded;
+		config = loaded.config;
 		try {
 			// 启动校验（spec §2.3）：模型键缺失 / 不可解析 → 本会话**完全不初始化**
 			//（不解析目录、不建 store、不注册工具），错误态由 `/memory` 重复显示。
 			// 校验本身抛错（registry 不合契约）也走同一个 catch：failConfig 自己会复位运行时。
-			const errors = modelConfigErrors(loaded, (value) => resolveModel(value, ctx.modelRegistry) !== undefined);
+			const errors = modelConfigErrors(loaded.config, (value) => resolveModel(value, ctx.modelRegistry) !== undefined);
 			if (errors.length > 0) {
 				failConfig(errors, ctx);
 				return;
@@ -317,7 +317,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI && nudgeDir) {
 			// 同步段快照：shouldNudge / confirm 之后的 fire-and-forget 链不再碰 ctx（见 notifyDream）。
 			const ui = ctx.ui;
-			const { nudge, message, sessions } = await shouldNudge(nudgeDir, config, ctx.cwd);
+			const { nudge, message, sessions } = await shouldNudge(nudgeDir, loaded.host, ctx.cwd);
 			if (nudge) {
 				const ok = await ui.confirm("Memory Consolidation", `${message}\n\nConsolidate memory files now?`);
 				// dream 需要 store（整轮逻辑锁 + 快照都挂在它上面）；这里必然非空，但 const 拷贝让 TS 也能看到。

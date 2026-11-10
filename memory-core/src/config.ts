@@ -75,9 +75,12 @@ export interface MemoryConfig {
 	 * **没有** ttl / 心跳 / 接管字段：跨进程 `.lock` 永远只持毫秒且永不自动回收。
 	 */
 	lock: { timeoutMs: number; snapshotKeep: number };
+	/**
+	 * dream 任务本身：模型、思考档位、会话落盘。
+	 * 触发它的**策略**（隔多少个会话 / 多少小时后提醒）是宿主知识，**不**在这里 —— 需要它的适配层
+	 * 自己持有（pi 的 `PiHostConfig`），dsh 没有这套策略。
+	 */
 	dream: {
-		nudgeAfterSessions: number;
-		nudgeAfterHours: number;
 		model?: string;
 		thinkLevel: EffortLevel;
 		sessionPersistence?: SessionPersistenceConfig;
@@ -103,7 +106,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 	memIndexInjectMaxLines: 50,
 	memIndexInjectMaxBytes: 16384,
 	lock: { timeoutMs: 5000, snapshotKeep: 5 },
-	dream: { nudgeAfterSessions: 5, nudgeAfterHours: 24, thinkLevel: "high" },
+	dream: { thinkLevel: "high" },
 	sessionSearch: { maxSessions: 10, maxMatches: 5 },
 	autoSurfacing: {
 		enabled: true,

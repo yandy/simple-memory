@@ -3,7 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { configFiles, loadConfig, modelConfigErrors, requiredModels } from "../src/config";
+import { configFiles, loadConfig, modelConfigErrors, requiredModels, PI_HOST_DEFAULTS } from "../src/config";
 
 /**
  * pi 侧配置层的全部职责：**读哪些文件、怎么把它们合并成 `MemoryConfig`**。
@@ -66,13 +66,13 @@ describe("loadConfig", () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memIndexMaxLines: 100 }));
 		await mkdir(join(projectDir, ".pi"), { recursive: true });
 		await writeFile(join(projectDir, ".pi", "memory.json"), JSON.stringify({ memIndexMaxLines: 50 }));
-		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(50);
+		expect((await loadConfig(ctx(true))).config.memIndexMaxLines).toBe(50);
 	});
 
 	it("ignores the project config when the project is not trusted", async () => {
 		await mkdir(join(projectDir, ".pi"), { recursive: true });
 		await writeFile(join(projectDir, ".pi", "memory.json"), JSON.stringify({ memIndexMaxLines: 50 }));
-		expect((await loadConfig(ctx(false))).memIndexMaxLines).toBe(200); // default, project ignored
+		expect((await loadConfig(ctx(false))).config.memIndexMaxLines).toBe(200); // default, project ignored
 	});
 
 	it("reads memory.json, not pi-memory.json", async () => {
@@ -82,7 +82,7 @@ describe("loadConfig", () => {
 		);
 		// 负向断言：按包名直觉的错拼必须被忽略 —— 若它被读进来，enabled 会翻回 true、maxFiles 会变成 99。
 		await writeFile(join(globalDir, "pi-memory.json"), JSON.stringify({ autoSurfacing: { enabled: true, maxFiles: 99 } }));
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		expect(cfg.autoSurfacing.enabled).toBe(false);
 		expect(cfg.autoSurfacing.maxFiles).toBe(3);
 		expect(cfg.extractMemories.maxContextTokens).toBe(1000);
@@ -92,8 +92,8 @@ describe("loadConfig", () => {
 	it("passes the platform seam through to the tilde expansion", async () => {
 		// `~\` 只在 win32 展开；POSIX 上它是合法文件名。两边各跑一次才能钉住「缝确实传下去了」。
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\mem" }));
-		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).memoryDir).toBe(join(homedir(), "mem"));
-		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).memoryDir).toBe("~\\mem");
+		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).config.memoryDir).toBe(join(homedir(), "mem"));
+		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).config.memoryDir).toBe("~\\mem");
 	});
 
 	// ── 以下用例迁自 memory-core/tests/config.test.ts 的 describe("loadConfigFrom") ────────────────
@@ -104,7 +104,7 @@ describe("loadConfig", () => {
 	// 「passes the platform seam through to the tilde expansion」与下面的 `~` 用例覆盖。
 
 	it("returns defaults when no config files exist", async () => {
-		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(200);
+		expect((await loadConfig(ctx(true))).config.memIndexMaxLines).toBe(200);
 	});
 
 	// 包级 `enabled` 已不是 schema 的一部分。残留键会随 deepMerge 进入运行时对象（与 v1 的
@@ -115,7 +115,7 @@ describe("loadConfig", () => {
 			join(globalDir, "memory.json"),
 			JSON.stringify({ enabled: false, autoSurfacing: { enabled: false }, dream: { model: "test/dream" } }),
 		);
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 
 		expect(requiredModels(cfg)).toEqual([{ task: "dream", value: "test/dream" }]);
 		expect(modelConfigErrors(cfg, () => true)).toEqual([]);
@@ -123,14 +123,14 @@ describe("loadConfig", () => {
 
 	it("merges global config over defaults", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memIndexMaxLines: 100 }));
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		expect(cfg.memIndexMaxLines).toBe(100);
 		expect(cfg.memIndexMaxBytes).toBe(25600); // unchanged default
 	});
 
 	it("nested deep-merge preserves sibling fields when one nested field is overridden", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ dream: { model: "deepseek/deepseek-v4-flash" } }));
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		expect(cfg.dream.model).toBe("deepseek/deepseek-v4-flash");
 		// 同层兄弟键没被覆盖掉（`nudgeAfter*` 已归 pi，这里钉的是留在 core 的兄弟键）。
 		expect(cfg.dream.thinkLevel).toBe("high");
@@ -138,21 +138,21 @@ describe("loadConfig", () => {
 
 	it("expands ~ in memoryDir", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~/mymem" }));
-		expect((await loadConfig(ctx(true))).memoryDir).toBe(join(homedir(), "mymem"));
+		expect((await loadConfig(ctx(true))).config.memoryDir).toBe(join(homedir(), "mymem"));
 	});
 
 	it("handles malformed JSON gracefully", async () => {
 		await writeFile(join(globalDir, "memory.json"), "this is not json");
-		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(200);
+		expect((await loadConfig(ctx(true))).config.memIndexMaxLines).toBe(200);
 	});
 
 	it("expands bare ~ to homedir", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~" }));
-		expect((await loadConfig(ctx(true))).memoryDir).toBe(homedir());
+		expect((await loadConfig(ctx(true))).config.memoryDir).toBe(homedir());
 	});
 
 	it("has autoSurfacing defaults", async () => {
-		const cfg = await loadConfig(ctx(false));
+		const { config: cfg } = await loadConfig(ctx(false));
 		expect(cfg.autoSurfacing).toEqual({
 			enabled: true,
 			thinkLevel: "off",
@@ -163,7 +163,7 @@ describe("loadConfig", () => {
 	});
 
 	it("has extractMemories defaults", async () => {
-		const cfg = await loadConfig(ctx(false));
+		const { config: cfg } = await loadConfig(ctx(false));
 		expect(cfg.extractMemories).toEqual({
 			enabled: false,
 			thinkLevel: "high",
@@ -175,7 +175,7 @@ describe("loadConfig", () => {
 
 	it("lets memory.json opt back into extractMemories", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ extractMemories: { enabled: true } }));
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		// 默认关闭只是默认值：显式 true 必须能覆盖它（deepMerge 的正路径）。
 		expect(cfg.extractMemories.enabled).toBe(true);
 		expect(cfg.extractMemories.thinkLevel).toBe("high");
@@ -188,7 +188,7 @@ describe("loadConfig", () => {
 			join(globalDir, "memory.json"),
 			JSON.stringify({ defaults: { sessionPersistence: { enabled: true } } }),
 		);
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		expect(cfg.defaults?.sessionPersistence).toEqual({ enabled: true });
 		expect(cfg.dream.sessionPersistence).toBeUndefined();
 		expect(cfg.autoSurfacing.sessionPersistence).toBeUndefined();
@@ -203,7 +203,7 @@ describe("loadConfig", () => {
 				dream: { sessionPersistence: { enabled: false } },
 			}),
 		);
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		expect(cfg.defaults?.sessionPersistence).toEqual({ enabled: true });
 		expect(cfg.dream.sessionPersistence).toEqual({ enabled: false });
 	});
@@ -216,11 +216,11 @@ describe("loadConfig", () => {
 				dream: { model: "tencent/glm" },
 			}),
 		);
-		expect((await loadConfig(ctx(true))).dream.model).toBe("tencent/glm");
+		expect((await loadConfig(ctx(true))).config.dream.model).toBe("tencent/glm");
 	});
 
 	it("ships defaults.sessionPersistence disabled so headless sessions stay in memory", async () => {
-		const cfg = await loadConfig(ctx(true));
+		const { config: cfg } = await loadConfig(ctx(true));
 		expect(cfg.defaults).toEqual({ sessionPersistence: { enabled: false } });
 		expect(cfg.dream.thinkLevel).toBe("high");
 		expect(cfg.dream.sessionPersistence).toBeUndefined();
@@ -228,33 +228,33 @@ describe("loadConfig", () => {
 
 	// 模型没有默认值：必须由用户显式配置，否则启动即报错
 	it("ships no model default, so models must be configured explicitly", async () => {
-		expect((await loadConfig(ctx(true))).defaults?.model).toBeUndefined();
+		expect((await loadConfig(ctx(true))).config.defaults?.model).toBeUndefined();
 	});
 
 	it("lets memory.json defaults.model provide the shared model", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ defaults: { model: "other/model" } }));
-		expect((await loadConfig(ctx(true))).defaults?.model).toBe("other/model");
+		expect((await loadConfig(ctx(true))).config.defaults?.model).toBe("other/model");
 	});
 
 	it("has lock defaults", async () => {
-		expect((await loadConfig(ctx(false))).lock).toEqual({ timeoutMs: 5000, snapshotKeep: 5 });
+		expect((await loadConfig(ctx(false))).config.lock).toEqual({ timeoutMs: 5000, snapshotKeep: 5 });
 	});
 
 	it("deep-merges the lock section, keeping the untouched sibling", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ lock: { timeoutMs: 1000 } }));
-		expect((await loadConfig(ctx(true))).lock).toEqual({ timeoutMs: 1000, snapshotKeep: 5 });
+		expect((await loadConfig(ctx(true))).config.lock).toEqual({ timeoutMs: 1000, snapshotKeep: 5 });
 	});
 
 	// v1 的 autoSurfacing.maxTopicBytes 语义是「一个 topic 文件的注入上限」，v2 的 maxEntryBytes 是
 	// 「一条 entry 的注入上限」。旧键必须彻底失效：若它还生效，用户配置里的旧值会静默改变 v2 的注入预算。
 	it("ignores the legacy autoSurfacing.maxTopicBytes key", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ autoSurfacing: { maxTopicBytes: 999 } }));
-		expect((await loadConfig(ctx(true))).autoSurfacing.maxEntryBytes).toBe(3072);
+		expect((await loadConfig(ctx(true))).config.autoSurfacing.maxEntryBytes).toBe(3072);
 	});
 
 	it("deep-merges the new extractMemories char limits", async () => {
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ extractMemories: { maxToolResultChars: 200 } }));
-		expect((await loadConfig(ctx(true))).extractMemories).toEqual({
+		expect((await loadConfig(ctx(true))).config.extractMemories).toEqual({
 			enabled: false,
 			thinkLevel: "high",
 			maxContextTokens: 2000,
@@ -268,16 +268,49 @@ describe("loadConfig", () => {
 		await writeFile(join(globalDir, "memory.json"), "{ not json");
 		await mkdir(join(projectDir, ".pi"), { recursive: true });
 		await writeFile(join(projectDir, ".pi", "memory.json"), JSON.stringify({ memIndexMaxLines: 42 }));
-		expect((await loadConfig(ctx(true))).memIndexMaxLines).toBe(42);
+		expect((await loadConfig(ctx(true))).config.memIndexMaxLines).toBe(42);
 	});
 
 	it("expands ~ only for win32 backslash forms", async () => {
 		// 正斜杠形态两个平台都展开
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~/mem" }));
-		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).memoryDir).toBe(join(homedir(), "mem"));
+		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).config.memoryDir).toBe(join(homedir(), "mem"));
 		// 反斜杠形态只在 win32 展开
 		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\mem" }));
-		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).memoryDir).toBe(join(homedir(), "mem"));
-		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).memoryDir).toBe("~\\mem");
+		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).config.memoryDir).toBe(join(homedir(), "mem"));
+		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).config.memoryDir).toBe("~\\mem");
+	});
+
+	// ── 宿主扩展位（pi 的 nudge 策略） ─────────────────────────────────────────
+	// 两个键已离开 `MemoryConfig`，但用户可见的键名与默认值不变：它们仍从**同一份** `memory.json`
+	// 的 `dream` 子树里读，只是落在 `host` 而不是 `config` 上。
+
+	it("falls back to PI_HOST_DEFAULTS when memory.json says nothing about nudging", async () => {
+		expect((await loadConfig(ctx(true))).host).toEqual(PI_HOST_DEFAULTS);
+	});
+
+	it("reads the nudge policy from memory.json's dream subtree", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ dream: { nudgeAfterSessions: 3 } }));
+		expect((await loadConfig(ctx(true))).host).toEqual({ nudgeAfterSessions: 3, nudgeAfterHours: 24 });
+	});
+
+	// 合并顺序与 `config` 一致：全局先、可信项目后，后者赢；同一文件里的兄弟键互不影响。
+	it("lets the trusted project override the global nudge policy key by key", async () => {
+		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ dream: { nudgeAfterSessions: 3 } }));
+		await mkdir(join(projectDir, ".pi"), { recursive: true });
+		await writeFile(join(projectDir, ".pi", "memory.json"), JSON.stringify({ dream: { nudgeAfterHours: 6 } }));
+		expect((await loadConfig(ctx(true))).host).toEqual({ nudgeAfterSessions: 3, nudgeAfterHours: 6 });
+	});
+
+	it("ignores the project's nudge policy when the project is not trusted", async () => {
+		await mkdir(join(projectDir, ".pi"), { recursive: true });
+		await writeFile(join(projectDir, ".pi", "memory.json"), JSON.stringify({ dream: { nudgeAfterSessions: 1 } }));
+		expect((await loadConfig(ctx(false))).host.nudgeAfterSessions).toBe(5);
+	});
+
+	// 一份坏文件不能带走整个宿主配置：跳过后面的文件照旧生效。
+	it("falls back to defaults for a malformed file instead of throwing", async () => {
+		await writeFile(join(globalDir, "memory.json"), "{ not json");
+		expect((await loadConfig(ctx(true))).host).toEqual(PI_HOST_DEFAULTS);
 	});
 });

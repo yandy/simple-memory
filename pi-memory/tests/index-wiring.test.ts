@@ -14,7 +14,7 @@ const { mockConfigValue, dirRef, dirOverrideRef } = vi.hoisted(() => ({
 		memIndexInjectMaxBytes: 16384,
 		lock: { timeoutMs: 5000, snapshotKeep: 5 },
 		defaults: { model: "test/model", sessionPersistence: { enabled: false } },
-		dream: { nudgeAfterSessions: 5, nudgeAfterHours: 24, thinkLevel: "high" as const },
+		dream: { thinkLevel: "high" as const },
 		sessionSearch: { maxSessions: 10, maxMatches: 5 },
 		autoSurfacing: {
 			enabled: true,
@@ -60,7 +60,10 @@ vi.mock("../src/config", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../src/config")>();
 	return {
 		...actual,
-		loadConfig: vi.fn().mockImplementation(async () => ({ ...mockConfigValue, memoryDir: dirRef.current })),
+		loadConfig: vi.fn().mockImplementation(async () => ({
+			config: { ...mockConfigValue, memoryDir: dirRef.current },
+			host: PI_HOST_DEFAULTS,
+		})),
 	};
 });
 
@@ -118,7 +121,7 @@ vi.mock("../src/index-source", async (importOriginal) => {
 });
 
 import memoryFactory, { moduleStatusLine } from "../index";
-import { DEFAULT_CONFIG, loadConfig, type MemoryConfig } from "../src/config";
+import { DEFAULT_CONFIG, loadConfig, PI_HOST_DEFAULTS, type MemoryConfig } from "../src/config";
 import { DREAM_ACTIONS, INDEX_TRUNCATION_MARKER, MAIN_AGENT_ACTIONS } from "@yandy0725/memory-core";
 
 const LEGACY_TOPIC = [

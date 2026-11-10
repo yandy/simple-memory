@@ -33,8 +33,6 @@ describe("DEFAULT_CONFIG", () => {
 		expect(DEFAULT_CONFIG.extractMemories.maxAssistantChars).toBe(2000);
 		// 其余默认值一并钉住：任何一个被改动都必须让这条用例红。
 		expect(DEFAULT_CONFIG.memoryDir).toBe(defaultMemoryRoot());
-		expect(DEFAULT_CONFIG.dream.nudgeAfterSessions).toBe(5);
-		expect(DEFAULT_CONFIG.dream.nudgeAfterHours).toBe(24);
 		expect(DEFAULT_CONFIG.dream.thinkLevel).toBe("high");
 		expect(DEFAULT_CONFIG.sessionSearch).toEqual({ maxSessions: 10, maxMatches: 5 });
 		expect(DEFAULT_CONFIG.autoSurfacing.thinkLevel).toBe("off");
@@ -42,6 +40,13 @@ describe("DEFAULT_CONFIG", () => {
 		expect(DEFAULT_CONFIG.autoSurfacing.maxInjectionBytes).toBe(10240);
 		expect(DEFAULT_CONFIG.extractMemories.thinkLevel).toBe("high");
 		expect(DEFAULT_CONFIG.extractMemories.maxContextTokens).toBe(2000);
+	});
+
+	// pi 的 nudge 策略（多少个会话 / 多少小时后提醒）是**宿主知识**，已搬去 `pi-memory` 的
+	// `PI_HOST_DEFAULTS`。core 侧钉反断言：键一旦回到 `MemoryConfig.dream`，这里就必须红。
+	it("no longer owns pi's nudge policy", () => {
+		expect("nudgeAfterSessions" in DEFAULT_CONFIG.dream).toBe(false);
+		expect("nudgeAfterHours" in DEFAULT_CONFIG.dream).toBe(false);
 	});
 
 	// v2.3.0 起读写**不再**同口径：注入窗口只取索引最新的 50 行（写入口径保持 200 行 / 25600 B，
