@@ -6,12 +6,16 @@ import {
 	DEFAULT_CONFIG,
 	defaultMemoryRoot,
 	loadConfigFrom,
+	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
 	taskModel,
+	type EffortLevel,
 	type MemoryConfig,
+	type ThinkLevel,
 } from "../src/config.js";
+import type { EffortLevel as EffortLevelFromIndex } from "../src/index.js";
 
 describe("DEFAULT_CONFIG", () => {
 	it("has expected defaults", () => {
@@ -344,6 +348,41 @@ describe("model config", () => {
 	});
 });
 
+describe("modelConfigErrors 的 tasks 参", () => {
+	const cfg = { ...DEFAULT_CONFIG, autoSurfacing: { ...DEFAULT_CONFIG.autoSurfacing, enabled: true } } as MemoryConfig;
+	it("省略 tasks 时 dream 恒在集合内（既有行为不变）", () => {
+		expect(requiredModels(cfg).map((m) => m.task)).toEqual(["dream", "autoSurfacing"]);
+	});
+	it("给定 tasks 时只校验这些任务，dream 不再被强制", () => {
+		expect(requiredModels(cfg, ["autoSurfacing"]).map((m) => m.task)).toEqual(["autoSurfacing"]);
+		expect(modelConfigErrors(cfg, () => false, ["autoSurfacing"])).toHaveLength(1);
+		expect(modelConfigErrors(cfg, () => false, ["autoSurfacing"])[0]).toContain("autoSurfacing");
+	});
+	it("tasks 里的任务被 enabled=false 关掉时不产生错误", () => {
+		const off = { ...cfg, autoSurfacing: { ...cfg.autoSurfacing, enabled: false } } as MemoryConfig;
+		expect(modelConfigErrors(off, () => false, ["autoSurfacing"])).toEqual([]);
+	});
+	it("顺序仍固定为 dream → extractMemories → autoSurfacing", () => {
+		const all = { ...cfg, extractMemories: { ...cfg.extractMemories, enabled: true } } as MemoryConfig;
+		expect(requiredModels(all, ["autoSurfacing", "dream", "extractMemories"]).map((m) => m.task))
+			.toEqual(["dream", "extractMemories", "autoSurfacing"]);
+	});
+
+	// 已裁定的新语义（实现期修订）：**省略 `tasks`** 时 `null` 子树按 falsy 跳过，而不是抛 TypeError。
+	// 带 defaults.model 使其余任务不贡献错误，返回值只反映「null 子树被跳过」这一件事。
+	const withModel = { ...cfg, defaults: { model: "test/shared", sessionPersistence: { enabled: false } } };
+	it("省略 tasks 时 extractMemories 为 null 不抛错：跳过该任务，dream 仍在集合内", () => {
+		const c = { ...withModel, extractMemories: null } as unknown as MemoryConfig;
+		expect(modelConfigErrors(c, () => true)).toEqual([]);
+		expect(requiredModels(c).map((m) => m.task)).toEqual(["dream", "autoSurfacing"]);
+	});
+	it("省略 tasks 时 autoSurfacing 为 null 不抛错：跳过该任务，dream 仍在集合内", () => {
+		const c = { ...withModel, autoSurfacing: null } as unknown as MemoryConfig;
+		expect(modelConfigErrors(c, () => true)).toEqual([]);
+		expect(requiredModels(c).map((m) => m.task)).toEqual(["dream"]);
+	});
+});
+
 describe("taskModel", () => {
 	it("prefers the per-task model and falls back to defaults.model", () => {
 		const shared = { ...DEFAULT_CONFIG, defaults: { model: "shared/model" } };
@@ -351,5 +390,66 @@ describe("taskModel", () => {
 		expect(taskModel(shared, "dream")).toBe("shared/model");
 		expect(taskModel({ ...shared, dream: { ...shared.dream, model: "own/model" } }, "dream")).toBe("own/model");
 		expect(taskModel({ ...shared, defaults: undefined }, "autoSurfacing")).toBeUndefined();
+	});
+});
+
+describe("mergeConfig", () => {
+	it("深合并、跳过 undefined 值、保留同层其它键、不改写 base", () => {
+		const base = DEFAULT_CONFIG;
+		const out = mergeConfig(base, {
+			memIndexMaxLines: 99,
+			autoSurfacing: { maxFiles: 7 },
+			lock: { timeoutMs: undefined },
+		});
+		expect(out.memIndexMaxLines).toBe(99);
+		expect(out.autoSurfacing.maxFiles).toBe(7);
+		expect(out.autoSurfacing.maxEntryBytes).toBe(DEFAULT_CONFIG.autoSurfacing.maxEntryBytes); // 同层其它键保留
+		expect(out.lock.timeoutMs).toBe(DEFAULT_CONFIG.lock.timeoutMs); // undefined 被跳过
+		expect(base.memIndexMaxLines).toBe(DEFAULT_CONFIG.memIndexMaxLines); // base 未被改写
+	});
+	it("null 子树原样带入（与 loadConfigFrom 的既有语义一致）", () => {
+		expect(mergeConfig(DEFAULT_CONFIG, { extractMemories: null }) as any).toMatchObject({ extractMemories: null });
+	});
+	it("与 loadConfigFrom 读同一份 JSON 的结果逐字相等", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "mergecfg-"));
+		try {
+			const file = join(dir, "memory.json");
+			const overlay = { memIndexMaxBytes: 1234, autoSurfacing: { enabled: false, maxFiles: 2 } };
+			await writeFile(file, JSON.stringify(overlay));
+			const viaFile = await loadConfigFrom([file]);
+			const viaMerge = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
+			expect(viaMerge).toEqual(viaFile);
+		} finally {
+			// 本文件顶部的 afterEach 只清它自己建的两个目录；这里自建的临时目录要自己清，
+			// 否则断言失败时会在 tmpdir 里留下一堆 mergecfg-* 目录。
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("EffortLevel", () => {
+	it("EffortLevel 接受宿主的任意档位，ThinkLevel 是它的别名", () => {
+		const dshEffort: EffortLevel = "max"; // dsh 的 DeepSeek 路线档位，旧 ThinkLevel 表达不出
+		const piEffort: ThinkLevel = dshEffort; // 双向可赋值 = 同一类型
+		const back: EffortLevel = piEffort; // ← 另一个方向，上面那句注释才是真的
+		expect([dshEffort, piEffort, back]).toEqual(["max", "max", "max"]);
+	});
+});
+
+describe("公开出口", () => {
+	it("带上 1.1.0 的三个加法", async () => {
+		const api = await import("../src/index.js");
+		expect(typeof api.mergeConfig).toBe("function");
+		// 精确钉住形参个数（而不是 `toBeGreaterThanOrEqual`：它对多一个或少一个形参都报绿）。
+		// 注：`Function.length` 数的是「第一个带默认值/剩余参之前」的形参，TS 的可选参 `tasks?`
+		// 编译后就是普通形参，**计入** length：requiredModels(cfg, tasks?) = 2，
+		// modelConfigErrors(cfg, resolve, tasks?) = 3。「tasks 仍是可选」由类型系统钉：
+		// 本文件与 dsh-memory 都有省略它的调用，它一旦变必传那些调用就编译不过。
+		expect(api.requiredModels.length).toBe(2);
+		expect(api.modelConfigErrors.length).toBe(3);
+		// EffortLevel 是类型导出，运行时没有对应值：从入口做类型导入能编译通过，即证明
+		// index.ts 的 `export type { EffortLevel }` 真的把它放上了公开面。
+		const fromIndex: EffortLevelFromIndex = "max";
+		expect(fromIndex).toBe("max");
 	});
 });

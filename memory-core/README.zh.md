@@ -162,6 +162,18 @@ export interface HostTranscriptPort {
 | 配置文件在哪、项目是否受信任 | 宿主知识；`loadConfigFrom(files)` 收显式的文件列表 |
 | 数会话数以决定何时提示 consolidate | 需要宿主的会话存储 |
 
+### 1.1.0 新增的配置辅助
+
+- `mergeConfig(base, overlay)` 把一个内存里的对象深合并进 `MemoryConfig`。宿主的配置**不是文件**时用它
+  —— 比如 cordis 行在激活插件时递进来的 `config:` 对象。`loadConfigFrom(files)` 现在委托给它，因此
+  只有这一份合并实现，两条路径始终一致。
+- `EffortLevel` 是配置里所有思考/推理档位的类型。它是**不透明字符串**：core 原样透传，不解释、不校验。
+  合法值属于宿主数据（dsh 里按 provider 路线而异），所以闭枚举是错的形状。`ThinkLevel` 作为 deprecated
+  别名保留，已有适配层的类型重导出不会破。
+- `modelConfigErrors(cfg, resolve, tasks?)` 与 `requiredModels(cfg, tasks?)` 多了一个可选 `tasks`，
+  让适配层声明**自己真正实现了哪些任务** —— 不再被迫为它没有的任务索要模型（例如没有 dream 支持的
+  适配层）。省略 `tasks` 保持旧行为：dream 恒在必需集合内，另两个按 `enabled` 决定。
+
 ### pi 适配层的对应关系
 
 | 需要 | core | pi |

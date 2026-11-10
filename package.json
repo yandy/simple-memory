@@ -7,7 +7,9 @@
 		"typecheck": "npm run typecheck --workspaces --if-present",
 		"lint": "npm run lint --workspaces --if-present",
 		"format": "npm run format --workspaces --if-present",
-		"check:host-deps": "node scripts/check-host-deps.mjs"
+		"check:host-deps": "node scripts/check-host-deps.mjs",
+		"check:memory-core-deps": "node scripts/check-memory-core-deps.mjs",
+		"smoke:registry": "node scripts/registry-smoke.mjs"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.6.4",

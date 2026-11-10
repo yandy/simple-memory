@@ -2,7 +2,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-export type ThinkLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+/**
+ * 宿主的思考/推理档位，**不透明字符串**：core 原样透传，不解释、不校验。
+ * pi 的合法值是 `off|minimal|low|medium|high|xhigh`；dsh 的合法值按 provider 路线是数据
+ * （DeepSeek 路线 `off|low|high|max`），所以 core 不能把它写成闭枚举。
+ * 合法性由适配层在启动期用宿主的 resolve 接口校验。
+ */
+export type EffortLevel = string;
+/** @deprecated pi 词汇，等价于 `EffortLevel`；保留是为了已发布适配层的类型重导出不破。 */
+export type ThinkLevel = EffortLevel;
 
 /** Session persistence configuration for headless memory-agent sub-sessions. */
 export interface SessionPersistenceConfig {
@@ -22,7 +30,7 @@ export interface DefaultsConfig {
 export interface AutoSurfacingConfig {
 	enabled: boolean;
 	model?: string;
-	thinkLevel: ThinkLevel;
+	thinkLevel: EffortLevel;
 	maxFiles: number;
 	/**
 	 * 单条 entry 注入正文的字节上限。
@@ -37,7 +45,7 @@ export interface ExtractMemoriesConfig {
 	/** 每轮自动提取。opt-in：默认 `false` —— 开启后每轮结束都会跑一次 headless 模型调用。 */
 	enabled: boolean;
 	model?: string;
-	thinkLevel: ThinkLevel;
+	thinkLevel: EffortLevel;
 	maxContextTokens: number;
 	/** 渲染进 extract prompt 时，单条 tool_result 的字符上限。 */
 	maxToolResultChars: number;
@@ -72,7 +80,7 @@ export interface MemoryConfig {
 		nudgeAfterSessions: number;
 		nudgeAfterHours: number;
 		model?: string;
-		thinkLevel: ThinkLevel;
+		thinkLevel: EffortLevel;
 		sessionPersistence?: SessionPersistenceConfig;
 	};
 	sessionSearch: { maxSessions: number; maxMatches: number };
@@ -125,13 +133,32 @@ export function taskModel(cfg: MemoryConfig, task: ModelTask): string | undefine
 	return cfg[task]?.model ?? cfg.defaults?.model;
 }
 
-/** 会执行的任务及其模型值。dream 恒在执行集合内（没有包级开关可以让它不跑）。 */
-export function requiredModels(cfg: MemoryConfig): Array<{ task: ModelTask; value: string | undefined }> {
-	const out: Array<{ task: ModelTask; value: string | undefined }> = [
-		{ task: "dream", value: taskModel(cfg, "dream") },
-	];
-	if (cfg.extractMemories.enabled) out.push({ task: "extractMemories", value: taskModel(cfg, "extractMemories") });
-	if (cfg.autoSurfacing.enabled) out.push({ task: "autoSurfacing", value: taskModel(cfg, "autoSurfacing") });
+/**
+ * 会执行的任务及其模型值。
+ *
+ * `tasks`：适配层声明自己实现了哪些任务（如 dsh 本轮不实现 dream，就传 `["autoSurfacing"]`）。
+ * 省略 = 既有行为不变（dream 恒在执行集合内，另两个按 `enabled`）；给定则**只**考虑这些任务，
+ * dream 不再被强制加入，另两个仍按 `enabled` 过滤。顺序与调用方列举顺序无关，恒为
+ * dream → extractMemories → autoSurfacing。
+ *
+ * 缺省路径上**不是**逐字不变，唯一的例外（实现期已裁定）：`deepMerge` 会把用户写的
+ * `"extractMemories": null` / `"autoSurfacing": null` 原样带进来，旧实现直接读 `.enabled` 会抛
+ * `TypeError`，现在按 falsy 跳过该任务。这与 `taskModel` 对 `"dream": null` 的既有防御同一取向：
+ * 配置读不懂时应给出「该任务关闭 / 没有模型」这种可读结果，而不是把启动校验变成一句看不懂的
+ * 初始化失败。
+ */
+export function requiredModels(
+	cfg: MemoryConfig,
+	tasks?: readonly ModelTask[],
+): Array<{ task: ModelTask; value: string | undefined }> {
+	const order: readonly ModelTask[] = ["dream", "extractMemories", "autoSurfacing"];
+	const out: Array<{ task: ModelTask; value: string | undefined }> = [];
+	for (const task of order) {
+		if (tasks !== undefined && !tasks.includes(task)) continue;
+		// dream 没有包级开关：进了候选即在执行集合内（省略 `tasks` 时它恒是候选）。另两个看 `enabled`。
+		// 这里用 `?.`，与 `taskModel` 同理：`deepMerge` 会把用户写的 `"extractMemories": null` 原样带进来。
+		if (task === "dream" || cfg[task]?.enabled) out.push({ task, value: taskModel(cfg, task) });
+	}
 	return out;
 }
 
@@ -139,10 +166,15 @@ export function requiredModels(cfg: MemoryConfig): Array<{ task: ModelTask; valu
  * 启动校验：空数组 = 通过。
  * `resolve` 由调用方注入（生产时是 `(v) => resolveModel(v, ctx.modelRegistry) !== undefined`），
  * 因此本函数不依赖 SDK 的 registry 类型，可用假 resolve 单测。
+ * `tasks`：原样透传给 `requiredModels`（只校验列出的任务；`null` 子树跳过那个例外同上）。
  */
-export function modelConfigErrors(cfg: MemoryConfig, resolve: (value: string) => boolean): string[] {
+export function modelConfigErrors(
+	cfg: MemoryConfig,
+	resolve: (value: string) => boolean,
+	tasks?: readonly ModelTask[],
+): string[] {
 	const errors: string[] = [];
-	for (const { task, value } of requiredModels(cfg)) {
+	for (const { task, value } of requiredModels(cfg, tasks)) {
 		if (value === undefined) {
 			errors.push(`no model for ${task} — set "${task}.model" or "defaults.model" in memory.json`);
 		} else if (!resolve(value)) {
@@ -188,6 +220,14 @@ function deepMerge<T>(base: T, over: Partial<T>): T {
 	return out;
 }
 
+/**
+ * 把 `overlay` 深合并到 `base` 上：`undefined` 跳过、plain object 递归、数组整体替换、`null` 子树原样带入。
+ * 返回**新对象**，不改 `base` —— 这是适配层在内存里覆盖配置的唯一入口（与 `loadConfigFrom` 共用同一份语义）。
+ */
+export function mergeConfig(base: MemoryConfig, overlay: unknown): MemoryConfig {
+	return deepMerge(base, (overlay ?? {}) as Partial<MemoryConfig>);
+}
+
 function readJsonSafe(path: string): Partial<MemoryConfig> {
 	try {
 		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf-8")) as Partial<MemoryConfig>;
@@ -228,7 +268,7 @@ export interface LoadConfigFromOptions {
 export async function loadConfigFrom(files: string[], opts: LoadConfigFromOptions = {}): Promise<MemoryConfig> {
 	let cfg: MemoryConfig = { ...DEFAULT_CONFIG, memoryDir: opts.memoryRoot ?? defaultMemoryRoot() };
 	for (const file of files) {
-		cfg = deepMerge(cfg, readJsonSafe(file));
+		cfg = mergeConfig(cfg, readJsonSafe(file));
 	}
 	cfg.memoryDir = expandTilde(cfg.memoryDir, opts.platform ?? process.platform);
 	return cfg;

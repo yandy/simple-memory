@@ -12,7 +12,7 @@ same files.
 |---|---|---|
 | [memory-core](./memory-core) | Harness-agnostic layer: disk format, `MemoryStore`, two-level locking, snapshots, project paths, injection policy, dream/extract orchestration, and the neutral `memory` tool contract (JSON Schema + handler). Imports only `node:*`. | `@yandy0725/memory-core` |
 | [pi-memory](./pi-memory) | pi adapter: extension wiring, `/memory` and `/dream`, typebox schema + pi-tui rendering, prompt-cache section freezing, headless sub-sessions, session search. | `@yandy0725/pi-memory` |
-| [dsh-memory](./dsh-memory) | DeepSeek harness (`@deepseek-ai/dsh`, cordis) adapter. **Placeholder — not implemented.** | `@yandy0725/dsh-memory` |
+| [dsh-memory](./dsh-memory) | DeepSeek harness (`@deepseek-ai/dsh`, cordis) adapter: cordis bundle, `memory_index` section, `memory` tool + `/memory`, per-turn recall — `extractMemories`/`dream` not this round. | `@yandy0725/dsh-memory` |
 
 An adapter owns the host-specific half — when to inject, how to render, which model to call. `memory-core`
 owns the half that must be identical everywhere, which is why the files below are shared rather than
@@ -30,7 +30,9 @@ otherwise.
 
 Each project directory holds `MEMORY.md` (the index), one `*.md` per memory, `.lock`, `.backups/`,
 `.dream-meta.json`, and `sessions/`. The `memoryDir` config key overrides the root; `~` and `~/` are
-expanded and relative values are resolved against the working directory.
+expanded and relative values are resolved against the working directory. `memoryDir` is **per-harness configuration**
+(pi reads it from `memory.json`, dsh from its cordis row `config:`): if you override it, override it in **every**
+harness, or the two harnesses write different directories and stop sharing.
 
 The disk format is byte-for-byte the one `pi-memory` 2.x writes: YAML frontmatter with
 `name`/`description`/`type`/`created`/`modified`, one index line per memory
@@ -60,16 +62,16 @@ directory exists — so check the hint *before* writing anything with 3.0 if you
 ## Development
 
 ```bash
-npm ci                        # root + both testable workspaces
-npm test                      # memory-core and pi-memory
+npm ci                        # root + all three workspaces
+npm test                      # memory-core, pi-memory and dsh-memory
 npm run typecheck && npm run lint
 npm run build -w memory-core  # dist/ (ESM + .d.ts + maps); CI validates the packed tarball
 npm run check:host-deps       # host packages must be peerDependencies, never dependencies
+npm run check:memory-core-deps # dev resolves the monorepo source, runtime the registry copy
+npm run smoke:registry        # installs the adapter tarball in a clean dir, pulling memory-core from the registry
 ```
 
 `memory-core`'s `src/**` may import only `node:*` and relative paths — `memory-core/tests/neutrality.test.ts`
 fails the build if that ever changes, and it is the only reason a second harness can depend on the package.
-
-`dsh-memory` has no code, so it has no test script; `npm test` skips it.
 
 Releases: see [docs/guides/release.md](./docs/guides/release.md).

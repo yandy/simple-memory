@@ -58,6 +58,7 @@ export {
 	defaultMemoryRoot,
 	expandTilde,
 	loadConfigFrom,
+	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
@@ -66,6 +67,7 @@ export {
 export type {
 	AutoSurfacingConfig,
 	DefaultsConfig,
+	EffortLevel,
 	ExtractMemoriesConfig,
 	LoadConfigFromOptions,
 	MemoryConfig,

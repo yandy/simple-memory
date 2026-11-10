@@ -11,6 +11,9 @@
  * - 源码中 import 了宿主提供包的 workspace，必须在 `peerDependencies` 中声明该包，
  *   由宿主在运行时提供实例；其中 typebox 系（`typebox` / `@sinclair/typebox`）按宿主
  *   要求使用 `*` 范围；
+ * - `@deepseek-ai/*` 宿主包按 scope 前缀识别（子路径说明符归一化成包名前两段），
+ *   `@deepseek-ai/dsh-*` 的 peer 范围须同时含下界 `>=0.2.2-rc.1` 与上界 `<0.3.0`，
+ *   `@deepseek-ai/cordis` 允许 `~4.1.0`；
  * - `@earendil-works/*`、`@mariozechner/*` 等核心包的范围由仓库约定自行决定
  *   （当前为 `>=<最低宿主版本>`），本脚本只要求声明存在。
  *
@@ -35,6 +38,9 @@ const HOST_PROVIDED_PACKAGES = new Set([
 	"@sinclair/typebox",
 	"typebox",
 ]);
+
+/** 以 scope 前缀识别 dsh 宿主包（对每个命中说明符归一化成包名前两段）。 */
+const HOST_PROVIDED_SCOPES = ["@deepseek-ai/"];
 
 /** 宿主要求以 `*` 声明范围的包（typebox 系）。 */
 const WILDCARD_RANGE_PACKAGES = new Set(["typebox", "@sinclair/typebox"]);
@@ -83,6 +89,11 @@ function collectSourceFiles(workspaceDir) {
 	return files;
 }
 
+/** `@scope/pkg/subpath` 归一化为包名（前两段）。 */
+function normalizeScopedPackage(specifier) {
+	return specifier.split("/").slice(0, 2).join("/");
+}
+
 /** 源码中出现的宿主提供包（去重、排序）。 */
 function collectHostImports(files) {
 	const imported = new Set();
@@ -91,7 +102,12 @@ function collectHostImports(files) {
 		for (const pattern of IMPORT_PATTERNS) {
 			for (const match of source.matchAll(pattern)) {
 				const specifier = SUBPATH_TO_PACKAGE.get(match[1]) ?? match[1];
-				if (HOST_PROVIDED_PACKAGES.has(specifier)) imported.add(specifier);
+				if (HOST_PROVIDED_PACKAGES.has(specifier)) {
+					imported.add(specifier);
+					continue;
+				}
+				const scope = HOST_PROVIDED_SCOPES.find((s) => specifier.startsWith(s));
+				if (scope !== undefined) imported.add(normalizeScopedPackage(specifier));
 			}
 		}
 	}
@@ -118,6 +134,19 @@ for (const workspace of rootPkg.workspaces ?? []) {
 		);
 	}
 
+	// dsh 系宿主包按 scope 前缀识别，不落在上面的精确名集合里，但同样禁止进 dependencies：
+	// 整个设计（docs/guides/dependencies.md「dsh 宿主包」）要求宿主包只活在 peer/dev，装进
+	// dependencies 会绕开「peer optional → 缺失时插件保持 inactive」的降级路径。
+	for (const name of Object.keys(deps)
+		.filter((name) => HOST_PROVIDED_SCOPES.some((scope) => name.startsWith(scope)))
+		.sort()) {
+		problems.push(
+			`${label}: dependencies["${name}"] = "${deps[name]}"，宿主已提供该包（dsh 系）。` +
+				`请改为 peerDependencies["${name}"]（范围 ">=0.2.2-rc.1 <0.3.0"，@deepseek-ai/cordis 用 "~4.1.0"），` +
+				`不能进 dependencies（安装副本会造成重复运行时模块，且绕过 peer optional 的降级路径）`,
+		);
+	}
+
 	for (const name of collectHostImports(collectSourceFiles(workspaceDir))) {
 		const peerRange = peers[name];
 		if (peerRange === undefined) {
@@ -128,6 +157,16 @@ for (const workspace of rootPkg.workspaces ?? []) {
 			problems.push(
 				`${label}: peerDependencies["${name}"] = "${peerRange}"，应为 "*"（宿主提供包按宿主约定使用 "*" 范围）`,
 			);
+		}
+		if (name.startsWith("@deepseek-ai/dsh-")) {
+			if (!peerRange.includes(">=0.2.2-rc.1") || !peerRange.includes("<0.3.0")) {
+				problems.push(
+					`${label}: peerDependencies["${name}"] = "${peerRange}"，应同时含下界 ">=0.2.2-rc.1" 与上界 "<0.3.0"`,
+				);
+			}
+		}
+		if (name === "@deepseek-ai/cordis" && peerRange !== "~4.1.0") {
+			problems.push(`${label}: peerDependencies["${name}"] = "${peerRange}"，应为 "~4.1.0"`);
 		}
 	}
 }

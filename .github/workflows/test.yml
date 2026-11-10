@@ -33,13 +33,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check:host-deps
+      - run: npm run check:memory-core-deps
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
 
   # 仓内解析走 memory-core 的源码（vitest alias + tsconfig paths），所以 `test` job 测的是逻辑。
-  # 这个 job 把 alias 关掉，让 pi-memory 的测试经包 exports 打到 memory-core/dist —— 用户拿到的
-  # 那条解析路径必须被真实执行一次，否则首次发布就是它的第一次运行。
+  # 这个 job 把 alias 关掉，让 pi-memory 与 dsh-memory 的测试经包 exports 打到 memory-core/dist ——
+  # 用户拿到的那条解析路径必须被真实执行一次，否则首次发布就是它的第一次运行。
   test-dist:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -50,10 +51,40 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci
-      - run: npm run build -w memory-core
+      - run: npm run build -w memory-core && npm run build -w dsh-memory
+      # dsh 宿主包只允许 `import type`（零运行时 import）：dist/**/*.js 里必须零 @deepseek-ai
+      # 命中。只 grep .js —— .d.ts 里出现宿主类型是合法的（type-only import 被 tsc 擦掉）。
+      - name: Assert no @deepseek-ai runtime imports in dsh-memory dist
+        run: |
+          if grep -rq "@deepseek-ai" dsh-memory/dist --include="*.js"; then
+            echo "::error::dsh-memory/dist contains a runtime @deepseek-ai import"
+            grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"
+            exit 1
+          fi
       - run: npm test -w pi-memory
         env:
           MEMORY_CORE_FROM_DIST: "1"
+      - run: npm test -w dsh-memory
+        env:
+          MEMORY_CORE_FROM_DIST: "1"
+
+  # 上一个 job 打的是**仓内**的 memory-core/dist（workspace 符号链接）。用户机器上解析到的是
+  # registry 上的那个版本，所以这里真装一次：把适配层打成 tarball，装进干净目录、依赖只从 registry
+  # 拉，再断言解析到的 memory-core 在干净目录内、版本满足声明的范围、且能真读写。
+  # 未发布的适配层（dsh-memory 目前 private: true）在 registry 上没有满足范围的版本时只打 notice 跳过；
+  # 去掉 private 之后同一条件变成失败。
+  registry-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w memory-core && npm run build -w dsh-memory
+      - run: npm run smoke:registry
 
   # 20.16.0 是 memory-core 的 engines 下限（dsh 生态声明的最低宿主版本），24 是开发版本。
   # 这个 job 只验证运行时形状，不跑 vitest：开发工具链的 Node 下限高于 engines。

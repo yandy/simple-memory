@@ -1,0 +1,399 @@
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { DEFAULT_CONFIG, LOCK_FILE, MemoryStore, mergeConfig, projectDirName } from "@yandy0725/memory-core";
+import type { MemoryConfig } from "@yandy0725/memory-core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createMemoryCommand, describeHolder, renderStatus } from "../src/commands.js";
+import type { CommandDeps } from "../src/commands.js";
+import type { SessionMemoryRuntime } from "../src/store-registry.js";
+
+/** 测试级临时目录总根：所有记忆目录都建在它下面，`afterEach` 一次 `rm -rf` 全清。 */
+let dir: string;
+
+beforeEach(async () => {
+	dir = await mkdtemp(join(tmpdir(), "am-cmd-"));
+	// unlock 的重试路径会调 core 的 `resolveMemoryDir`（= 一次 git 探测）。与 store-registry / assembly
+	// 同一套 hermetic 手法：绝不读开发者机器的 global / system git config。
+	const emptyGitConfig = join(dir, "gitconfig-empty");
+	await writeFile(emptyGitConfig, "", "utf8");
+	vi.stubEnv("GIT_CONFIG_GLOBAL", emptyGitConfig);
+	vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+});
+
+afterEach(async () => {
+	vi.unstubAllEnvs();
+	await rm(dir, { recursive: true, force: true });
+});
+
+/** 从不污染 DEFAULT_CONFIG 的副本派生一份合法的 MemoryConfig，只覆盖 memoryDir。 */
+function makeConfig(memoryDir: string, over: unknown = {}): MemoryConfig {
+	return mergeConfig(structuredClone(DEFAULT_CONFIG), { memoryDir, ...(over as object) });
+}
+
+function makeStore(memoryDir: string): MemoryStore {
+	const cfg = makeConfig(memoryDir);
+	return new MemoryStore({
+		memoryDir,
+		indexMaxLines: cfg.memIndexMaxLines,
+		indexMaxBytes: cfg.memIndexMaxBytes,
+		lock: cfg.lock,
+	});
+}
+
+function makeRuntime(
+	memoryDir: string,
+	store: MemoryStore | null,
+	over: Partial<SessionMemoryRuntime> = {},
+): SessionMemoryRuntime {
+	const base: SessionMemoryRuntime = {
+		sessionId: "s1",
+		cwd: join(dir, "cwd"),
+		config: makeConfig(memoryDir),
+		store,
+		memoryDir,
+		error: null,
+		surfacing: { available: true, reason: null },
+	};
+	return { ...base, ...over };
+}
+
+function makeDeps(rt: SessionMemoryRuntime | undefined, warnings: string[] = [], over: Partial<CommandDeps> = {}): CommandDeps {
+	return {
+		registry: { get: () => rt },
+		indexCache: { refresh: async () => {} },
+		warnings,
+		...over,
+	};
+}
+
+function handlerFor(rt: SessionMemoryRuntime | undefined, warnings: string[] = [], over: Partial<CommandDeps> = {}) {
+	return createMemoryCommand(makeDeps(rt, warnings, over)).handler;
+}
+
+const HELD_LOCK = { op: "add", pid: 4242, hostname: "somehost", startedAt: "2026-11-09T12:00:00.000Z" };
+
+/**
+ * `describeHolder(HELD_LOCK)` 的**字面量**期望值，从 `src/commands.ts` 的格式
+ * `` `${op} (pid ${pid} on ${hostname}, started ${startedAt})` `` 逐字抄来 —— 刻意写死，
+ * 不用 `describeHolder(HELD_LOCK)` 自证：那样把 hostname 从格式里删掉时两边同时变，测试仍然绿。
+ * hostname 是硬要求：`.lock` 是记忆目录里的普通文件，同一目录可能被挂载到多台机器，
+ * 只看 pid 无法区分「本机已死的进程」与「别的机器正在跑」。
+ */
+const HELD_LOCK_DESCRIPTION = "add (pid 4242 on somehost, started 2026-11-09T12:00:00.000Z)";
+
+describe("describeHolder", () => {
+	it("pins the literal format, hostname included", () => {
+		expect(describeHolder(HELD_LOCK)).toBe(HELD_LOCK_DESCRIPTION);
+	});
+});
+
+describe("createMemoryCommand definition", () => {
+	it("exposes a host-valid command definition", () => {
+		const cmd = createMemoryCommand(makeDeps(undefined));
+		expect(cmd.name).toBe("memory");
+		expect(cmd.name).toMatch(/^[a-z][a-z0-9_-]*$/);
+		expect(typeof cmd.description).toBe("string");
+		expect(cmd.description.length).toBeGreaterThan(0);
+		expect(typeof cmd.input.hint).toBe("string");
+		expect(cmd.input.hint.length).toBeGreaterThan(0);
+		expect(typeof cmd.handler).toBe("function");
+	});
+});
+
+describe("renderStatus", () => {
+	it("renders all six status lines with the resolved directory", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const text = await renderStatus(rt, []);
+
+		expect(text).toContain(`Dir: ${memoryDir}`);
+		expect(text).toMatch(/^Index: /m);
+		expect(text).toMatch(/^Inject: /m);
+		expect(text).toMatch(/^Entries: /m);
+		expect(text).toMatch(/^Modules: /m);
+		expect(text).toMatch(/^Lock: /m);
+	});
+
+	it("reports Index from write capacity and Inject from injection capacity", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		const rt = makeRuntime(memoryDir, store);
+
+		for (let i = 0; i < 60; i++) {
+			await store.addEntry({ name: `Entry ${i}`, description: `note ${i}`, body: `body ${i}` });
+		}
+
+		const text = await renderStatus(rt, []);
+		// 写入口径不截断（60 行全在索引里），注入口径只取最新 50 行 —— 两个数若对调，这里就红。
+		expect(text).toContain(`Index: 60/${rt.config.memIndexMaxLines} lines`);
+		expect(text).toContain(`Inject: 50/${rt.config.memIndexInjectMaxLines} lines`);
+	});
+
+	it("shows autoSurfacing on(model) or off(reason) in the Modules line", async () => {
+		const memoryDir = join(dir, "mem");
+		const on = makeRuntime(memoryDir, makeStore(memoryDir), {
+			config: makeConfig(memoryDir, { autoSurfacing: { model: "deepseek-official/deepseek-flash" } }),
+			surfacing: { available: true, reason: null },
+		});
+		expect(await renderStatus(on, [])).toContain("Modules: autoSurfacing=on(deepseek-official/deepseek-flash)");
+
+		const reason = "no model configured — set autoSurfacing.model or defaults.model in the plugin row config";
+		const off = makeRuntime(memoryDir, makeStore(memoryDir), {
+			surfacing: { available: false, reason },
+		});
+		expect(await renderStatus(off, [])).toContain(`Modules: autoSurfacing=off(${reason})`);
+	});
+
+	it("renders the Lock line as held by <literal holder>, hostname included", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		await mkdir(memoryDir, { recursive: true });
+		await writeFile(join(memoryDir, LOCK_FILE), JSON.stringify(HELD_LOCK), "utf8");
+
+		const text = await renderStatus(rt, []);
+		expect(text).toContain(`Lock: held by ${HELD_LOCK_DESCRIPTION}`);
+	});
+
+	it("renders an unreadable lock as unreadable with the --force hint", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		await mkdir(memoryDir, { recursive: true });
+		// 不可解析的锁体 —— core 的 readLockStatus 正是这样判 `unreadable`（不 stub core）。
+		await writeFile(join(memoryDir, LOCK_FILE), "{not a lock record", "utf8");
+
+		const text = await renderStatus(rt, []);
+		expect(text).toContain("Lock: unreadable — run /memory unlock --force");
+		expect(text).not.toContain("Lock: held by");
+	});
+
+	it("prints the Config line only when there are warnings, each verbatim", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+
+		expect(await renderStatus(rt, [])).not.toContain("Config:");
+
+		const warnings = ['unknown config key "memroyDir" — ignored', 'config key "memoryDir" must be string, got number — ignored'];
+		const text = await renderStatus(rt, warnings);
+		expect(text).toContain("Config: 2 warning(s)");
+		for (const w of warnings) expect(text).toContain(w);
+	});
+
+	it("names unimplemented modules in the Modules line, and only when the user configured them", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+
+		// 没配 dream / extractMemories 的用户不该看到它们（避免噪声）。
+		const quiet = await renderStatus(rt, []);
+		expect(quiet).toContain("Modules: autoSurfacing=on(no model)");
+		expect(quiet).not.toContain("not implemented");
+
+		// 配了就地报：白名单从 DEFAULT_CONFIG 派生，这两棵子树天生能通过校验却没有任何效果。
+		const loud = await renderStatus(rt, [], ["dream", "extractMemories"]);
+		expect(loud).toContain(
+			"Modules: autoSurfacing=on(no model), dream=not implemented in this adapter, extractMemories=not implemented in this adapter",
+		);
+	});
+
+	it("threads deps.unimplementedModules into the rendered status", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+
+		const result = await handlerFor(rt, [], { unimplementedModules: ["dream"] })({
+			agent: { session: { id: "s1" } },
+			rawInput: "",
+		});
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("dream=not implemented in this adapter");
+		expect(result.text).not.toContain("extractMemories=");
+	});
+});
+
+describe("misconfigured states", () => {
+	it("returns a success result naming each config error line", async () => {
+		const error = "dsh-memory row config must be an object\nsecond line of the error";
+		const rt = makeRuntime(join(dir, "unused"), null, { error, memoryDir: null });
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "" });
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("misconfigured");
+		for (const line of error.split("\n")) expect(result.text).toContain(line);
+	});
+
+	it("returns a success result when the session has no runtime at all", async () => {
+		const result = await handlerFor(undefined)({ agent: { session: { id: "ghost" } }, rawInput: "" });
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("not initialized");
+	});
+
+	it("refreshes the index cache before reporting status", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const refresh = vi.fn(async () => {});
+		const cmd = createMemoryCommand({ registry: { get: () => rt }, indexCache: { refresh }, warnings: [] });
+
+		const result = await cmd.handler({ agent: { session: { id: "s1" } }, rawInput: "" });
+
+		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(result.kind).toBe("success");
+	});
+});
+
+describe("unlock", () => {
+	it("describes the holder and deletes nothing without --force", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const lockPath = join(memoryDir, LOCK_FILE);
+		await mkdir(memoryDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock" });
+
+		expect(existsSync(lockPath)).toBe(true);
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain(`Lock is held by ${HELD_LOCK_DESCRIPTION}`);
+		expect(result.text).toContain("--force");
+	});
+
+	it("describes an unreadable lock and deletes nothing without --force", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const lockPath = join(memoryDir, LOCK_FILE);
+		await mkdir(memoryDir, { recursive: true });
+		await writeFile(lockPath, "{not a lock record", "utf8");
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock" });
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("Lock is unreadable — re-run /memory unlock --force to remove it.");
+		expect(existsSync(lockPath)).toBe(true);
+	});
+
+	it("returns an error and touches nothing when the session has no runtime", async () => {
+		const memoryDir = join(dir, "mem");
+		const lockPath = join(memoryDir, LOCK_FILE);
+		await mkdir(memoryDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+
+		const result = await handlerFor(undefined)({ agent: { session: { id: "ghost" } }, rawInput: "unlock --force" });
+
+		expect(result.kind).toBe("error");
+		expect(result.text).toContain("Cannot unlock");
+		// 不能死路一条：文案要说清下一步去哪里。
+		expect(result.text).toContain("/memory");
+		expect(existsSync(lockPath)).toBe(true);
+	});
+
+	it("re-resolves the directory from rt.cwd when the session started in the error state", async () => {
+		// 以配置错误启动的会话：store / memoryDir 都是 null，但 rt.cwd 有值。清锁是崩溃遗留 `.lock`
+		// 的唯一人工入口，所以这里按需重解一次目录（pi 在同类状态下也是这么做的）。
+		const root = join(dir, "mem-root");
+		const cwd = join(dir, "cwd");
+		await mkdir(cwd, { recursive: true });
+		// 与 store-registry 的解析同式（普通非 git 目录 → `<root>/local/<escaped cwd>`）—— 刻意不用
+		// `resolveMemoryDir` 自证：那会把实现里的错公式同时写进期望值。
+		const resolvedDir = join(resolve(root), "local", projectDirName(resolve(cwd)));
+		const lockPath = join(resolvedDir, LOCK_FILE);
+		await mkdir(resolvedDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+		// 同目录里放一个兄弟文件：「只删 .lock」在重试路径上同样成立。
+		const sibling = join(resolvedDir, "deadbeef.md");
+		await writeFile(sibling, "sibling entry body\n", "utf8");
+
+		const rt = makeRuntime(root, null, {
+			memoryDir: null,
+			cwd,
+			error: "dsh-memory row config must be an object",
+		});
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock --force" });
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("Memory lock removed.");
+		expect(existsSync(lockPath)).toBe(false);
+		expect(existsSync(sibling)).toBe(true);
+		expect(await readFile(sibling, "utf8")).toBe("sibling entry body\n");
+	});
+
+	it("still requires --force on the re-resolve path", async () => {
+		const root = join(dir, "mem-root");
+		const cwd = join(dir, "cwd");
+		await mkdir(cwd, { recursive: true });
+		const resolvedDir = join(resolve(root), "local", projectDirName(resolve(cwd)));
+		const lockPath = join(resolvedDir, LOCK_FILE);
+		await mkdir(resolvedDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+
+		const rt = makeRuntime(root, null, { memoryDir: null, cwd, error: "dsh-memory row config must be an object" });
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock" });
+
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain(`Lock is held by ${HELD_LOCK_DESCRIPTION}`);
+		expect(result.text).toContain("--force");
+		expect(existsSync(lockPath)).toBe(true);
+	});
+
+	it("returns an actionable error and touches nothing when the directory cannot be re-resolved either", async () => {
+		const memoryDir = join(dir, "mem");
+		const lockPath = join(memoryDir, LOCK_FILE);
+		await mkdir(memoryDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+		// 目录没解出来、连 cwd 也没有（dirs.ensure 拒绕 + session.header.cwd 为空）：无从重试。
+		const rt = makeRuntime(memoryDir, null, { memoryDir: null, cwd: "", error: "resolve failed" });
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock --force" });
+
+		expect(result.kind).toBe("error");
+		expect(result.text).toContain("Cannot unlock");
+		// 说清下一步（先修行 config / 先用 /memory 确认 Dir:），而不是只报一个状态。
+		expect(result.text).toContain("row config");
+		expect(result.text).toContain("/memory");
+		expect(result.text).toContain("unlock --force");
+		expect(existsSync(lockPath)).toBe(true);
+	});
+
+	it("removes the lock with --force and treats absence as success", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const lockPath = join(memoryDir, LOCK_FILE);
+		await mkdir(memoryDir, { recursive: true });
+
+		const absent = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "  unlock --force" });
+		expect(absent.kind).toBe("success");
+		expect(absent.text).toContain("No lock present");
+
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+		// 「只删 .lock」的另一半：目录里其它文件必须原样存在。
+		const entryPath = join(memoryDir, "deadbeef.md");
+		const indexPath = join(memoryDir, "MEMORY.md");
+		await writeFile(entryPath, "sibling entry body\n", "utf8");
+		await writeFile(indexPath, "- [Sibling](deadbeef.md) — a note\n", "utf8");
+
+		const removed = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock --force" });
+		expect(removed.kind).toBe("success");
+		expect(removed.text).toContain("removed");
+		expect(existsSync(lockPath)).toBe(false);
+		expect(existsSync(entryPath)).toBe(true);
+		expect(await readFile(entryPath, "utf8")).toBe("sibling entry body\n");
+		expect(existsSync(indexPath)).toBe(true);
+	});
+
+	it("returns an error result instead of throwing when the unlink fails", async () => {
+		const memoryDir = join(dir, "mem");
+		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const lockPath = join(memoryDir, LOCK_FILE);
+		// 一个目录会让 readLockStatus 读成 unreadable，也让 unlink 抛非 ENOENT（EISDIR/EPERM）。
+		await mkdir(memoryDir, { recursive: true });
+		await writeFile(lockPath, JSON.stringify(HELD_LOCK), "utf8");
+		await rm(lockPath, { force: true });
+		await mkdir(lockPath);
+
+		const result = await handlerFor(rt)({ agent: { session: { id: "s1" } }, rawInput: "unlock --force" });
+
+		expect(result.kind).toBe("error");
+		expect(result.text).toContain("Failed to remove memory lock");
+	});
+});
