@@ -219,4 +219,6 @@ pi-memory `234 passed`）。**尚未对真实运行的宿主验证**，两处缺
    → `followup` / `whenIdle` / `cancel` 这条链只在假宿主上验证过。子会话的工具面、`maxTurns`
    尽力而为的上界与超时打断都需要真实宿主跑一轮才算数。
 
-别把这两样当成已验证。
+别把这两样当成已验证。真机验收的可复制流程（隔离 `DSH_HOME` + 从模板建 profile + 本地 `file:` 装包 +
+`zstdcat` 读子会话、断言工具面只剩 `memory`）见
+[docs/guides/dsh-real-host-smoke.md](../docs/guides/dsh-real-host-smoke.md)。
