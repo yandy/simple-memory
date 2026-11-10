@@ -121,7 +121,12 @@ export function createTurnStoppingListener(deps: ExtractListenerDeps): ExtractTr
 			);
 
 			// 记账：卸载/退出时 `drain()` 用它等在途的抽取。
-			const tracked = run.finally(() => inFlight.delete(tracked));
+			//
+			// 注意 `run.catch(...)` 这一层不是装饰：extract 的 `errorPolicy` 是 `rethrow`，而 `run` 的
+			// 失败只由下面那个两参 `.then` 处理；若把 `run.finally(...)` 直接放进 `inFlight`，派生出的
+			// 那个 promise 没人接管 —— 它会变成一个未处理拒绝（CI 上真的红了）。记账用的这一份必须
+			// **永不 reject**。
+			const tracked = run.catch(() => undefined).finally(() => inFlight.delete(tracked));
 			inFlight.add(tracked);
 
 			// 两参 `.then`（而不是 `.then().catch()`）：成功分支自己抛错只会进它自己的分支，

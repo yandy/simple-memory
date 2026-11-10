@@ -234,3 +234,35 @@ describe("createTurnStoppingListener — 交给 core 的东西", () => {
 		expect(warn).toHaveBeenCalled();
 	});
 });
+
+describe("createTurnStoppingListener — 不许留下未处理拒绝（CI 回归）", () => {
+	it("leaves no unhandled rejection when a round rejects", async () => {
+		// extract 的 `errorPolicy` 是 `rethrow`：一轮失败会以 rejection 结束。触发点必须自己接管它
+		// （包括为 `drain()` 记账用的那个派生 promise），否则 Node 会把它当成未处理拒绝 ——
+		// CI 上就是这么红的（本地 vitest 不一定暴露）。
+		const seen: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => {
+			seen.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const rt = makeRuntime(makeConfig());
+			const { deps } = makeDeps({
+				rt,
+				headless: {
+					run: async () => {
+						throw new Error("model unavailable");
+					},
+				},
+			});
+
+			createTurnStoppingListener(deps)({ agent: { session: sessionLike() } });
+			await flush();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+
+		expect(seen).toEqual([]);
+	});
+});
