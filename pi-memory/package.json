@@ -3,7 +3,7 @@
 	"publishConfig": {
 		"access": "public"
 	},
-	"version": "3.0.0",
+	"version": "4.0.0",
 	"description": "File-system driven persistent memory layer for pi coding agent",
 	"license": "MIT",
 	"repository": {
@@ -13,7 +13,7 @@
 	},
 	"type": "module",
 	"dependencies": {
-		"@yandy0725/memory-core": "^1.0.0"
+		"@yandy0725/memory-core": "^2.0.0"
 	},
 	"keywords": [
 		"pi-package"
