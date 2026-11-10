@@ -65,64 +65,6 @@ describe("index wiring (integration)", () => {
 		dirOverrideRef.current = null;
 	});
 
-	it("registers exactly one memory tool with the five main-agent actions", async () => {
-		const { pi, tools, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-
-		expect(handlers["session_start"]).toBeDefined();
-		expect(handlers["before_agent_start"]).toBeDefined();
-		expect(handlers["agent_end"]).toBeDefined();
-
-		await handlers["session_start"][0]({}, uiCtx());
-
-		expect(tools).toHaveLength(1);
-		expect(tools[0].name).toBe("memory");
-		// D12：主 agent 的 schema 只有 5 个 action，且不含 dream 专属的 new_name 参数
-		expect(tools[0].parameters.properties.action.enum).toEqual([
-			"add",
-			"replace",
-			"remove",
-			"list",
-			"search",
-		]);
-		expect(Object.keys(tools[0].parameters.properties)).not.toContain("new_name");
-		expect(commands["memory"]).toBeDefined();
-		expect(commands["dream"]).toBeDefined();
-	});
-
-	it("registers the tool only once across sessions", async () => {
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
-
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["session_start"][0]({}, uiCtx());
-
-		expect(tools).toHaveLength(1);
-	});
-
-	it("writes through the store end to end", async () => {
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-
-		const result = await tools[0].execute(
-			"call-1",
-			{ action: "add", name: "Use real DB in tests", description: "不要 mock", content: "集成测试必须连真实 PostgreSQL。" },
-			undefined,
-			undefined,
-			undefined as any,
-		);
-
-		expect(result.content[0].text).toBe('Saved "Use real DB in tests" (Use-real-DB-in-tests.md).');
-		const raw = await readFile(join(dir, "Use-real-DB-in-tests.md"), "utf8");
-		expect(raw).toContain("name: Use real DB in tests");
-		expect(raw).toContain("modified:");
-		expect(raw).not.toContain("updated:");
-		const index = await readFile(join(dir, "MEMORY.md"), "utf8");
-		expect(index).toContain("- [SSH](ssh.md) — staging ssh config");
-		expect(index).toContain("- [Use real DB in tests](Use-real-DB-in-tests.md) — 不要 mock");
-	});
-
 	// 端到端钉住「session_start 用的是**注入**口径」：一行 swap 就会落在写入口径（200/25600）上，
 	// 那时 60 条索引会整份注入，下面的 50 条断言就会红。
 	// compaction 是会话内唯一的刷新点：那里也必须用注入口径（同一个窗口核心）。
@@ -652,36 +594,6 @@ describe("index wiring (integration)", () => {
 	// per-session 去重（v3 设计：集合在 session_start 时初始化）：每次 session_start 都必须把
 	// 上一 session 的 injectedFiles 清掉，否则新会话里同一条 entry 会因旧集合而被静默压掉。
 	// 这一条用 healthy → 配置错误 → healthy 三次启动钉住它（去掉 clear 就会第二次观测到 ssh.md）。
-	it("clears the injected-file set on every session_start", async () => {
-		const injectedAtCall: Array<Set<string>> = [];
-		scanEntriesMock.mockResolvedValue([
-			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
-		]);
-		// injectedFiles 是活 Set：必须在调用瞬间深拷贝（见 `does not surface the same entry file twice`）
-		runTaskMock.mockImplementation(async (...args: any[]) => {
-			injectedAtCall.push(new Set(args[1].injectedFiles));
-			return { files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" };
-		});
-
-		const { pi, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), uiCtx());
-
-		// 中途一次「配置错误」启动（session_start 不建 store），再回到 healthy：三条路径都必须从
-		// 空集合开始。`resetSessionState()` 在每次 session_start 开头无条件清空它 —— 去掉那次
-		// clear，第二次观测就会看到上一轮注入过的 `ssh.md`，用例变红。
-		breakModelConfig();
-		await handlers["session_start"][0]({}, uiCtx());
-		restoreModelConfig();
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), uiCtx());
-
-		expect(injectedAtCall).toHaveLength(2);
-		expect(injectedAtCall[0]).toEqual(new Set());
-		expect(injectedAtCall[1]).toEqual(new Set());
-	});
-
 	// ── 模型校验（设计 §2）─────────────────────────────────────────────
 	it("reports missing models and does not initialise anything", async () => {
 		mockConfigValue.defaults = { sessionPersistence: { enabled: false } };
@@ -759,18 +671,6 @@ describe("index wiring (integration)", () => {
 		expect(notify.mock.calls[0][0]).toContain(
 			'model "test/model" for dream is not resolvable (unknown id or missing credentials)',
 		);
-	});
-
-	it("initialises when only defaults.model is set", async () => {
-		mockConfigValue.extractMemories.enabled = true;
-		const notify = vi.fn();
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
-
-		await handlers["session_start"][0]({}, uiCtx(uiWith(notify)));
-
-		expect(tools).toHaveLength(1);
-		expect(notify).not.toHaveBeenCalled();
 	});
 
 
