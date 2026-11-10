@@ -201,7 +201,7 @@ export type HeadlessOutcome =
   /** 请求从未真正开始：宿主拒绝、模型不可用、适配层判定不该发、请求前就超时。`aborted` 指发出前取消。 */
   | { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
 
-/** 描述符的 `incomplete` 收的那一半：除 "completed" 之外的一切。 */
+/** 描述符的 `notCompleted` 收的那一半：除 "completed" 之外的一切。 */
 export type IncompleteOutcome = Exclude<HeadlessOutcome, { status: "completed" }>;
 ```
 
@@ -209,24 +209,28 @@ export type IncompleteOutcome = Exclude<HeadlessOutcome, { status: "completed" }
 （pi 读这条时：`agent-runner` 的超时仍在抛错（`agent-runner.ts:170-180`，测试钉住 `rejects.toThrow`），
 本轮不改，所以 **pi 实际只产生 `completed`**；`incomplete` / `no-output` 是给 dsh 的词汇，pi 侧的补齐见 §11。）
 
-**core 自己的「不跑」不进端口词汇**：`runTask` 有一个只属于 core 的返回类型，避免把 core 的判定伪装成宿主的语言。
+**core 自己的「不跑」不进端口词汇**：`runTask` 直接返回任务的 `R`，core 自己的判定与端口给的非
+`completed` 结果都由描述符的**同一个 `notCompleted` 钩子**收口，避免把 core 的判定伪装成宿主的语言。
 
 ```ts
-export type TaskRunResult<R> =
-  | { kind: "ran"; value: R }
-  | { kind: "skipped"; cause: "no-input" | "lock-busy" };
+/** `notCompleted` 收的 `why`：core 自己的判定，或端口给的非 completed 结果。 */
+export type Incomplete =
+  | { status: "no-input" }
+  | { status: "lock-busy" }
+  | IncompleteOutcome;
 ```
 
-三个任务把它映射成自己的词汇（**唯一允许「三套词汇」的地方**）：
+三个任务在 `notCompleted` 里把它映射成自己的词汇（**唯一允许「三套词汇」的地方**）：
 
-| 任务 | ran | no-output | incomplete | not-run | skipped |
+| 任务 | ran（`parse`） | no-output | incomplete | not-run | no-input / lock-busy |
 |---|---|---|---|---|---|
-| autoSurfacing | `{files, content}`；`content === ""` 时适配层不注入 | `[]` | `[]` | `[]` | `[]` |
+| autoSurfacing | `{files, content}`；`content === ""` 时适配层不注入 | `{files:[], content:""}` | `{files:[], content:""}` | `{files:[], content:""}` | `{files:[], content:""}` |
 | extractMemories | `{skipped:false, result}` | `{skipped:false, result:""}`（今天 pi 的空回复就是这个形状，不能变成 skipped —— 否则「写了 N 条但没写总结」那轮的通知会消失） | `{skipped:false, result?}`（写入已发生，不能报错） | `{skipped:true}` | `{skipped:true}` |
 | dream | 摘要 | `throw`（用户显式触发，静默等于骗人） | `throw`（带 cause；快照已在） | `throw`（带 cause） | `throw`（理论不可达） |
 
-端口**抛错**（传输级异常）由 `plan.errorPolicy` 决定：`swallow` → 该任务返回「没跑」那一格；
-`rethrow` → 原样上抛。**try/catch 只在 `runTask` 一处**，三个任务不再各写一个。
+端口**抛错**（传输级异常）由 `plan.errorPolicy` 决定：`swallow` → 该任务把
+`{status:"not-run", cause:"host-refused", detail}` 交给 `notCompleted`；`rethrow` → 原样上抛。
+**try/catch 只在 `runTask` 一处**，三个任务不再各写一个。
 
 `enabled` 不在这里判：它是**触发点决策**（§6.5 允许适配层读它），core 不会因为 `enabled: false` 而收到调用。
 
@@ -251,13 +255,14 @@ export async function runTask<I, R>(
   task: MemoryTask<I, R>,
   input: I,
   ctx: TaskContext,
-): Promise<TaskRunResult<R>>;
+): Promise<R>;
 ```
 
 `runTask` 负责（全在 core 内）：读 `cfg`（model / effort / sessionPersistence / §6.1 表的预算）→
-`buildPrompt` 返回 `null` 则 `skipped: no-input` → 施加 `plan.lock`（dream 的 `logicalLockActive()` 自检 +
-进入时全目录快照；extract 的 `tryWithLogicalLock` 拿不到就 `lock-busy`）→ 构造 `HeadlessRunRequest` 跑端口 →
-按 §6.2 收口（含 `errorPolicy`）。
+`buildPrompt` 返回 `null` 则 `task.notCompleted(…, { status: "no-input" })` → 施加 `plan.lock`（dream 的
+`logicalLockActive()` 自检 + 进入时全目录快照；extract 的 `tryWithLogicalLock` 拿不到就
+`task.notCompleted(…, { status: "lock-busy" })`）→ 构造 `HeadlessRunRequest` 跑端口 →
+`completed` 走 `task.parse`，其余结果走 `task.notCompleted`（含 `errorPolicy`）。
 
 **适配层只剩三件事**：提供端口（怎么调模型）、决定何时调 `runTask`（含 `enabled` 判定）、呈现结果。
 

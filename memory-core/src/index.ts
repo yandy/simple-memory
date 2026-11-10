@@ -108,8 +108,16 @@ export { runExtract } from "./orchestration/extract.js";
 export type { ExtractPorts, RunExtractOpts } from "./orchestration/extract.js";
 export { renderConversation } from "./orchestration/conversation.js";
 export type { ConversationLimits } from "./orchestration/conversation.js";
+export { runTask, TASKS } from "./orchestration/task.js";
+export type {
+	Incomplete,
+	MemoryTask,
+	TaskContext,
+	TaskDeps,
+	TaskPlan,
+} from "./orchestration/task.js";
 export { runSideQuery } from "./orchestration/surfacing.js";
-export type { RunSideQueryOpts } from "./orchestration/surfacing.js";
+export type { RunSideQueryOpts, SurfacingInput, SurfacingResult } from "./orchestration/surfacing.js";
 export { buildDreamTask, buildExtractTask } from "./orchestration/prompts.js";
 export type {
 	ExtractMessage,
