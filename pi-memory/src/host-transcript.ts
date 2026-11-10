@@ -133,7 +133,11 @@ export function toExtractMessages(messages: unknown[]): ExtractMessage[] {
 	}
 	return out;
 }
-/** 组装 pi 的两个宿主能力，交给 core 的 `runExtract` 与 `memory` 工具。 */
+/**
+ * 把 pi 的两个宿主能力组装成 core 的 `HostTranscriptPort`：`toExtractMessages` 供
+ * `runTask(TASKS.extractMemories, …)` 渲染对话，`searchSessions` 与 `memory` 工具的
+ * `search scope=sessions` 走同一份实现。
+ */
 export function createPiTranscript(): HostTranscriptPort {
 	return { searchSessions, toExtractMessages };
 }

@@ -3,14 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	DEFAULT_CONFIG,
 	MAIN_AGENT_ACTIONS,
 	MemoryStore,
+	TASKS,
 	type ExtractMessage,
-	type RunExtractOpts,
+	type MemoryAction,
+	type SessionPersistenceConfig,
 	type StoreConfig,
+	type TaskContext,
 	buildExtractTask,
+	mergeConfig,
 	renderConversation,
-	runExtract,
+	runTask,
 } from "../src/index.js";
 
 /** 假的 `HeadlessAgentPort`。 */
@@ -21,7 +26,44 @@ const headlessRun = vi.fn();
  */
 const toExtractMessages = (raw: unknown[]): ExtractMessage[] => raw as ExtractMessage[];
 const ports = { headless: { run: headlessRun }, transcript: { toExtractMessages, searchSessions: async () => "" } };
-const extract = (o: RunExtractOpts) => runExtract(o, ports);
+
+interface ExtractOverrides {
+	effort?: string;
+	memoryDir?: string;
+	store?: MemoryStore;
+	messages?: unknown[];
+	maxContextTokens?: number;
+	maxToolResultChars?: number;
+	maxAssistantChars?: number;
+	model?: string;
+	sessionPersistence?: SessionPersistenceConfig;
+	agentsMdBlocks?: string[];
+	onWrite?: (info: { action: MemoryAction; name?: string }) => void;
+}
+
+// 预算 / 模型 / 目录的默认值只在 `opts` 里定义一份；`extract` 只负责消费，不再重复默认。
+const extract = (o: Partial<ExtractOverrides> = {}) => {
+	const x = opts(o);
+	return runTask(
+		TASKS.extractMemories,
+		{ messages: x.messages!, agentsMdBlocks: x.agentsMdBlocks!, onWrite: x.onWrite },
+		{
+			cfg: mergeConfig(DEFAULT_CONFIG, {
+				defaults: { model: x.model!, sessionPersistence: x.sessionPersistence },
+				extractMemories: {
+					thinkLevel: x.effort!,
+					maxContextTokens: x.maxContextTokens!,
+					maxToolResultChars: x.maxToolResultChars!,
+					maxAssistantChars: x.maxAssistantChars!,
+					sessionPersistence: x.sessionPersistence,
+				},
+			}),
+			cwd: x.memoryDir!,
+			store: x.store!,
+			ports,
+		},
+	);
+};
 
 const LIMITS = { maxToolResultChars: 500, maxAssistantChars: 2000, maxContextTokens: 100_000 };
 
@@ -42,7 +84,7 @@ function busyStore(): MemoryStore {
 	} as unknown as MemoryStore;
 }
 
-function opts(over: Partial<RunExtractOpts> = {}): RunExtractOpts {
+function opts(over: Partial<ExtractOverrides> = {}): Partial<ExtractOverrides> {
 	return {
 		effort: "high",
 		memoryDir: dir,
@@ -52,6 +94,7 @@ function opts(over: Partial<RunExtractOpts> = {}): RunExtractOpts {
 		maxToolResultChars: 500,
 		maxAssistantChars: 2000,
 		model: "deepseek/deepseek-v4-flash",
+		agentsMdBlocks: [],
 		...over,
 	};
 }
@@ -60,7 +103,7 @@ beforeEach(async () => {
 	dir = await mkdtemp(join(tmpdir(), "mem-extract-"));
 	store = new MemoryStore(CFG(dir));
 	headlessRun.mockClear();
-	headlessRun.mockResolvedValue("saved 2 memories");
+	headlessRun.mockResolvedValue({ status: "completed", text: "saved 2 memories" });
 });
 afterEach(async () => {
 	await rm(dir, { recursive: true, force: true });
@@ -350,7 +393,7 @@ describe("buildExtractTask", () => {
 	});
 });
 
-describe("runExtract", () => {
+describe("runTask(TASKS.extractMemories)", () => {
 	// extract **不等待**逻辑锁 —— 拿不到即跳过本轮。
 	it("returns skipped without calling the headless agent when the logical lock is busy", async () => {
 		const out = await extract(opts({ store: busyStore() }));
@@ -367,11 +410,18 @@ describe("runExtract", () => {
 			headless: { run: headlessRun },
 			transcript: { toExtractMessages: () => [], searchSessions: async () => "" },
 		};
-		expect(await runExtract(opts({ messages: [null, 42, {}] }), empty)).toEqual({ skipped: true });
+		const cfg = mergeConfig(DEFAULT_CONFIG, { defaults: { model: "deepseek/deepseek-v4-flash" } });
+		expect(
+			await runTask(
+				TASKS.extractMemories,
+				{ messages: [null, 42, {}], agentsMdBlocks: [] },
+				{ cfg, cwd: dir, store, ports: empty },
+			),
+		).toEqual({ skipped: true });
 		expect(headlessRun).not.toHaveBeenCalled();
 	});
 
-	it("asks for no builtin tools, five actions, maxTurns=5 and a 120s timeout", async () => {
+	it("asks for the full extract prompt and the configured model", async () => {
 		const out = await extract(
 			opts({
 				model: "deepseek/deepseek-v4-flash",
@@ -383,18 +433,16 @@ describe("runExtract", () => {
 		expect(headlessRun).toHaveBeenCalledTimes(1);
 		expect(headlessRun).toHaveBeenCalledWith(
 			expect.objectContaining({
-				cwd: dir,
-				effort: "high",
-				maxTurns: 5,
-				timeoutMs: 120_000,
-				// 「关 builtin、只留 memory 工具」在 core 里就是这两个字段；
-				// 白名单陷阱（宿主的 tools: [] 会连 customTools 一起滤掉）由适配层躲开。
-				builtinTools: "none",
-				memoryTool: { actions: MAIN_AGENT_ACTIONS, skipLogicalLock: true, onWrite: undefined },
+				task: expect.stringContaining("memory extraction agent"),
 				model: "deepseek/deepseek-v4-flash",
-				sessionPersistence: { enabled: true },
 			}),
 		);
+		// 请求的其余字段由 plan 派生：把 `skipLogicalLock` 改成 `lock === "logical+snapshot"`
+		// 会让 extract 的每次 memory 写入都去抢它已持有的锁（每次 5s 超时）。
+		expect(headlessRun).toHaveBeenCalledWith(expect.objectContaining({
+			builtinTools: "none", maxTurns: 5, timeoutMs: 120_000,
+			memoryTool: expect.objectContaining({ actions: MAIN_AGENT_ACTIONS, skipLogicalLock: true, skipSnapshot: false }),
+		}));
 	});
 
 	it("forwards onWrite into the memory tool spec so the adapter can count writes", async () => {
@@ -436,5 +484,18 @@ describe("runExtract", () => {
 		headlessRun.mockRejectedValueOnce(new Error("extract failed"));
 		await expect(extract(opts())).rejects.toThrow("extract failed");
 		expect(store.logicalLockActive()).toBe(false);
+	});
+});
+
+describe("TASKS.extractMemories", () => {
+	// 这些值以前是 runExtract 手写进请求里的；搬到描述符后，请求只剩 task 与 model 需要断言。
+	it("declares the plan: five turns, 120s, five actions, logical lock, rethrow", () => {
+		expect(TASKS.extractMemories.plan).toEqual({
+			maxTurns: 5,
+			timeoutMs: 120_000,
+			memoryTool: MAIN_AGENT_ACTIONS,
+			lock: "logical",
+			errorPolicy: "rethrow",
+		});
 	});
 });

@@ -66,6 +66,10 @@ typecheck。`src/host-types.ts` 从 `@deepseek-ai/dsh-agent` 取 `Agent`，而 `
 - 构建配置不得继承源码别名：否则产物可能对着**比 registry 上更新**的源码编出来，而用户拿到的
   core 没有那些 API。
 
+单宿主策略键不进 core 的配置契约：像 pi 的 `dream.nudgeAfterSessions` / `dream.nudgeAfterHours` 这类
+「只服务一个宿主」的键，只属于那个宿主的配置（pi 侧的 `PiHostConfig`），不得进 `MemoryConfig`。core 的
+配置契约只收两个宿主共有的语义。
+
 执行点两条：
 
 - `npm run check:memory-core-deps`（`scripts/check-memory-core-deps.mjs`，CI 的 `test` job）—— 静态检查

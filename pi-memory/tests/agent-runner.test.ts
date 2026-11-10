@@ -46,7 +46,7 @@ mocks.createAgentSessionMock.mockResolvedValue({
 	extensionsResult: {},
 });
 
-import { runHeadlessAgent } from "../src/agent-runner";
+import { createPiHeadlessAgent, runHeadlessAgent } from "../src/agent-runner";
 
 const { promptMock, abortMock, steerMock, disposeMock, subscribeMock, createAgentSessionMock, inMemoryMock, createSessionMock } = mocks;
 
@@ -357,5 +357,48 @@ describe("runHeadlessAgent", () => {
 				model: "nope/nope",
 			}),
 		).rejects.toThrow('model "nope/nope" is not resolvable (unknown id or missing credentials)');
+	});
+});
+
+describe("createPiHeadlessAgent", () => {
+	const request = {
+		task: "t",
+		cwd: "/mem",
+		model: "deepseek/deepseek-v4-flash",
+		builtinTools: "none" as const,
+		memoryTool: null,
+	};
+	const deps = {
+		modelRegistry: fakeRegistry,
+		buildMemoryTool: () => ({ name: "memory", label: "Memory", description: "primitives", parameters: {} }) as any,
+	};
+
+	it("wraps a finished headless run as completed", async () => {
+		subscribeMock.mockImplementation((listener: any) => {
+			queueMicrotask(() => {
+				listener({ type: "message_start", message: {} });
+				listener({
+					type: "message_update",
+					message: {},
+					assistantMessageEvent: { type: "text_delta", delta: "hello", contentIndex: 0 },
+				});
+				listener({ type: "message_end", message: {} });
+				listener({ type: "turn_end", message: {}, toolResults: [] });
+				listener({ type: "agent_end", messages: [], willRetry: false });
+			});
+			return () => {};
+		});
+
+		const port = createPiHeadlessAgent(deps);
+		expect(await port.run({ ...request, task: "hello" })).toEqual({ status: "completed", text: "hello" });
+	});
+
+	it("keeps throwing on timeout instead of inventing an outcome", async () => {
+		promptMock.mockReturnValueOnce(new Promise<void>(() => {}));
+		subscribeMock.mockReturnValue(() => {});
+
+		const port = createPiHeadlessAgent(deps);
+
+		await expect(port.run({ ...request, timeoutMs: 50 })).rejects.toThrow(/timed out after 50ms/);
 	});
 });

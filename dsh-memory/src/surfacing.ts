@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { renderSurfacedBlock, requiredModel, runSideQuery, scanEntries } from "@yandy0725/memory-core";
+import { runTask, scanEntries, TASKS } from "@yandy0725/memory-core";
 import type { HeadlessAgentPort } from "@yandy0725/memory-core";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
@@ -7,7 +7,7 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
  * 每轮召回：挂在宿主 `agent/pre-step` waterfall 上，在模型被调用前，用一轮零工具侧查询挑出与用户
  * 这轮输入相关的 entry，再把它们渲染成 `<relevant_memories>` 块 splice 进进入该 step 的消息里。
  *
- * 记忆逻辑全在 core（`runSideQuery` 选文件、`renderSurfacedBlock` 渲染并净化）；本模块是宿主胶水：
+ * 记忆逻辑全在 core（`runTask(TASKS.autoSurfacing)` 选文件并渲染、净化）；本模块是宿主胶水：
  * 找到真人 prompt、调 core、把结果放进宿主真正会投递的位置。两处宿主敏感语义：
  *
  * 1. 它跑在 agent loop 会 await 的 waterfall 里 —— 慢会拖慢用户这一轮，抛错/挂起会弄坏它。
@@ -155,28 +155,16 @@ export function createPreStepListener(
 
 			const manifest = await scanEntries(rt.store);
 			const injectedFiles = deps.injected.get(rt.sessionId) ?? new Set<string>();
-			const selected = await runSideQuery(
+			const { files, content } = await runTask(
+				TASKS.autoSurfacing,
+				{ userPrompt: prompt.slice(0, USER_PROMPT_MAX_CHARS), injectedFiles, manifest },
 				{
-					manifest,
-					userPrompt: prompt.slice(0, USER_PROMPT_MAX_CHARS),
-					injectedFiles,
-					maxFiles: rt.config.autoSurfacing.maxFiles,
-					effort: rt.config.autoSurfacing.thinkLevel,
-					model: requiredModel(rt.config, "autoSurfacing"),
+					cfg: rt.config,
 					cwd: rt.memoryDir,
+					store: rt.store,
 					signal: payload.signal,
-					sessionPersistence:
-						rt.config.autoSurfacing.sessionPersistence ?? rt.config.defaults?.sessionPersistence,
+					ports: { headless: deps.headless },
 				},
-				{ headless: deps.headless },
-			);
-			if (selected.length === 0) return decision;
-
-			const content = await renderSurfacedBlock(
-				rt.store,
-				selected,
-				rt.config.autoSurfacing.maxEntryBytes,
-				rt.config.autoSurfacing.maxInjectionBytes,
 			);
 			if (content === "") return decision;
 
@@ -185,7 +173,7 @@ export function createPreStepListener(
 			if (payload.signal.aborted) return decision;
 
 			// 只在成功且非空渲染之后才标记 injected（与 pi 一致）：空渲染不消耗这些文件本会话再浮现的机会。
-			for (const file of selected) injectedFiles.add(file);
+			for (const file of files) injectedFiles.add(file);
 			deps.injected.set(rt.sessionId, injectedFiles);
 
 			// 召回插在「最后一条仍来自本轮 claim 的消息」之后：用身份包含（而非 source.kind）判定，
@@ -195,7 +183,7 @@ export function createPreStepListener(
 			// 同样的未加 guard 的 `-1 + 1`），且是理论场景（没有哪个被调研的监听器产出 identity-
 			// disjoint 消息）—— 不加 guard，在这里与 first-party 分叉本身是另一种风险。
 			const lastClaimed = decision.messages.findLastIndex((m) => payload.messages.includes(m));
-			const message = createRecallMessage(content, selected.length);
+			const message = createRecallMessage(content, files.length);
 			return { ...decision, messages: decision.messages.toSpliced(lastClaimed + 1, 0, message) };
 		} catch (e) {
 			// 召回是增强，绝不能拖垮这一轮：任何失败都记一行，原样返回 decision。

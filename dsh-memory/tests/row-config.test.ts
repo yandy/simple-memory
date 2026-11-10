@@ -1,19 +1,10 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, loadConfigFrom } from "@yandy0725/memory-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, mergeConfig } from "@yandy0725/memory-core";
+import { describe, expect, it } from "vitest";
 import { resolveRowConfig, ROW_CONFIG_KEYS } from "../src/row-config.js";
 
 describe("resolveRowConfig", () => {
-	let tmpDir: string | undefined;
-	afterEach(async () => {
-		if (tmpDir !== undefined) {
-			await rm(tmpDir, { recursive: true, force: true });
-			tmpDir = undefined;
-		}
-	});
-
 	it("returns the defaults verbatim for undefined (no warnings, no error)", () => {
 		const { config, warnings, error } = resolveRowConfig(undefined);
 		expect(config).toEqual({ ...DEFAULT_CONFIG, memoryDir: expandTilde(defaultMemoryRoot()) });
@@ -35,18 +26,21 @@ describe("resolveRowConfig", () => {
 		expect(warnings).toEqual([]);
 	});
 
-	it("matches core loadConfigFrom byte-for-byte for the same overlay", async () => {
-		tmpDir = await mkdtemp(join(tmpdir(), "rowcfg-"));
-		const file = join(tmpDir, "memory.json");
+	// 与 `memory.json` 的路径锚定：行 config 不引入任何额外合并语义，它逐字等于「默认值 → 逐个
+	// `mergeConfig` → 末尾 `expandTilde`」这条公开文档的链（core 1.x 的 `loadConfigFrom([file])`
+	// 就是同一条链加文件 IO；文件 IO 现已归适配层，所以这里直接钉这条链）。
+	it("matches the documented mergeConfig + expandTilde chain for the same overlay", () => {
 		const overlay = {
 			memIndexMaxLines: 99,
 			defaults: { model: "deepseek-official/deepseek-flash" },
 			autoSurfacing: { enabled: false, maxFiles: 2 },
 		};
-		await writeFile(file, JSON.stringify(overlay));
-		const viaFile = await loadConfigFrom([file]);
-		const viaRow = resolveRowConfig(overlay).config;
-		expect(viaRow).toEqual(viaFile);
+		const viaChain = (() => {
+			const c = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
+			c.memoryDir = expandTilde(c.memoryDir);
+			return c;
+		})();
+		expect(resolveRowConfig(overlay).config).toEqual(viaChain);
 	});
 
 	it("warns about an unknown top-level key and leaves the real key untouched", () => {

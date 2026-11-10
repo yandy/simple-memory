@@ -47,14 +47,6 @@ const INDEX_SECTION_ORDER = 4000;
 /** per-agent effect 的标签，出现在宿主 `fiber.getEffects()` 的诊断树里。 */
 const AGENT_EFFECT_LABEL = "memory/agent";
 
-/**
- * 本适配层**没有实现**的 core 模块。行 config 的白名单是从 `DEFAULT_CONFIG` 派生的，所以这两棵子树
- * 天生能通过校验（无告警）却没有任何效果 —— 用户写了 `dream: { model: "…" }` 时，`/memory` 必须就地
- * 告诉他「配了但本适配层不跑」，否则他得到的是一句「你没配 model」式的误导。
- * 只在用户真写了它们时才显示，不给其余人增加噪声。
- */
-const UNIMPLEMENTED_MODULES: readonly string[] = Object.freeze(["dream", "extractMemories"]);
-
 /** 一个会话的工具注册清理项（双 owner：agent 的 fiber 与我们的 fiber 各持一份 disposer）。 */
 interface SessionCleanup {
 	disposeTool(): void;
@@ -162,11 +154,11 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		},
 	};
 	ctx.systemPrompt.section(section);
-	// 用户真在行 config 里写了本适配层没实现的子树时，把它们交给 `/memory` 就地报出来。
+	// 用户在行 config 里写过的白名单顶层键，交给 `/memory` 就地报出未实现的模块
+	//（哪些算未实现、是否只在真写了该键时才显示、怎么措辞，都在 commands.ts 的 renderStatus）。
 	const setKeys = rowConfigSetKeys(config);
-	const unimplementedModules = UNIMPLEMENTED_MODULES.filter((key) => setKeys.includes(key));
 	ctx.commands.register(
-		createMemoryCommand({ registry, indexCache, warnings: resolved.warnings, unimplementedModules }),
+		createMemoryCommand({ registry, indexCache, warnings: resolved.warnings, setKeys }),
 	);
 
 	// 6. `agent/created`：串行、且在创建完成前被 await —— 这是唯一的异步窗口。记忆目录要探 git remote

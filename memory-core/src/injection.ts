@@ -217,13 +217,14 @@ export async function scanEntries(store: MemoryStore): Promise<EntryManifest[]> 
 		.slice(0, SIDE_QUERY_MAX_ENTRIES);
 }
 
-export async function renderSurfacedBlock(
+export async function renderSurfacedEntries(
 	store: MemoryStore,
 	selectedFiles: string[],
 	maxEntryBytes: number,
 	maxInjectionBytes: number,
-): Promise<string> {
+): Promise<{ files: string[]; content: string }> {
 	const blocks: string[] = [];
+	const files: string[] = [];
 	let totalBytes = 0;
 
 	for (const file of selectedFiles) {
@@ -239,12 +240,25 @@ export async function renderSurfacedBlock(
 		const blockBytes = Buffer.byteLength(block, "utf8");
 		if (totalBytes + blockBytes > maxInjectionBytes) break;
 		blocks.push(block);
+		files.push(file);
 		totalBytes += blockBytes;
 	}
 
-	if (blocks.length === 0) return "";
-	return `<relevant_memories>\n${blocks.join("\n\n")}\n</relevant_memories>`;
+	if (blocks.length === 0) return { files: [], content: "" };
+	return { files, content: `<relevant_memories>\n${blocks.join("\n\n")}\n</relevant_memories>` };
 }
+
+/**
+ * 单块渲染的兼容入口：只返回渲染文本。
+ * 该签名是既有公开契约，保留为 `renderSurfacedEntries` 的薄壳。
+ */
+export const renderSurfacedBlock = (
+	store: MemoryStore,
+	selectedFiles: string[],
+	maxEntryBytes: number,
+	maxInjectionBytes: number,
+): Promise<string> =>
+	renderSurfacedEntries(store, selectedFiles, maxEntryBytes, maxInjectionBytes).then((r) => r.content);
 
 /** Build the side-query task prompt. */
 export function buildSideQueryTask(manifest: EntryManifest[], userPrompt: string, maxFiles: number): string {

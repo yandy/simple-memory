@@ -36,6 +36,10 @@ pi 会话写入的记忆，dsh 会话的索引与工具能看到；反向同样�
 `memory.json`），但写了不生效 —— 所以你写了它们时，`/memory` 的 `Modules:` 行会就地报
 `dream=not implemented in this adapter`（`extractMemories` 同理）。
 
+将来实现 extract / dream 时，嵌套子会话**会被宿主落盘**：dsh 的 persistence 只看服务是否挂载，**没有
+per-session 开关**（主稿 §4.3），而 pi 的 `sessionPersistence.enabled: false` 在 dsh 侧不可兑现。所以 dsh
+的会话日志会多出这些子会话 —— 这是与 pi 的真实行为差异，不假装对齐。
+
 不冻结的原因是 dsh 每一步都重新装配 system prompt（pi 是整个会话冻结索引、回放录制值来护住 prompt
 cache），所以索引是一份快照：在 `agent/created`、每次记忆写入成功后、`/memory` 执行后、每个 `pre-step`
 之前异步刷新，读侧同步查表。
@@ -169,7 +173,7 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 
 ## 验证状态
 
-单元测试与跨 harness 共享测试全绿（dsh-memory `227 passed`，memory-core `489 passed | 4 skipped`，
-pi-memory `200 passed`）。**尚未对真实运行的宿主验证**：装进真实 dsh profile 的端到端、以及召回消息
+单元测试与跨 harness 共享测试全绿（dsh-memory `230 passed`，memory-core `487 passed | 4 skipped`，
+pi-memory `234 passed`）。**尚未对真实运行的宿主验证**：装进真实 dsh profile 的端到端、以及召回消息
 用 `form: "notice"` 时正文是否确实进模型（单测只钉住了「消息的 content 含完整正文、summary 是短摘要」，
 真宿主行为待后续任务确认）。别把这两样当成已验证。

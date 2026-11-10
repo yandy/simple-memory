@@ -1,4 +1,5 @@
-import type { HeadlessAgentPort, HeadlessRunRequest } from "@yandy0725/memory-core";
+import type { HeadlessAgentPort, HeadlessOutcome, HeadlessRunRequest } from "@yandy0725/memory-core";
+import { errorMessage } from "./errors.js";
 import { parseModelRef } from "./model.js";
 
 /**
@@ -8,7 +9,11 @@ import { parseModelRef } from "./model.js";
  * 目前只支持 auto-surfacing 的侧查询：它的 `builtinTools: "none"` 且 `memoryTool: null`
  * 是**意图本身**（查询只是「给 manifest 与用户 prompt，选相关文件」，给它任何工具都是白烧 token）。
  * extract / dream 的 `builtinTools: "file-io"` 与 `memoryTool !== null` 尚未实现，那类请求一律返回
- * `null`（= 没跑），**不抛错**。
+ * `{ status: "not-run", cause: "host-refused" }`（= 没跑），**不抛错**。
+ *
+ * 结果词汇按 core 的判别规则映射：请求**发出前**结束 → `not-run`；**发出后**没拿到完整答案 →
+ * `incomplete`。本适配层自己产生的 `incomplete` 都来自「已发出后被中断」：循环里的 abort 检查、
+ * 宿主发的终止 `aborted` chunk，以及调用方取消导致的抛错。
  */
 
 /** 宿主 `ctx.llm` 里我们用到的那一小片，结构化描述、零宿主 import。 */
@@ -37,15 +42,21 @@ export type StreamChunkLike =
 
 export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 	return {
-		async run(req: HeadlessRunRequest): Promise<string | null> {
-			// 不支持的请求：没跑，返回 null，不抛错。extract / dream 尚未实现。
-			if (req.builtinTools !== "none" || req.memoryTool !== null) return null;
+		async run(req: HeadlessRunRequest): Promise<HeadlessOutcome> {
+			// 不支持的请求：没跑（`not-run` + `host-refused`），不抛错。extract / dream 尚未实现。
+			if (req.builtinTools !== "none" || req.memoryTool !== null) {
+				return {
+					status: "not-run",
+					cause: "host-refused",
+					detail: "this adapter implements zero-tool headless calls only",
+				};
+			}
 
 			const ref = parseModelRef(req.model);
-			if (ref === null) return null;
+			if (ref === null) return { status: "not-run", cause: "unavailable" };
 
-			// 还没开始就取消：直接没跑。
-			if (req.signal?.aborted) return null;
+			// 还没开始就取消：请求从未发出，所以是 `not-run`（不是 `incomplete`）。
+			if (req.signal?.aborted) return { status: "not-run", cause: "aborted" };
 
 			// `maxTurns` 在这里不需要工具循环：零工具的一问一答就是一 turn，没有循环可封顶。
 			// 这不是「静默忽略」—— 不存在需要封顶的循环；将来若在这里加工具，`maxTurns` 必须成为循环上界。
@@ -73,6 +84,14 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 			if (req.signal !== undefined) signals.push(req.signal);
 			if (timeoutController !== undefined) signals.push(timeoutController.signal);
 			const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+
+			// 已发出但被中断（还没拿到完整文本）时的收口，遵循 core 的判别规则：
+			// **发出后**没拿到完整答案 = `incomplete`（`aborted`）；定时器响过 = 请求没拿到结果 = `not-run`（`timeout`）。
+			// 这里绝不返回 `host-refused`：请求已经发出去了，宿主没有拒绝它。
+			const interruptedOutcome = (): HeadlessOutcome =>
+				timeoutController?.signal.aborted === true
+					? { status: "not-run", cause: "timeout" }
+					: { status: "incomplete", cause: "aborted" };
 
 			const streamOptions = {
 				provider: ref.provider,
@@ -106,8 +125,9 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 			try {
 				for await (const chunk of llm.stream(streamOptions)) {
 					// 每个 chunk 先查组合 signal 是否已 abort：宿主会把 abort 转成终止 aborted chunk，
-					// 但一个不理会 signal 的流会一直 yield，超时就兜不住。返回 null = 「本轮没跑」。
-					if (signal?.aborted) return null;
+					// 但一个不理会 signal 的流会一直 yield，超时就兜不住。
+					// 定时器响过（也就是说超时了）优先判 `timeout` —— 组合 signal 两者都会为真，不先看分不开。
+					if (signal?.aborted) return interruptedOutcome();
 					if (chunk.type === "text-delta") {
 						// 兜底 arm 让判别式收窄失效：`chunk.text` 在这里是 unknown，必须 typeof 收窄。
 						// 宿主不会发 text: undefined，但 ctx.llm.stream 经 waterfall 暴露给三方插件，
@@ -145,18 +165,30 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 					// reasoning-delta 是思维链，绝不能累积进答案 —— 加进来会污染侧查询输出，
 					// 这是最容易被人「好心」补上的地方。tool-call-delta / usage 也一律忽略。
 				}
-			} catch {
-				// middleware / nested-call / cleanup / consumer 失败仍会抛：同样视为「本轮没跑成」。
-				return null;
+			} catch (e) {
+				// middleware / nested-call / cleanup / consumer 失败仍会抛。
+				// 定时器响过时宿主很可能只是把 abort 变成异常抛出 —— 那也是超时，不是宿主拒绝。
+				if (timeoutController?.signal.aborted === true) return { status: "not-run", cause: "timeout" };
+				// 调用方取消导致的抛错是「已发出后被中断」，不是宿主拒绝 —— 同样按 core 的判别规则走。
+				if (req.signal?.aborted === true) return { status: "incomplete", cause: "aborted" };
+				return { status: "not-run", cause: "host-refused", detail: errorMessage(e) };
 			} finally {
 				if (timer !== undefined) clearTimeout(timer);
 			}
 
-			// 终止 finish chunk 的裁决移到循环外（读到流尽）：失败 → null，成功（stop/max-tokens/未知）→ 继续。
-			if (terminalKind === "error" || terminalKind === "aborted") return null;
+			// 终止 finish chunk 的裁决移到循环外（读到流尽）：失败 → `not-run`，
+			// 中途取消 → `incomplete`，成功（stop/max-tokens/未知）→ 继续。
+			if (terminalKind === "error") {
+				return { status: "not-run", cause: "host-refused", detail: "the host ended the stream with an error finish" };
+			}
+			if (terminalKind === "aborted") {
+				return timeoutController?.signal.aborted === true
+					? { status: "not-run", cause: "timeout" }
+					: { status: "incomplete", cause: "aborted" };
+			}
 
 			// 按首次出现顺序（Map 插入序）拼接，只取解析后 type 为 text 的桶；
-			// core 靠 null 区分「没跑」与「跑了没写出东西」。
+			// 空文本也是 `completed`：core 靠 `status` 区分「没跑」与「跑了没写出东西」。
 			const text = [...partials.values()]
 				.map((partial) => {
 					const type = partial.block !== null ? partial.block.type : partial.blockType;
@@ -164,8 +196,8 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 				})
 				.filter((value): value is string => value !== null)
 				.join("");
-			// 成功但空文本必须是 ""。
-			return text.trim() === "" ? "" : text;
+			// 成功但空文本必须是 `completed` + `text: ""`（空回复是意图内的结果，不是没跑）。
+			return { status: "completed", text: text.trim() === "" ? "" : text };
 		},
 	};
 }

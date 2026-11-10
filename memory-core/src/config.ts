@@ -1,4 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -76,9 +75,12 @@ export interface MemoryConfig {
 	 * **没有** ttl / 心跳 / 接管字段：跨进程 `.lock` 永远只持毫秒且永不自动回收。
 	 */
 	lock: { timeoutMs: number; snapshotKeep: number };
+	/**
+	 * dream 任务本身：模型、思考档位、会话落盘。
+	 * 触发它的**策略**（隔多少个会话 / 多少小时后提醒）是宿主知识，**不**在这里 —— 需要它的适配层
+	 * 自己持有（pi 的 `PiHostConfig`），dsh 没有这套策略。
+	 */
 	dream: {
-		nudgeAfterSessions: number;
-		nudgeAfterHours: number;
 		model?: string;
 		thinkLevel: EffortLevel;
 		sessionPersistence?: SessionPersistenceConfig;
@@ -104,7 +106,7 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 	memIndexInjectMaxLines: 50,
 	memIndexInjectMaxBytes: 16384,
 	lock: { timeoutMs: 5000, snapshotKeep: 5 },
-	dream: { nudgeAfterSessions: 5, nudgeAfterHours: 24, thinkLevel: "high" },
+	dream: { thinkLevel: "high" },
 	sessionSearch: { maxSessions: 10, maxMatches: 5 },
 	autoSurfacing: {
 		enabled: true,
@@ -222,19 +224,11 @@ function deepMerge<T>(base: T, over: Partial<T>): T {
 
 /**
  * 把 `overlay` 深合并到 `base` 上：`undefined` 跳过、plain object 递归、数组整体替换、`null` 子树原样带入。
- * 返回**新对象**，不改 `base` —— 这是适配层在内存里覆盖配置的唯一入口（与 `loadConfigFrom` 共用同一份语义）。
+ * 返回**新对象**，不改 `base` —— 这是合并语义的**唯一**一份实现：适配层读文件、读行 config、
+ * 读任何宿主侧的 overlay，都把它交给这里。core 不读任何配置文件。
  */
 export function mergeConfig(base: MemoryConfig, overlay: unknown): MemoryConfig {
 	return deepMerge(base, (overlay ?? {}) as Partial<MemoryConfig>);
-}
-
-function readJsonSafe(path: string): Partial<MemoryConfig> {
-	try {
-		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf-8")) as Partial<MemoryConfig>;
-	} catch {
-		// ignore malformed
-	}
-	return {};
 }
 
 /**
@@ -250,26 +244,4 @@ export function defaultMemoryRoot(env: NodeJS.ProcessEnv = process.env, home: st
 	const xdg = env.XDG_DATA_HOME?.trim();
 	const base = xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "share");
 	return join(base, "simple-memory");
-}
-
-export interface LoadConfigFromOptions {
-	/** 命名/展开规则跟随的平台。默认 `process.platform`。 */
-	platform?: NodeJS.Platform;
-	/** 覆盖共享数据根（测试注入缝）。默认 `defaultMemoryRoot()`。 */
-	memoryRoot?: string;
-}
-
-/**
- * 把 `files` 里存在且可解析的 JSON 按顺序 deep-merge 到默认值上，最后展开 `memoryDir` 的 `~`。
- *
- * core **不认识任何宿主的配置文件路径**：`files` 由适配层组装（全局配置在哪、项目配置在哪、
- * 项目不受信任时该不该读，全都是宿主的事）。不存在与 JSON 损坏的文件都跳过。
- */
-export async function loadConfigFrom(files: string[], opts: LoadConfigFromOptions = {}): Promise<MemoryConfig> {
-	let cfg: MemoryConfig = { ...DEFAULT_CONFIG, memoryDir: opts.memoryRoot ?? defaultMemoryRoot() };
-	for (const file of files) {
-		cfg = mergeConfig(cfg, readJsonSafe(file));
-	}
-	cfg.memoryDir = expandTilde(cfg.memoryDir, opts.platform ?? process.platform);
-	return cfg;
 }

@@ -1,28 +1,25 @@
-import type { SessionPersistenceConfig } from "../config.js";
 import type { EntryManifest } from "../injection.js";
-import { buildSideQueryTask } from "../injection.js";
-import type { HeadlessAgentPort } from "./ports.js";
+import { buildSideQueryTask, renderSurfacedEntries } from "../injection.js";
+import type { MemoryTask } from "./task.js";
 
-export interface RunSideQueryOpts {
+export interface SurfacingInput {
 	/** 本轮的候选清单（`scanEntries` 的产出）。 */
 	manifest: EntryManifest[];
 	/** 用户这一轮的输入（调用方负责先截到预算内）。 */
 	userPrompt: string;
 	/** 本 session 已经注入过的文件，不再重复选。 */
 	injectedFiles: Set<string>;
-	maxFiles: number;
-	/** 宿主的思考/推理档位，core 原样透传。 */
-	effort?: string;
-	model: string;
-	/** 子会话 cwd；传 memoryDir。 */
-	cwd: string;
-	/**
-	 * 宿主那一轮的取消信号，原样透传给端口的 `HeadlessRunRequest.signal`。
-	 * 适配层通常在「宿主会 await 的钩子」里调用本函数（例如每轮开始前），此时不传 signal 意味着
-	 * 用户取消后，调用方仍要等满 `timeoutMs` 才拿得到一个没人要的结果。
-	 */
-	signal?: AbortSignal;
-	sessionPersistence?: SessionPersistenceConfig;
+}
+
+export interface SurfacingResult {
+	/** 本轮真正渲染成功的文件；渲染不出内容时恒为 `[]`（不标记已注入）。 */
+	files: string[];
+	content: string;
+}
+
+/** 去掉已注入的文件，得到真正进入侧查询的候选清单。 */
+function candidates(input: SurfacingInput): EntryManifest[] {
+	return input.manifest.filter((entry) => !input.injectedFiles.has(entry.file));
 }
 
 /** 从侧查询的回复里解析 `selected_files`，只保留确实在候选清单里的文件。 */
@@ -38,38 +35,34 @@ function parseSelectedFiles(result: string, candidates: EntryManifest[], maxFile
 	}
 }
 
-/**
- * 跑一轮轻量侧查询，选出与用户输入相关的 entry 文件名。
- *
- * 超时/失败一律返回 `[]`，**没有回退**：auto-surfacing 是纯增益，选不出来就不注入，
- * 绝不因为侧查询挂了而打断用户这一轮。
- *
- * 返回的是**文件名**，不是注入内容 —— 「注入到哪个通道、本 session 已注入过哪些」是适配层的事。
- */
-export async function runSideQuery(
-	opts: RunSideQueryOpts,
-	ports: { headless: HeadlessAgentPort },
-): Promise<string[]> {
-	const candidates = opts.manifest.filter((entry) => !opts.injectedFiles.has(entry.file));
-	if (candidates.length === 0) return [];
-	const task = buildSideQueryTask(candidates, opts.userPrompt, opts.maxFiles);
-	try {
-		const result = await ports.headless.run({
-			task,
-			cwd: opts.cwd,
-			model: opts.model,
-			effort: opts.effort,
-			maxTurns: 1,
-			timeoutMs: 30_000,
-			signal: opts.signal,
-			// 零工具就是意图：侧查询只需要回一个 JSON，给它任何工具都是白烧 token。
-			builtinTools: "none",
-			memoryTool: null,
-			sessionPersistence: opts.sessionPersistence,
-		});
-		if (result === null) return [];
-		return parseSelectedFiles(result, candidates, opts.maxFiles);
-	} catch {
-		return [];
-	}
-}
+/** autoSurfacing 描述符：core 自读 `cfg.autoSurfacing` 的预算，适配层只给宿主数据。 */
+export const autoSurfacing: MemoryTask<SurfacingInput, SurfacingResult> = {
+	id: "autoSurfacing",
+	plan: {
+		maxTurns: 1,
+		timeoutMs: 30_000,
+		memoryTool: null,
+		lock: "none",
+		errorPolicy: "swallow",
+	},
+	buildPrompt(cfg, _deps, input) {
+		const remaining = candidates(input);
+		if (remaining.length === 0) return null;
+		return buildSideQueryTask(remaining, input.userPrompt, cfg.autoSurfacing.maxFiles);
+	},
+	async parse(cfg, deps, input, text) {
+		const selected = parseSelectedFiles(text, candidates(input), cfg.autoSurfacing.maxFiles);
+		// 只返回真正渲染出来的文件：预算被 maxInjectionBytes 截断、或 readEntry 读不到时，
+		// 未渲染的文件不能进 `files`，否则适配层会把它们标记成已注入、整个 session 不再浮现。
+		return renderSurfacedEntries(
+			deps.store,
+			selected,
+			cfg.autoSurfacing.maxEntryBytes,
+			cfg.autoSurfacing.maxInjectionBytes,
+		);
+	},
+	notCompleted() {
+		return { files: [], content: "" };
+	},
+};
+

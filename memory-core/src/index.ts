@@ -52,12 +52,11 @@ export { sanitizeForInjection, stripInvisibleChars } from "./store/sanitize.js";
 export { escapeWindowsTrailing, isReservedWindowsName, windowsSafeName } from "./store/windows-names.js";
 
 // ── 配置（默认值、合并语义、模型校验、共享数据根）──────────────────────────────
-// 配置文件**在哪**是宿主知识，由适配层组装成 `loadConfigFrom` 的 `files` 入参。
+// core 只给默认值与合并语义；配置文件在哪、读不读，是适配层的事。
 export {
 	DEFAULT_CONFIG,
 	defaultMemoryRoot,
 	expandTilde,
-	loadConfigFrom,
 	mergeConfig,
 	modelConfigErrors,
 	requiredModel,
@@ -69,7 +68,6 @@ export type {
 	DefaultsConfig,
 	EffortLevel,
 	ExtractMemoriesConfig,
-	LoadConfigFromOptions,
 	MemoryConfig,
 	ModelTask,
 	SessionPersistenceConfig,
@@ -104,20 +102,30 @@ export type { EntryManifest } from "./injection.js";
 // ── orchestration/ LLM 编排 ───────────────────────────────────────────────────
 // 适配层实现 `HeadlessAgentPort` 与 `HostTranscriptPort` 两个端口，就能拿到与 pi 完全相同的
 // dream / extract / 侧查询行为（prompt 文本、锁与快照边界、截断预算、错误语义）。
-export { runDream } from "./orchestration/dream.js";
-export type { RunDreamOpts } from "./orchestration/dream.js";
-export { runExtract } from "./orchestration/extract.js";
-export type { ExtractPorts, RunExtractOpts } from "./orchestration/extract.js";
+export { runTask } from "./orchestration/task.js";
+export { TASKS } from "./orchestration/tasks.js";
+export { moduleStatusRows } from "./orchestration/status.js";
+export type { ModuleStatusRow } from "./orchestration/status.js";
+export type {
+	Incomplete,
+	MemoryTask,
+	MemoryToolOnWrite,
+	TaskContext,
+	TaskDeps,
+	TaskPlan,
+} from "./orchestration/task.js";
+export type { ExtractInput, ExtractResult } from "./orchestration/extract.js";
 export { renderConversation } from "./orchestration/conversation.js";
 export type { ConversationLimits } from "./orchestration/conversation.js";
-export { runSideQuery } from "./orchestration/surfacing.js";
-export type { RunSideQueryOpts } from "./orchestration/surfacing.js";
+export type { SurfacingInput, SurfacingResult } from "./orchestration/surfacing.js";
 export { buildDreamTask, buildExtractTask } from "./orchestration/prompts.js";
 export type {
 	ExtractMessage,
 	HeadlessAgentPort,
+	HeadlessOutcome,
 	HeadlessRunRequest,
 	HostTranscriptPort,
+	IncompleteOutcome,
 	OrchestrationPorts,
 } from "./orchestration/ports.js";
 export { memoryToolSchema } from "./tool/schema.js";

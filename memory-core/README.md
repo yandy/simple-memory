@@ -17,10 +17,10 @@ machine share one memory.
 | **Store** | `MemoryStore` — `listEntries` / `readEntry` / `readIndex` / `searchEntries` / `addEntry` / `replaceEntry` / `removeEntry` / `renameEntry` / `rebuildIndex`, plus the logical-lock API |
 | **Concurrency & recovery** | a cross-process `.lock` held for milliseconds and never auto-reclaimed; an in-process logical lock per primitive call or per whole dream round; transient-error retry; `.backups/<ts>-<label>/` rollback points |
 | **Paths & safety** | git-remote normalisation to a single legal directory component, directory-escape assertion, injection sanitising, Windows reserved-name handling |
-| **Orchestration** | `runDream`, `runExtract`, `runSideQuery` and their prompt text, over the two ports below |
+| **Orchestration** | the three task descriptors in `TASKS` (`autoSurfacing`, `extractMemories`, `dream`) and the `runTask` entry point, with their prompt text, over the two ports below |
 | **Injection policy** | index windowing (newest N lines / bytes), entry truncation, capacity reporting, `scanEntries`, `renderSurfacedBlock` — pure functions that return strings |
 | **Tool contract** | the action sets, the JSON Schema, the model-facing text, and `createMemoryActionHandler` |
-| **Config** | defaults, deep-merge over an explicit file list, `~` expansion, model-config validation, `defaultMemoryRoot()` |
+| **Config** | defaults, `mergeConfig` deep-merge, `~` expansion, model-config validation, `defaultMemoryRoot()` — no file IO: adapters read files and call `mergeConfig` |
 
 No LLM call, no UI, no host API: `src/**` imports only `node:*` and relative paths, and
 `tests/neutrality.test.ts` fails the build if that ever changes.
@@ -48,7 +48,6 @@ path when there is none), so clones and worktrees of one repository share memory
   Test-command.md      — one file per memory
   .lock                — cross-process write lock (held for milliseconds, never auto-reclaimed)
   .backups/            — rollback points: <ISO-ts>-<label>/ (plus migrate-<ts>/ whole-directory snapshots from earlier 1.x migrations)
-  .dream-meta.json     — last dream timestamp + session count (drives the nudge)
   sessions/            — persisted headless sessions, only when sessionPersistence is enabled
 ```
 
@@ -137,8 +136,8 @@ export interface HeadlessRunRequest {
 }
 
 export interface HeadlessAgentPort {
-  /** null = the round did not run (host declined or timed out). */
-  run(req: HeadlessRunRequest): Promise<string | null>;
+  /** completed / no-output / incomplete / not-run — see `HeadlessOutcome`. */
+  run(req: HeadlessRunRequest): Promise<HeadlessOutcome>;
 }
 
 export interface HostTranscriptPort {
@@ -148,8 +147,33 @@ export interface HostTranscriptPort {
 }
 ```
 
-`runDream(opts, { headless })`, `runExtract(opts, { headless, transcript })` and
-`runSideQuery(opts, { headless })` take the ports explicitly — there is no module-level singleton.
+`HeadlessOutcome` is the result your `run` must return. It is a four-arm union:
+
+```ts
+type HeadlessOutcome =
+	| { status: "completed"; text: string }
+	| { status: "no-output" }
+	| { status: "incomplete"; cause: "max-tokens" | "turn-limit" | "aborted" }
+	| { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
+```
+
+**Discriminate by when the run ended: finished before the request was issued → `not-run`; issued
+without a complete answer → `incomplete`.** (`no-output` is the "ran, produced no text" case; an
+empty completed reply is `{ status: "completed", text: "" }`, not `no-output`.)
+
+The tasks translate each arm as follows:
+
+- **extract**: `not-run` → `{ skipped: true }`; `incomplete` → ran-with-partial (`{ skipped: false }`);
+  `no-output` → `{ skipped: false, result: "" }`.
+- **dream**: throws on every non-`completed` outcome (it is fail-closed).
+- **surfacing**: returns an empty result (`{ files: [], content: "" }`).
+
+This is the shape a new `HeadlessAgentPort` must return — `runTask` is built on top of it and does
+not fall back to a plain string.
+
+`runTask(TASKS.autoSurfacing, input, ctx)`, `runTask(TASKS.extractMemories, input, ctx)` and
+`runTask(TASKS.dream, input, ctx)` take the ports explicitly through `ctx.ports` — there is no
+module-level singleton.
 
 **Watch the allowlist trap.** If your harness's `tools` option is an allowlist that also filters
 custom tools, then "no builtin tools, only the `memory` tool" must be expressed some other way.
@@ -164,15 +188,15 @@ can call nothing yet still "succeeds".
 | Prompt-cache optimisations (recording/replaying the frozen value) | pure host machinery |
 | Tool schema conversion, UI rendering, notifications | host-specific schema DSL and UI channels |
 | Model resolution and validation | host-specific registry; `model`/`effort` are opaque strings here |
-| Where config files live, and whether the project is trusted | host knowledge; `loadConfigFrom(files)` takes an explicit list |
-| Counting sessions to decide when to nudge | needs the host's session store |
+| Where config files live, and whether the project is trusted | host knowledge; the adapter reads its own files and hands the parsed object to `mergeConfig` |
+| Deciding when to remind the user to consolidate | needs the host's session store and reminder thresholds |
 
 ### Config helpers new in 1.1.0
 
 - `mergeConfig(base, overlay)` deep-merges an in-memory object into a `MemoryConfig`. Use it when the
   host's config is **not a file** — a cordis row's `config:` object handed to the plugin at activation,
-  for example. `loadConfigFrom(files)` now delegates to it, so there is exactly one merge implementation
-  and the two paths stay in lockstep.
+  for example. There is exactly one merge implementation; adapters that do read files parse them and
+  hand the result to `mergeConfig`.
 - `EffortLevel` is the type of every thinking/reasoning level in the config. It is an **opaque string**:
   core passes it through without interpreting or validating it. Legal values are per-host data (in dsh,
   per-provider-route), which is why a closed enum was the wrong shape. `ThinkLevel` remains as a
@@ -183,14 +207,40 @@ can call nothing yet still "succeeds".
   `tasks` keeps the previous behaviour: dream is always in the required set and the other two are gated
   by `enabled`.
 
+## What changed in 2.0.0
+
+**Config file IO moved to the adapters.** Core no longer reads files. **`loadConfigFrom` was removed in
+2.0.0**, and `LoadConfigFromOptions`, the options type it took, went with it — if your build now fails
+with "`loadConfigFrom` is not exported" ("does not provide an export named 'loadConfigFrom'"), that
+removal is the explanation, and there is no compatibility shell to fall back on. Core still owns the
+config *semantics*: `DEFAULT_CONFIG`, `mergeConfig`, `defaultMemoryRoot` and `expandTilde`. An adapter
+reads its own config file(s) and then calls `mergeConfig` on the parsed object — pi reads its two
+`memory.json` files that way, and dsh merges its cordis row `config:` object the same way. Where files
+live, and whether a project is trusted, is host knowledge and stays in the adapter.
+
+**The three model tasks are now first-class.** `autoSurfacing`, `extractMemories` and `dream` are task
+descriptors declared once in `TASKS`; the single entry point is `runTask(task, input, ctx)`, which reads
+the config, builds the prompt, applies the task's lock/snapshot plan and runs the port. The three legacy
+`run*` functions are gone, along with their option types `RunSideQueryOpts`, `RunExtractOpts`,
+`RunDreamOpts`, and the `ExtractPorts` interface. `HeadlessAgentPort.run` now returns a `HeadlessOutcome` (`completed` /
+`no-output` / `incomplete` / `not-run`) instead of `string | null`, so a port can tell "ran but produced
+nothing" apart from "never ran". Each adapter declares the tasks it implements in `IMPLEMENTED_TASKS`,
+and `/memory`'s module line is derived from core's `moduleStatusRows(cfg, tasks)` — core supplies the
+rows, the adapter keeps its own wording and ordering.
+
+**The dream-nudge keys left the shared config.** The `memory.json` keys are unchanged and still live
+under `dream`, but core no longer owns them: pi reads them into its own `PiHostConfig` (defaults
+5 / 24), and they are no longer part of `MemoryConfig`. The reminder policy is a single-host concern,
+so it belongs to the adapter, not the shared core.
+
 ### Mapping used by the pi adapter
 
 | Need | core | pi |
 |---|---|---|
 | Index into the system prompt | `buildIndexSection`, `truncateIndexForInjection`, `indexInjectionCapacity` | `systemPromptOptions.sections["memory_index"]` + transcript replay |
-| Per-turn surfaced memories | `scanEntries`, `runSideQuery`, `renderSurfacedBlock` | message injection, per-session dedupe |
+| Per-turn surfaced memories | `scanEntries`, `runTask(TASKS.autoSurfacing, …)` | message injection, per-session dedupe |
 | The `memory` tool | `memoryToolSchema`, `MEMORY_TOOL_*`, `createMemoryActionHandler` | typebox + `ToolDefinition` + pi-tui rendering + `ctx.ui.notify` |
-| dream / extract rounds | `runDream`, `runExtract`, prompts | `createAgentSession` via `createPiHeadlessAgent` |
+| dream / extract rounds | `runTask(TASKS.dream, …)`, `runTask(TASKS.extractMemories, …)`, prompts | `createAgentSession` via `createPiHeadlessAgent` |
 | Past-session search | `HostTranscriptPort.searchSessions` | `SessionManager` |
 
 ## Windows

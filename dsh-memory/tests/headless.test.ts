@@ -40,7 +40,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("ab");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "ab" });
 	});
 
 	it("ignores a text-delta whose text is not a string instead of appending 'undefined'", async () => {
@@ -51,7 +51,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("ok");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "ok" });
 	});
 
 	it("accumulates text block-end chunks and ignores usage/block-start", async () => {
@@ -64,7 +64,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("hello ");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "hello " });
 	});
 
 	it("does not double-count when a text-delta and a same-index block-end both arrive", async () => {
@@ -75,13 +75,16 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("hello");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "hello" });
 	});
 
 	it("yields the same text from delta-only and block-end-only streams", async () => {
 		const run = (chunks: StreamChunkLike[]) => createDshHeadless({ stream: chunkStream(...chunks) }).run(baseReq());
-		expect(await run([{ type: "text-delta", index: 0, text: "same" }])).toBe("same");
-		expect(await run([{ type: "block-end", index: 0, block: { type: "text", text: "same" } }])).toBe("same");
+		expect(await run([{ type: "text-delta", index: 0, text: "same" }])).toEqual({ status: "completed", text: "same" });
+		expect(await run([{ type: "block-end", index: 0, block: { type: "text", text: "same" } }])).toEqual({
+			status: "completed",
+			text: "same",
+		});
 	});
 
 	it("returns only the answer, not the reasoning, when reasoning-delta is present", async () => {
@@ -92,7 +95,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("answer");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "answer" });
 	});
 
 	it("excludes reasoning text even when a text-delta lands on a reasoning block-start bucket", async () => {
@@ -105,7 +108,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("answer");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "answer" });
 	});
 
 	it("orders by block-start first-seen, not by the order text deltas arrive", async () => {
@@ -118,7 +121,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("ab");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "ab" });
 	});
 
 	it("concatenates multiple text blocks in first-seen order when their indices arrive out of order", async () => {
@@ -129,7 +132,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("ba");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "ba" });
 	});
 
 	it("freezes an index once its block-end has arrived, ignoring later deltas for that index", async () => {
@@ -140,7 +143,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("A");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "A" });
 	});
 
 	it("keys buckets by the raw index, so chunks without an index share one bucket and append together", async () => {
@@ -151,7 +154,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("ab");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "ab" });
 	});
 
 	it("does not use a -1 sentinel: a missing index and a real -1 index stay separate buckets", async () => {
@@ -162,7 +165,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("AB");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "AB" });
 	});
 
 	it("returns the accumulated text on a normal stop finish chunk", async () => {
@@ -173,7 +176,7 @@ describe("createDshHeadless — 成功路径", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("done ");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "done " });
 	});
 
 	it("reads to exhaustion, never entering the iterator.return cleanup channel, on a stop finish", async () => {
@@ -199,23 +202,23 @@ describe("createDshHeadless — 成功路径", () => {
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("done ");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "done " });
 	});
 
-	it("returns an empty string (not null) for a successful round with no text", async () => {
+	it("maps a clean empty answer to completed with empty text (an empty answer is not 'not-run')", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream({ type: "finish", reason: { kind: "stop" } }),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "" });
 	});
 
-	it("returns an empty string when the only text is whitespace", async () => {
+	it("maps a whitespace-only answer to completed with empty text", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream({ type: "text-delta", text: "   " }),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBe("");
+		expect(await port.run(baseReq())).toEqual({ status: "completed", text: "" });
 	});
 });
 
@@ -276,30 +279,38 @@ describe("createDshHeadless — 传给 llm.stream 的入参", () => {
 });
 
 describe("createDshHeadless — 不支持的请求", () => {
-	it("returns null and never calls llm.stream for builtinTools: file-io", async () => {
+	it("maps builtinTools: file-io to not-run/host-refused and never calls llm.stream", async () => {
 		const stream = vi.fn(() => emptyStream());
 		const port = createDshHeadless({ stream });
-		expect(await port.run(baseReq({ builtinTools: "file-io" }))).toBeNull();
+		expect(await port.run(baseReq({ builtinTools: "file-io" }))).toEqual({
+			status: "not-run",
+			cause: "host-refused",
+			detail: expect.any(String),
+		});
 		expect(stream).not.toHaveBeenCalled();
 	});
 
-	it("returns null and never calls llm.stream for a non-null memoryTool", async () => {
+	it("maps a non-null memoryTool to not-run/host-refused and never calls llm.stream", async () => {
 		const stream = vi.fn(() => emptyStream());
 		const port = createDshHeadless({ stream });
-		expect(await port.run(baseReq({ memoryTool: { actions: ["list"] } }))).toBeNull();
+		expect(await port.run(baseReq({ memoryTool: { actions: ["list"] } }))).toEqual({
+			status: "not-run",
+			cause: "host-refused",
+			detail: expect.any(String),
+		});
 		expect(stream).not.toHaveBeenCalled();
 	});
 
-	it("returns null and never calls llm.stream for an unparseable model", async () => {
+	it("maps an unparseable model to not-run/unavailable and never calls llm.stream", async () => {
 		const stream = vi.fn(() => emptyStream());
 		const port = createDshHeadless({ stream });
-		expect(await port.run(baseReq({ model: "no-slash" }))).toBeNull();
+		expect(await port.run(baseReq({ model: "no-slash" }))).toEqual({ status: "not-run", cause: "unavailable" });
 		expect(stream).not.toHaveBeenCalled();
 	});
 });
 
 describe("createDshHeadless — 两条失败通道", () => {
-	it("returns null on a terminal error finish chunk (NO_ADAPTER)", async () => {
+	it("maps a terminal error finish chunk (NO_ADAPTER) to not-run/host-refused", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream({
 				type: "finish",
@@ -307,28 +318,50 @@ describe("createDshHeadless — 两条失败通道", () => {
 			}),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBeNull();
+		expect(await port.run(baseReq())).toEqual({
+			status: "not-run",
+			cause: "host-refused",
+			detail: expect.any(String),
+		});
 	});
 
-	it("returns null on a terminal aborted finish chunk (no failure field, like the fake host)", async () => {
+	it("maps a terminal aborted finish chunk (no failure field, like the fake host) to incomplete/aborted", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream({ type: "finish", reason: { kind: "aborted" } }),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBeNull();
+		expect(await port.run(baseReq())).toEqual({ status: "incomplete", cause: "aborted" });
 	});
 
-	it("returns null (not throwing) when llm.stream itself throws", async () => {
+	it("maps a throwing llm.stream to not-run/host-refused carrying the error message", async () => {
 		const llm: LlmLike = {
 			stream() {
 				throw Object.assign(new Error("auth failed"), { code: "AUTH" });
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBeNull();
+		expect(await port.run(baseReq())).toEqual({
+			status: "not-run",
+			cause: "host-refused",
+			detail: "auth failed",
+		});
 	});
 
-	it("returns null (not the partial text) when an error finish follows a text chunk", async () => {
+	it("maps a stream that throws after the caller aborted to incomplete/aborted, not host-refused", async () => {
+		const controller = new AbortController();
+		const llm: LlmLike = {
+			async *stream() {
+				yield { type: "text-delta", text: "partial" };
+				controller.abort();
+				// 宿主把 abort 变成异常抛出而不是终止 chunk：这是「已发出后被中断」，不是宿主拒绝。
+				throw new DOMException("aborted", "AbortError");
+			},
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "incomplete", cause: "aborted" });
+	});
+
+	it("drops the partial text when an error finish follows a text chunk", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream(
 				{ type: "text-delta", text: "partial" },
@@ -336,21 +369,25 @@ describe("createDshHeadless — 两条失败通道", () => {
 			),
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq())).toBeNull();
+		expect(await port.run(baseReq())).toEqual({
+			status: "not-run",
+			cause: "host-refused",
+			detail: expect.any(String),
+		});
 	});
 });
 
 describe("createDshHeadless — signal", () => {
-	it("returns null and never calls llm.stream when the signal is already aborted", async () => {
+	it("maps an already-aborted signal to not-run/aborted and never calls llm.stream", async () => {
 		const controller = new AbortController();
 		controller.abort();
 		const stream = vi.fn(() => emptyStream());
 		const port = createDshHeadless({ stream });
-		expect(await port.run(baseReq({ signal: controller.signal }))).toBeNull();
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "not-run", cause: "aborted" });
 		expect(stream).not.toHaveBeenCalled();
 	});
 
-	it("returns null (not the partial text) when the signal aborts mid-stream", async () => {
+	it("maps an in-loop mid-stream abort to incomplete/aborted (issued, not host-refused)", async () => {
 		const controller = new AbortController();
 		const llm: LlmLike = {
 			async *stream() {
@@ -361,10 +398,10 @@ describe("createDshHeadless — signal", () => {
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq({ signal: controller.signal }))).toBeNull();
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "incomplete", cause: "aborted" });
 	});
 
-	it("returns null on the next chunk when the signal aborts but the stream ignores it", async () => {
+	it("gives up on the next chunk when the signal aborts but the stream ignores it", async () => {
 		const controller = new AbortController();
 		const llm: LlmLike = {
 			async *stream() {
@@ -376,12 +413,13 @@ describe("createDshHeadless — signal", () => {
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq({ signal: controller.signal }))).toBeNull();
+		// 定时器没响，只有调用方取消：已发出的调用被中断，是 `incomplete`。
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "incomplete", cause: "aborted" });
 	});
 });
 
 describe("createDshHeadless — timeout", () => {
-	it("returns null when timeoutMs elapses and aborts the stream's signal", async () => {
+	it("maps its own timeout to not-run/timeout and aborts the stream's signal", async () => {
 		let seenSignal: AbortSignal | undefined;
 		const llm: LlmLike = {
 			async *stream(opts) {
@@ -395,8 +433,23 @@ describe("createDshHeadless — timeout", () => {
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq({ timeoutMs: 20 }))).toBeNull();
+		expect(await port.run(baseReq({ timeoutMs: 20 }))).toEqual({ status: "not-run", cause: "timeout" });
 		expect(seenSignal?.aborted).toBe(true);
+	});
+
+	it("maps an aborting llm.stream to not-run/timeout when its own timer fired", async () => {
+		const llm: LlmLike = {
+			async *stream(opts) {
+				// 宿主把 abort 变成异常抛出，而不是终止 chunk：超时仍必须是 timeout，不是 host-refused。
+				await new Promise<void>((resolve) => {
+					if (opts.signal?.aborted) return resolve();
+					opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				throw new DOMException("aborted", "AbortError");
+			},
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq({ timeoutMs: 20 }))).toEqual({ status: "not-run", cause: "timeout" });
 	});
 
 	it("composes the timeout with the caller's signal so either abort ends the stream", async () => {
@@ -415,7 +468,7 @@ describe("createDshHeadless — timeout", () => {
 		const port = createDshHeadless(llm);
 		const pending = port.run(baseReq({ signal: controller.signal, timeoutMs: 50 }));
 		controller.abort();
-		expect(await pending).toBeNull();
+		expect(await pending).toEqual({ status: "incomplete", cause: "aborted" });
 		expect(seenSignal?.aborted).toBe(true);
 	});
 
@@ -428,7 +481,7 @@ describe("createDshHeadless — timeout", () => {
 				},
 			};
 			const port = createDshHeadless(llm);
-			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toBe("ok");
+			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toEqual({ status: "completed", text: "ok" });
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();
@@ -442,7 +495,7 @@ describe("createDshHeadless — timeout", () => {
 				stream: chunkStream({ type: "finish", reason: { kind: "error" } }),
 			};
 			const port = createDshHeadless(llm);
-			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toBeNull();
+			expect((await port.run(baseReq({ timeoutMs: 30_000 }))).status).toBe("not-run");
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();
@@ -458,7 +511,7 @@ describe("createDshHeadless — timeout", () => {
 				},
 			};
 			const port = createDshHeadless(llm);
-			expect(await port.run(baseReq({ timeoutMs: 30_000 }))).toBeNull();
+			expect((await port.run(baseReq({ timeoutMs: 30_000 }))).status).toBe("not-run");
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();
@@ -480,7 +533,7 @@ describe("createDshHeadless — timeout", () => {
 			const port = createDshHeadless(llm);
 			const pending = port.run(baseReq({ timeoutMs: 30_000 }));
 			await vi.advanceTimersByTimeAsync(30_000);
-			expect(await pending).toBeNull();
+			expect(await pending).toEqual({ status: "not-run", cause: "timeout" });
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();

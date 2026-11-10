@@ -15,10 +15,10 @@
 | **读写门面** | `MemoryStore` —— `listEntries` / `readEntry` / `readIndex` / `searchEntries` / `addEntry` / `replaceEntry` / `removeEntry` / `renameEntry` / `rebuildIndex`，外加逻辑锁 API |
 | **并发与恢复** | 只持毫秒、永不自动回收的跨进程 `.lock`；按「一次原语调用」或「一整轮 dream」持有的进程内逻辑锁；瞬时错误重试；`.backups/<ts>-<label>/` 回滚点 |
 | **路径与安全** | git remote 归一化成单个合法目录名、目录逃逸断言、注入净化、Windows 保留设备名处理 |
-| **LLM 编排** | `runDream`、`runExtract`、`runSideQuery` 及其 prompt 文本，跑在下面两个端口之上 |
+| **LLM 编排** | `TASKS` 里的三个任务描述符（`autoSurfacing` / `extractMemories` / `dream`）与 `runTask` 入口，及其 prompt 文本，跑在下面两个端口之上 |
 | **注入策略** | 索引窗口（最新 N 行 / N 字节）、正文截断、容量口径、`scanEntries`、`renderSurfacedBlock` —— 全是返回字符串的纯函数 |
 | **工具契约** | action 集合、JSON Schema、模型可见文案、`createMemoryActionHandler` |
-| **配置** | 默认值、按显式文件列表 deep-merge、`~` 展开、模型配置校验、`defaultMemoryRoot()` |
+| **配置** | 默认值、`mergeConfig` deep-merge、`~` 展开、模型配置校验、`defaultMemoryRoot()` —— 不读文件：适配层自己读文件后调 `mergeConfig` |
 
 没有 LLM 调用、没有 UI、没有宿主 API：`src/**` 只 import `node:*` 与相对路径，
 `tests/neutrality.test.ts` 会在这一点被破坏时让构建变红。
@@ -45,7 +45,6 @@ clone 与 worktree 共享记忆。
   Test-command.md      — 一条记忆一个文件
   .lock                — 跨进程写锁（只持毫秒，永不自动回收）
   .backups/            — 回滚点：<ISO-ts>-<label>/（以及旧版 1.x 迁移留下的 migrate-<ts>/ 整目录快照）
-  .dream-meta.json     — 上次 dream 的时间与会话数（提醒逻辑用它）
   sessions/            — headless 会话落盘目录，仅在开启 sessionPersistence 时使用
 ```
 
@@ -133,8 +132,8 @@ export interface HeadlessRunRequest {
 }
 
 export interface HeadlessAgentPort {
-  /** null = 本轮没跑（宿主拒绝或超时）。 */
-  run(req: HeadlessRunRequest): Promise<string | null>;
+  /** completed / no-output / incomplete / not-run —— 见 `HeadlessOutcome`。 */
+  run(req: HeadlessRunRequest): Promise<HeadlessOutcome>;
 }
 
 export interface HostTranscriptPort {
@@ -144,8 +143,30 @@ export interface HostTranscriptPort {
 }
 ```
 
-`runDream(opts, { headless })`、`runExtract(opts, { headless, transcript })`、
-`runSideQuery(opts, { headless })` 都显式收端口 —— 没有模块级单例。
+`HeadlessOutcome` 是 `run` 必须返回的结果，它是一个四分支 union：
+
+```ts
+type HeadlessOutcome =
+	| { status: "completed"; text: string }
+	| { status: "no-output" }
+	| { status: "incomplete"; cause: "max-tokens" | "turn-limit" | "aborted" }
+	| { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
+```
+
+**判别规则：请求发出之前就结束 → `not-run`；发出之后没拿到完整答案 → `incomplete`。**
+（`no-output` 是「跑了但没有任何文本」；空回复是 `{ status: "completed", text: "" }`，不是 `no-output`。）
+
+各任务的后果：
+
+- **extract**：`not-run` → `{ skipped: true }`；`incomplete` → 跑过一部分（`{ skipped: false }`）；
+  `no-output` → `{ skipped: false, result: "" }`。
+- **dream**：任何非 `completed` 结果都会抛错（fail-closed）。
+- **surfacing**：返回空结果（`{ files: [], content: "" }`）。
+
+注意：这是新的 `HeadlessAgentPort` 必须返回的形状 —— `runTask` 建在它之上，不会退回到纯字符串。
+
+`runTask(TASKS.autoSurfacing, input, ctx)`、`runTask(TASKS.extractMemories, input, ctx)`、
+`runTask(TASKS.dream, input, ctx)` 都通过 `ctx.ports` 显式收端口 —— 没有模块级单例。
 
 **注意白名单陷阱。** 如果宿主的 `tools` 选项是一个连 custom tools 一起过滤的白名单，那么
 「关掉 builtin、只留 `memory` 工具」必须用别的方式表达。pi 的方式是 `noTools: "builtin"`；
@@ -159,14 +180,14 @@ export interface HostTranscriptPort {
 | prompt cache 优化（录制/重放冻结值） | 纯宿主机制 |
 | 工具 schema 转换、UI 渲染、通知 | 宿主自己的 schema DSL 与 UI 通道 |
 | 模型解析与校验 | 宿主自己的注册表；这里 `model` / `effort` 是不透明字符串 |
-| 配置文件在哪、项目是否受信任 | 宿主知识；`loadConfigFrom(files)` 收显式的文件列表 |
+| 配置文件在哪、项目是否受信任 | 宿主知识；适配层自己读文件，把解析结果交给 `mergeConfig` |
 | 数会话数以决定何时提示 consolidate | 需要宿主的会话存储 |
 
 ### 1.1.0 新增的配置辅助
 
 - `mergeConfig(base, overlay)` 把一个内存里的对象深合并进 `MemoryConfig`。宿主的配置**不是文件**时用它
-  —— 比如 cordis 行在激活插件时递进来的 `config:` 对象。`loadConfigFrom(files)` 现在委托给它，因此
-  只有这一份合并实现，两条路径始终一致。
+  —— 比如 cordis 行在激活插件时递进来的 `config:` 对象。合并实现只有这一份；要读文件的适配层自己
+  解析后把结果交给 `mergeConfig`。
 - `EffortLevel` 是配置里所有思考/推理档位的类型。它是**不透明字符串**：core 原样透传，不解释、不校验。
   合法值属于宿主数据（dsh 里按 provider 路线而异），所以闭枚举是错的形状。`ThinkLevel` 作为 deprecated
   别名保留，已有适配层的类型重导出不会破。
@@ -174,14 +195,37 @@ export interface HostTranscriptPort {
   让适配层声明**自己真正实现了哪些任务** —— 不再被迫为它没有的任务索要模型（例如没有 dream 支持的
   适配层）。省略 `tasks` 保持旧行为：dream 恒在必需集合内，另两个按 `enabled` 决定。
 
+## 2.0.0 有什么变化
+
+**配置文件 IO 下放给适配层。** core 不再读文件：**`loadConfigFrom` 已在 2.0.0 移除**，它收的那个
+`LoadConfigFromOptions` 选项类型也一并删掉。如果你的代码报「`loadConfigFrom` is not exported」
+（`does not provide an export named 'loadConfigFrom'`），原因就是这个删除，而且没有兼容壳可退。
+它仍保留配置的**语义**：`DEFAULT_CONFIG`、`mergeConfig`、`defaultMemoryRoot` 与 `expandTilde`。
+适配层自己读自己的配置文件，再把解析出的对象交给 `mergeConfig` ——
+pi 就这么读它的两个 `memory.json`，dsh 也这么合并它的 cordis 行 `config:` 对象。文件在哪、项目
+是否受信任，是宿主知识，留在适配层。
+
+**三个模型任务现在是一等对象。** `autoSurfacing`、`extractMemories`、`dream` 是声明在 `TASKS` 里的
+任务描述符，唯一的入口是 `runTask(task, input, ctx)`：它自己读 config、造 prompt、施加该任务的
+锁/快照计划、再跑端口。旧的三个 `run*` 函数删掉了，一起删掉的还有它们的选项类型 `RunSideQueryOpts`、`RunExtractOpts`、
+`RunDreamOpts`，以及 `ExtractPorts` 接口。`HeadlessAgentPort.run` 现在返回
+`HeadlessOutcome`（`completed` / `no-output` / `incomplete` / `not-run`）而不是 `string | null`，
+端口因此能区分「跑了但没写出东西」与「根本没跑」。每个适配层用 `IMPLEMENTED_TASKS` 声明自己实现了
+哪些任务，`/memory` 的模块行由 core 的 `moduleStatusRows(cfg, tasks)` 派生 —— core 给行数据，措辞与
+顺序仍是适配层自己的事。
+
+**dream 的 nudge 键移出共享配置。** `memory.json` 的键名不变、仍挂在 `dream` 下，但 core 不再拥有
+它们：pi 把它们读进自己的 `PiHostConfig`（默认值 5 / 24），它们不再是 `MemoryConfig` 的一部分。
+提醒策略是单宿主的关切，属于适配层而不是共享的 core。
+
 ### pi 适配层的对应关系
 
 | 需要 | core | pi |
 |---|---|---|
 | 索引进 system prompt | `buildIndexSection`、`truncateIndexForInjection`、`indexInjectionCapacity` | `systemPromptOptions.sections["memory_index"]` + transcript 重放 |
-| 每轮浮现的记忆 | `scanEntries`、`runSideQuery`、`renderSurfacedBlock` | message 注入、session 内去重 |
+| 每轮浮现的记忆 | `scanEntries`、`runTask(TASKS.autoSurfacing, …)` | message 注入、session 内去重 |
 | `memory` 工具 | `memoryToolSchema`、`MEMORY_TOOL_*`、`createMemoryActionHandler` | typebox + `ToolDefinition` + pi-tui 渲染 + `ctx.ui.notify` |
-| dream / extract 轮次 | `runDream`、`runExtract`、prompt 文本 | `createPiHeadlessAgent` 里的 `createAgentSession` |
+| dream / extract 轮次 | `runTask(TASKS.dream, …)`、`runTask(TASKS.extractMemories, …)`、prompt 文本 | `createPiHeadlessAgent` 里的 `createAgentSession` |
 | 搜历史会话 | `HostTranscriptPort.searchSessions` | `SessionManager` |
 
 ## Windows

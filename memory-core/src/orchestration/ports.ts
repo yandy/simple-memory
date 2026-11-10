@@ -8,11 +8,30 @@ import type { MemoryAction } from "../tool/actions.js";
  */
 
 /**
- * 跑一轮受限工具的 headless 会话，返回 assistant 文本。
+ * 一轮 headless 会话的结果。
  *
- * `null` = 本轮**未执行**（宿主拒绝、超时、或适配层判定不该跑）。调用方必须能区分
- * 「跑了但没写出东西」与「根本没跑」：`runExtract` 靠它决定要不要报 `{ skipped: true }`。
+ * **判别规则**：请求**发出之前**就结束 → `not-run`（没跑）；**发出之后**没拿到完整文本 →
+ * `incomplete`（跑过一部分，写入可能已发生）。`no-output` 是「跑完但终止事件没有任何 assistant
+ * 文本」—— 它是 `incomplete` 的极端形态，单独留一个 arm 是因为调用方对「跑了、没写出东西」与
+ * 「写了半截」的处置不同。
  */
+export type HeadlessOutcome =
+	/** 跑完并拿到了最终文本。空回复是 `text: ""`，**不是** `no-output`。 */
+	| { status: "completed"; text: string }
+	/** 跑过但拿不到最终文本（终止事件无 assistant 输出）。 */
+	| { status: "no-output" }
+	/** 跑过一部分：写入可能已发生。`aborted` 指请求已发出、中途被取消。 */
+	| { status: "incomplete"; cause: "max-tokens" | "turn-limit" | "aborted" }
+	/**
+	 * 请求从未真正开始：宿主拒绝、模型不可用、适配层判定不该发、请求前就超时。
+	 * `aborted` 指发出前取消。`detail` 是可选的一句人读诊断（宿主原始报错等）。
+	 */
+	| { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
+
+/** 描述符的 `incomplete` 收的那一半：除 `completed` 之外的一切。 */
+export type IncompleteOutcome = Exclude<HeadlessOutcome, { status: "completed" }>;
+
+/** 跑一轮受限工具的 headless 会话的请求：core 构造，适配层执行。 */
 export interface HeadlessRunRequest {
 	/** prompt 全文，由 core 的 `orchestration/prompts.ts` 生成。 */
 	task: string;
@@ -52,7 +71,13 @@ export interface HeadlessRunRequest {
 }
 
 export interface HeadlessAgentPort {
-	run(req: HeadlessRunRequest): Promise<string | null>;
+	/**
+	 * 跑一轮受限工具的 headless 会话。
+	 *
+	 * 结果必须是 `HeadlessOutcome`：调用方要靠 `status` 区分「跑了但没写出东西」与「根本没跑」
+	 * （extract 描述符靠它决定要不要报 `{ skipped: true }`）。传输级异常仍可抛。
+	 */
+	run(req: HeadlessRunRequest): Promise<HeadlessOutcome>;
 }
 
 /**

@@ -14,7 +14,7 @@ const { mockConfigValue, dirRef, dirOverrideRef } = vi.hoisted(() => ({
 		memIndexInjectMaxBytes: 16384,
 		lock: { timeoutMs: 5000, snapshotKeep: 5 },
 		defaults: { model: "test/model", sessionPersistence: { enabled: false } },
-		dream: { nudgeAfterSessions: 5, nudgeAfterHours: 24, thinkLevel: "high" as const },
+		dream: { thinkLevel: "high" as const },
 		sessionSearch: { maxSessions: 10, maxMatches: 5 },
 		autoSurfacing: {
 			enabled: true,
@@ -39,13 +39,10 @@ const { mockConfigValue, dirRef, dirOverrideRef } = vi.hoisted(() => ({
 	dirOverrideRef: { current: null as null | ((cwd: string) => string) },
 }));
 
-const { scanEntriesMock, runSideQueryMock, injectSurfacedContentMock, runExtractMock, runDreamMock, shouldNudgeMock, readRecordedMemoryIndexMock, readDreamMetaMock, writeDreamMetaMock, detectLegacyMemoryDirMock, createMemoryToolSpy } =
+const { scanEntriesMock, runTaskMock, shouldNudgeMock, readRecordedMemoryIndexMock, readDreamMetaMock, writeDreamMetaMock, detectLegacyMemoryDirMock, createMemoryToolSpy } =
 	vi.hoisted(() => ({
 		scanEntriesMock: vi.fn(),
-		runSideQueryMock: vi.fn(),
-		injectSurfacedContentMock: vi.fn(),
-		runExtractMock: vi.fn().mockResolvedValue({ skipped: false, result: "saved 1" }),
-		runDreamMock: vi.fn().mockResolvedValue("consolidated"),
+		runTaskMock: vi.fn(),
 		shouldNudgeMock: vi.fn(),
 		readRecordedMemoryIndexMock: vi.fn(),
 		readDreamMetaMock: vi.fn(),
@@ -60,17 +57,19 @@ vi.mock("../src/config", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../src/config")>();
 	return {
 		...actual,
-		loadConfig: vi.fn().mockImplementation(async () => ({ ...mockConfigValue, memoryDir: dirRef.current })),
+		loadConfig: vi.fn().mockImplementation(async () => ({
+			config: { ...mockConfigValue, memoryDir: dirRef.current },
+			host: PI_HOST_DEFAULTS,
+		})),
 	};
 });
 
-// auto-surfacing 的三个函数（scanEntries / runSideQuery / renderSurfacedBlock）与 dream / extract
-// 的编排现在都来自 core，在这里一并替换；applyIndexSection / buildInjection 走 pi 的真实实现，
-// 这样「sections 注入 + 冻结」这件事本身也被钉住。
-// `resolveMemoryDir` / `scanEntries` / `runDream` / `runExtract` / `buildDreamTask` 同样来自 core，
-// 但同一个包还提供 `MemoryStore` / `indexCapacity` / `parseEntryIndex` / `readLockStatus` /
-// `withFsRetry` / `LOCK_FILE` / `buildIndexSection` / `indexInjectionCapacity` —— 那些是本文件
-// 端到端写入用例的被测对象，必须保持真实，所以只能整体展开后替换这几个符号。
+// auto-surfacing 的 scanEntries 与三个任务共用的 runTask 都来自 core，在这里一并替换；
+// applyIndexSection / buildInjection 走 pi 的真实实现，这样「sections 注入 + 冻结」这件事本身也被钉住。
+// `resolveMemoryDir` / `scanEntries` / `runTask` 同样来自 core，但同一个包还提供 `MemoryStore` /
+// `indexCapacity` / `parseEntryIndex` / `readLockStatus` / `withFsRetry` / `LOCK_FILE` /
+// `buildIndexSection` / `indexInjectionCapacity` —— 那些是本文件端到端写入用例的被测对象，
+// 必须保持真实，所以只能整体展开后替换这几个符号。
 // 同一个模块只能有一个 `vi.mock` 工厂（后注册的会覆盖前者），所以两者必须写在一起。
 vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@yandy0725/memory-core")>();
@@ -79,11 +78,7 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 		resolveMemoryDir: vi.fn().mockImplementation(async (_config: unknown, cwd: string) =>
 			dirOverrideRef.current ? dirOverrideRef.current(cwd) : dirRef.current),
 		scanEntries: scanEntriesMock,
-		runSideQuery: runSideQueryMock,
-		renderSurfacedBlock: injectSurfacedContentMock,
-		runDream: runDreamMock,
-		runExtract: runExtractMock,
-		buildDreamTask: vi.fn().mockReturnValue("dream task"),
+		runTask: runTaskMock,
 	};
 });
 
@@ -118,8 +113,8 @@ vi.mock("../src/index-source", async (importOriginal) => {
 });
 
 import memoryFactory, { moduleStatusLine } from "../index";
-import { DEFAULT_CONFIG, loadConfig, type MemoryConfig } from "../src/config";
-import { DREAM_ACTIONS, INDEX_TRUNCATION_MARKER, MAIN_AGENT_ACTIONS } from "@yandy0725/memory-core";
+import { DEFAULT_CONFIG, loadConfig, PI_HOST_DEFAULTS, type MemoryConfig } from "../src/config";
+import { DREAM_ACTIONS, INDEX_TRUNCATION_MARKER, MAIN_AGENT_ACTIONS, TASKS } from "@yandy0725/memory-core";
 
 const LEGACY_TOPIC = [
 	"---",
@@ -232,11 +227,20 @@ describe("index wiring (integration)", () => {
 		await writeFile(join(dir, "MEMORY.md"), DISK_INDEX, "utf8");
 
 		scanEntriesMock.mockReset();
-		runSideQueryMock.mockReset();
-		injectSurfacedContentMock.mockReset();
-		runExtractMock.mockReset();
-		runExtractMock.mockResolvedValue({ skipped: false, result: "saved 1" });
-		runDreamMock.mockClear();
+		runTaskMock.mockReset();
+		runTaskMock.mockImplementation((task: { id?: string }, _input: unknown, ctx?: { cfg?: MemoryConfig }) => {
+			if (task.id === "dream") {
+				const model = ctx?.cfg?.dream?.model ?? ctx?.cfg?.defaults?.model;
+				if (model === undefined) {
+					return Promise.reject(
+						new Error('no model for dream — set "dream.model" or "defaults.model" in memory.json'),
+					);
+				}
+				return Promise.resolve("consolidated");
+			}
+			if (task.id === "extractMemories") return Promise.resolve({ skipped: false, result: "saved 1" });
+			return Promise.resolve({ files: [], content: "" });
+		});
 		shouldNudgeMock.mockReset();
 		shouldNudgeMock.mockResolvedValue({ nudge: false, message: "", sessions: 0, newEntries: 0 });
 		readRecordedMemoryIndexMock.mockReset();
@@ -256,6 +260,8 @@ describe("index wiring (integration)", () => {
 	afterEach(async () => {
 		await rm(dir, { recursive: true, force: true });
 		delete (mockConfigValue.autoSurfacing as any).sessionPersistence;
+		mockConfigValue.autoSurfacing.maxFiles = 5;
+		mockConfigValue.autoSurfacing.thinkLevel = "off";
 		mockConfigValue.extractMemories.enabled = false;
 		mockConfigValue.lock = { timeoutMs: 5000, snapshotKeep: 5 };
 		dirOverrideRef.current = null;
@@ -515,11 +521,10 @@ describe("index wiring (integration)", () => {
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
 		const injectedAtCall: Array<Set<string>> = [];
-		runSideQueryMock.mockImplementation(async (...args: any[]) => {
-			injectedAtCall.push(new Set(args[0].injectedFiles));
-			return ["ssh.md"];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: "<relevant_memories>\n## SSH\nx\n</relevant_memories>" };
 		});
-		injectSurfacedContentMock.mockResolvedValue("<relevant_memories>\n## SSH\nx\n</relevant_memories>");
 
 		const first = sectionsEvent();
 		await handlers["before_agent_start"][0](first, uiCtx());
@@ -564,7 +569,7 @@ describe("index wiring (integration)", () => {
 	it("session_shutdown waits for an in-flight extract", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let release: (() => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					release = () => resolve({ skipped: false, result: "ok" });
@@ -593,7 +598,7 @@ describe("index wiring (integration)", () => {
 	it("session_shutdown gives up after lock.timeoutMs rather than hanging", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		mockConfigValue.lock = { timeoutMs: 30, snapshotKeep: 5 };
-		runExtractMock.mockImplementationOnce(() => new Promise(() => {}));
+		runTaskMock.mockImplementationOnce(() => new Promise(() => {}));
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, uiCtx());
@@ -654,7 +659,7 @@ describe("index wiring (integration)", () => {
 	it("agent_end counts the writes made through the extract tool and notifies once", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					resolveExtract = resolve;
@@ -668,7 +673,7 @@ describe("index wiring (integration)", () => {
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(notify)));
 
 		// customTools[0] 就是传给 extract 的真工具：直接跑它，onWrite 就是唯一的计数通道
-		const onWrite = runExtractMock.mock.calls[0][0].onWrite;
+		const onWrite = runTaskMock.mock.calls[0][1].onWrite;
 		onWrite({ action: "add", name: "A" });
 		onWrite({ action: "add", name: "B" });
 		// `list` 是读、不计数：这条规则在 core 的 WRITE_ACTIONS 里（memory-core/tests/memory-handler.test.ts）。
@@ -685,7 +690,7 @@ describe("index wiring (integration)", () => {
 	it("agent_end uses the singular form for exactly one write", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					resolveExtract = resolve;
@@ -697,7 +702,7 @@ describe("index wiring (integration)", () => {
 		await handlers["session_start"][0]({}, uiCtx());
 
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(notify)));
-		const onWrite = runExtractMock.mock.calls[0][0].onWrite;
+		const onWrite = runTaskMock.mock.calls[0][1].onWrite;
 		onWrite({ action: "add", name: "A" });
 
 		resolveExtract?.({ skipped: false, result: "ok" });
@@ -714,11 +719,11 @@ describe("index wiring (integration)", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, uiCtx());
 
-		runExtractMock.mockResolvedValueOnce({ skipped: false, result: "nothing to save" });
+		runTaskMock.mockResolvedValueOnce({ skipped: false, result: "nothing to save" });
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(notify)));
 		await flush();
 
-		runExtractMock.mockResolvedValueOnce({ skipped: true });
+		runTaskMock.mockResolvedValueOnce({ skipped: true });
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(notify)));
 		await flush();
 
@@ -728,7 +733,7 @@ describe("index wiring (integration)", () => {
 	it("agent_end does not notify a headless session about extracted memories", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					resolveExtract = resolve;
@@ -743,7 +748,7 @@ describe("index wiring (integration)", () => {
 			{ messages: [{ role: "user", content: "hi" }] },
 			uiCtx({ hasUI: false, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }),
 		);
-		const onWrite = runExtractMock.mock.calls[0][0].onWrite;
+		const onWrite = runTaskMock.mock.calls[0][1].onWrite;
 		onWrite({ action: "add", name: "A" });
 
 		resolveExtract?.({ skipped: false, result: "ok" });
@@ -754,7 +759,7 @@ describe("index wiring (integration)", () => {
 
 	it("reports an extract failure once per session and resets the quota on session_start", async () => {
 		mockConfigValue.extractMemories.enabled = true;
-		runExtractMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
+		runTaskMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
 		const notify = vi.fn();
 		const ui = uiWith(notify);
 		const { pi, handlers } = createFakePi();
@@ -782,7 +787,7 @@ describe("index wiring (integration)", () => {
 
 	it("does not report an extract failure to a headless session", async () => {
 		mockConfigValue.extractMemories.enabled = true;
-		runExtractMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
+		runTaskMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
 		const notify = vi.fn();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -807,8 +812,7 @@ describe("index wiring (integration)", () => {
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 			{ file: "db.md", name: "DB", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
-		runSideQueryMock.mockResolvedValue(["ssh.md", "db.md"]);
-		injectSurfacedContentMock.mockResolvedValue("<relevant_memories>\n## SSH\nx\n\n## DB\ny\n</relevant_memories>");
+		runTaskMock.mockResolvedValue({ files: ["ssh.md", "db.md"], content: "<relevant_memories>\n## SSH\nx\n\n## DB\ny\n</relevant_memories>" });
 
 		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), uiCtx(uiWith(notify)));
 
@@ -824,13 +828,12 @@ describe("index wiring (integration)", () => {
 		scanEntriesMock.mockResolvedValue([
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
-		runSideQueryMock.mockResolvedValue(["ssh.md"]);
-		injectSurfacedContentMock.mockResolvedValue("");
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: "" });
 
 		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), uiCtx(uiWith(notify)));
 		expect(notify).not.toHaveBeenCalled();
 
-		injectSurfacedContentMock.mockResolvedValue("<relevant_memories>\n## SSH\nx\n</relevant_memories>");
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: "<relevant_memories>\n## SSH\nx\n</relevant_memories>" });
 		await handlers["before_agent_start"][0](
 			sectionsEvent("ssh?"),
 			uiCtx({ hasUI: false, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }),
@@ -894,7 +897,7 @@ describe("index wiring (integration)", () => {
 	it("delivers 'Extracted' from the sync UI snapshot when the session dies mid-extract", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					resolveExtract = resolve;
@@ -907,7 +910,7 @@ describe("index wiring (integration)", () => {
 		const session = disposableCtx();
 		const caught = await captureUnhandledRejections(async () => {
 			await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, session.ctx);
-			const onWrite = runExtractMock.mock.calls[0][0].onWrite;
+			const onWrite = runTaskMock.mock.calls[0][1].onWrite;
 			onWrite({ action: "add", name: "A" });
 
 			// extract 还没回来，session 先被 /new（或退出宽限超时）销毁了
@@ -924,7 +927,7 @@ describe("index wiring (integration)", () => {
 	it("does not reject unhandled when a failing extract settles after the session died", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let rejectExtract: ((reason?: unknown) => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((_resolve, reject) => {
 					rejectExtract = reject;
@@ -948,7 +951,7 @@ describe("index wiring (integration)", () => {
 	it("does not misreport a throwing 'Extracted' notice as an extract failure", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					resolveExtract = resolve;
@@ -963,7 +966,7 @@ describe("index wiring (integration)", () => {
 
 		const caught = await captureUnhandledRejections(async () => {
 			await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(notify)));
-			const onWrite = runExtractMock.mock.calls[0][0].onWrite;
+			const onWrite = runTaskMock.mock.calls[0][1].onWrite;
 			onWrite({ action: "add", name: "A" });
 			resolveExtract?.({ skipped: false, result: "ok" });
 			await flush();
@@ -974,7 +977,7 @@ describe("index wiring (integration)", () => {
 		expect(String(notify.mock.calls[0][0])).not.toMatch(/^Extract failed:/);
 
 		// 成功通知抛错不能烧掉失败通知配额：下一轮真失败仍然要报
-		runExtractMock.mockImplementationOnce(() => Promise.reject(new Error("model exploded")));
+		runTaskMock.mockImplementationOnce(() => Promise.reject(new Error("model exploded")));
 		const okNotify = vi.fn();
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(okNotify)));
 		await flush();
@@ -983,7 +986,7 @@ describe("index wiring (integration)", () => {
 
 	it("renders a non-Error rejection reason without 'undefined'", async () => {
 		mockConfigValue.extractMemories.enabled = true;
-		runExtractMock.mockImplementationOnce(() => Promise.reject("model exploded"));
+		runTaskMock.mockImplementationOnce(() => Promise.reject("model exploded"));
 		const notify = vi.fn();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -997,7 +1000,7 @@ describe("index wiring (integration)", () => {
 
 	it("resets the extract failure quota across a misconfigured restart", async () => {
 		mockConfigValue.extractMemories.enabled = true;
-		runExtractMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
+		runTaskMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, uiCtx());
@@ -1032,7 +1035,7 @@ describe("index wiring (integration)", () => {
 	it("settles the nudge dream without touching a disposed ctx", async () => {
 		shouldNudgeMock.mockResolvedValue({ nudge: true, message: "💡 dream", sessions: 7, newEntries: 7 });
 		let resolveDream: ((summary: string) => void) | undefined;
-		runDreamMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise<string>((resolve) => {
 					resolveDream = resolve;
@@ -1062,7 +1065,7 @@ describe("index wiring (integration)", () => {
 	it("renders a non-Error nudge dream failure with String(e)", async () => {
 		shouldNudgeMock.mockResolvedValue({ nudge: true, message: "💡 dream", sessions: 7, newEntries: 7 });
 		let rejectDream: ((reason?: unknown) => void) | undefined;
-		runDreamMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise<string>((_resolve, reject) => {
 					rejectDream = reject;
@@ -1084,7 +1087,7 @@ describe("index wiring (integration)", () => {
 
 	it("settles /dream without touching a disposed ctx", async () => {
 		let resolveDream: ((summary: string) => void) | undefined;
-		runDreamMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise<string>((resolve) => {
 					resolveDream = resolve;
@@ -1116,7 +1119,7 @@ describe("index wiring (integration)", () => {
 
 	it("does not reject unhandled when /dream fails after the session died", async () => {
 		let rejectDream: ((reason?: unknown) => void) | undefined;
-		runDreamMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise<string>((_resolve, reject) => {
 					rejectDream = reject;
@@ -1170,7 +1173,7 @@ describe("index wiring (integration)", () => {
 		mockConfigValue.extractMemories.enabled = true;
 		mockConfigValue.lock = { timeoutMs: 30, snapshotKeep: 5 };
 		let release: (() => void) | undefined;
-		runExtractMock.mockImplementationOnce(
+		runTaskMock.mockImplementationOnce(
 			() =>
 				new Promise((resolve) => {
 					release = () => resolve({ skipped: true });
@@ -1203,12 +1206,11 @@ describe("index wiring (integration)", () => {
 		scanEntriesMock.mockResolvedValue([
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
-		runSideQueryMock.mockResolvedValue(["ssh.md"]);
-		let resolveInject: ((value: string) => void) | undefined;
-		injectSurfacedContentMock.mockImplementationOnce(
+		let resolveRun: ((value: { files: string[]; content: string }) => void) | undefined;
+		runTaskMock.mockImplementationOnce(
 			() =>
-				new Promise<string>((resolve) => {
-					resolveInject = resolve;
+				new Promise<{ files: string[]; content: string }>((resolve) => {
+					resolveRun = resolve;
 				}),
 		);
 
@@ -1219,9 +1221,9 @@ describe("index wiring (integration)", () => {
 		// 就把索引段删掉了（spec §9.1 的 null 陷阱）。
 		const handlerDone = handlers["before_agent_start"][0](event, session.ctx).catch(() => undefined);
 		await flush();
-		expect(resolveInject).toBeDefined();
+		expect(resolveRun).toBeDefined();
 		session.dispose();
-		resolveInject?.("<relevant_memories>\n## SSH\nx\n</relevant_memories>");
+		resolveRun?.({ files: ["ssh.md"], content: "<relevant_memories>\n## SSH\nx\n</relevant_memories>" });
 		await handlerDone;
 
 		expect(event.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
@@ -1241,8 +1243,7 @@ describe("index wiring (integration)", () => {
 		scanEntriesMock.mockResolvedValue([
 			{ file: "ssh.md", name: "SSH", description: "ssh config", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
-		runSideQueryMock.mockResolvedValue(["ssh.md"]);
-		injectSurfacedContentMock.mockResolvedValue("<relevant_memories>\n## SSH\nssh config\n</relevant_memories>");
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: "<relevant_memories>\n## SSH\nssh config\n</relevant_memories>" });
 
 		const result = await handlers["before_agent_start"][0](
 			{ prompt: "how do I debug SSH?", systemPrompt: "Normal system prompt" },
@@ -1252,14 +1253,17 @@ describe("index wiring (integration)", () => {
 		expect(scanEntriesMock).toHaveBeenCalledTimes(1);
 		// 清单来自 store（不是逐文件 readFile）
 		expect(typeof scanEntriesMock.mock.calls[0][0].readEntry).toBe("function");
-		expect(runSideQueryMock).toHaveBeenCalledTimes(1);
-		expect(runSideQueryMock.mock.calls[0][0].injectedFiles).toBeInstanceOf(Set);
-		expect(injectSurfacedContentMock).toHaveBeenCalledWith(
-			scanEntriesMock.mock.calls[0][0],
-			["ssh.md"],
-			4096,
-			20480,
-		);
+		expect(runTaskMock).toHaveBeenCalledTimes(1);
+		const input = runTaskMock.mock.calls[0][1];
+		const taskCtx = runTaskMock.mock.calls[0][2];
+		expect(input.manifest).toEqual([
+			{ file: "ssh.md", name: "SSH", description: "ssh config", type: "project", modified: "2026-01-01T00:00:00.000Z" },
+		]);
+		expect(input.userPrompt).toBe("how do I debug SSH?");
+		expect(input.injectedFiles).toBeInstanceOf(Set);
+		expect(taskCtx.cwd).toBe(dir);
+		expect(taskCtx.store).toBe(scanEntriesMock.mock.calls[0][0]);
+		expect(typeof taskCtx.ports.headless.run).toBe("function");
 		expect(result?.message).toEqual({
 			customType: "memory-auto-surfacing",
 			content: "<relevant_memories>\n## SSH\nssh config\n</relevant_memories>",
@@ -1279,15 +1283,14 @@ describe("index wiring (integration)", () => {
 		// Finding Minor 5：injectedFiles 是活 Set，同一引用会在后续轮次被改写 —— 断言必须在
 		// 调用瞬间深拷贝，否则「第二轮已含 ssh.md」是拿断言时的集合比它自己，永远成立。
 		const injectedAtCall: Array<Set<string>> = [];
-		runSideQueryMock.mockImplementation(async (...args: any[]) => {
-			injectedAtCall.push(new Set(args[0].injectedFiles));
-			return ["ssh.md"];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" };
 		});
-		injectSurfacedContentMock.mockResolvedValue("<relevant_memories>x</relevant_memories>");
 
 		const event = { prompt: "ssh?", systemPrompt: "sp" };
 		await handlers["before_agent_start"][0](event, uiCtx());
-		// 第二轮：runSideQuery 收到的 injectedFiles 里已经有 ssh.md
+		// 第二轮：runTask 收到的 injectedFiles 里已经有 ssh.md
 		await handlers["before_agent_start"][0](event, uiCtx());
 
 		expect(injectedAtCall).toHaveLength(2);
@@ -1312,13 +1315,13 @@ describe("index wiring (integration)", () => {
 		);
 
 		expect(scanEntriesMock).not.toHaveBeenCalled();
-		expect(runSideQueryMock).not.toHaveBeenCalled();
+		expect(runTaskMock).not.toHaveBeenCalled();
 		expect(result?.systemPrompt).toContain("- [SSH](ssh.md) — staging ssh config");
 	});
 
-	it("resolveDefault: defaults.sessionPersistence flows through to runSideQuery", async () => {
-		// 保留 model：启动校验（设计 §2.3）要求 defaults.model 存在，否则 session_start 直接失败
-		mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: true } };
+	it("passes the config object into runTask instead of pre-extracted budget values", async () => {
+		mockConfigValue.autoSurfacing.maxFiles = 7;
+		mockConfigValue.autoSurfacing.thinkLevel = "low";
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, uiCtx());
@@ -1326,32 +1329,20 @@ describe("index wiring (integration)", () => {
 		scanEntriesMock.mockResolvedValue([
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
-		runSideQueryMock.mockResolvedValue([]);
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" });
 
 		await handlers["before_agent_start"][0]({ prompt: "q", systemPrompt: "sp" }, uiCtx());
 
-		expect(runSideQueryMock.mock.calls[0][0].sessionPersistence).toEqual({ enabled: true });
+		const taskCtx = runTaskMock.mock.calls[0][2];
+		expect(Object.keys(taskCtx).sort()).toEqual(["cfg", "cwd", "ports", "store"]);
+		expect(taskCtx.cfg.autoSurfacing.maxFiles).toBe(7);
+		expect(taskCtx.cfg.autoSurfacing.thinkLevel).toBe("low");
+		// 输入只给宿主数据：预算值由 core 自己从 cfg 读。
+		const input = runTaskMock.mock.calls[0][1];
+		expect(Object.keys(input).sort()).toEqual(["injectedFiles", "manifest", "userPrompt"]);
 	});
 
-	it("resolveDefault: per-task sessionPersistence overrides defaults", async () => {
-		// 同上：覆盖 defaults 时必须带上 model，否则启动校验失败
-		mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: true } };
-		(mockConfigValue.autoSurfacing as any).sessionPersistence = { enabled: false };
-		const { pi, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-
-		scanEntriesMock.mockResolvedValue([
-			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
-		]);
-		runSideQueryMock.mockResolvedValue([]);
-
-		await handlers["before_agent_start"][0]({ prompt: "q", systemPrompt: "sp" }, uiCtx());
-
-		expect(runSideQueryMock.mock.calls[0][0].sessionPersistence).toEqual({ enabled: false });
-	});
-
-	it("agent_end hands the raw messages, char limits, an onWrite counter and both ports to runExtract", async () => {
+	it("agent_end hands the raw messages, an onWrite counter and both ports to runTask", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -1363,22 +1354,26 @@ describe("index wiring (integration)", () => {
 		];
 		await handlers["agent_end"][0]({ messages }, uiCtx());
 
-		expect(runExtractMock).toHaveBeenCalledTimes(1);
-		const args = runExtractMock.mock.calls[0][0];
+		expect(runTaskMock).toHaveBeenCalledTimes(1);
+		expect(runTaskMock.mock.calls[0][0]).toBe(TASKS.extractMemories);
+		const input = runTaskMock.mock.calls[0][1];
+		const taskCtx = runTaskMock.mock.calls[0][2];
 		// spec §11.1：消息**原样**透传，不再被压成 {role, content} 字符串
-		expect(args.messages).toBe(messages);
-		expect(args.maxContextTokens).toBe(2000);
-		expect(args.maxToolResultChars).toBe(500);
-		expect(args.maxAssistantChars).toBe(2000);
-		expect(typeof args.store.tryWithLogicalLock).toBe("function");
+		expect(input.messages).toBe(messages);
+		expect(input.agentsMdBlocks).toEqual([]);
 		// 计数通道：core 把它透进子会话的 memory 工具，pi 只负责累加与通知
-		expect(typeof args.onWrite).toBe("function");
-		// 「5 个 action + memory 工具」由 core 的 runExtract 决定（钉在 memory-core/tests/extract.test.ts）；
-		// pi 这一侧只提供两个端口。
-		const ports = runExtractMock.mock.calls[0][1];
+		expect(typeof input.onWrite).toBe("function");
+		// 配置值不再拆成参数：都收在 cfg 里，由 core 自己读。
+		expect(taskCtx.cfg.extractMemories.maxContextTokens).toBe(2000);
+		expect(taskCtx.cfg.extractMemories.maxToolResultChars).toBe(500);
+		expect(taskCtx.cfg.extractMemories.maxAssistantChars).toBe(2000);
+		expect(taskCtx.cwd).toBe(dir);
+		expect(typeof taskCtx.store.tryWithLogicalLock).toBe("function");
+		// 「5 个 action + memory 工具」由 core 的 TASKS.extractMemories 决定；pi 只提供两个端口。
+		const ports = taskCtx.ports;
 		expect(typeof ports.headless.run).toBe("function");
-		expect(typeof ports.transcript.toExtractMessages).toBe("function");
-		expect(typeof ports.transcript.searchSessions).toBe("function");
+		expect(typeof ports.transcript?.toExtractMessages).toBe("function");
+		expect(typeof ports.transcript?.searchSessions).toBe("function");
 	});
 
 	it("agent_end extracts AGENTS.md blocks from the last system prompt", async () => {
@@ -1399,7 +1394,7 @@ describe("index wiring (integration)", () => {
 		await handlers["before_agent_start"][0]({ systemPrompt: sysPrompt }, uiCtx());
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hello" }] }, uiCtx());
 
-		const blocks = runExtractMock.mock.calls[0][0].agentsMdBlocks;
+		const blocks = runTaskMock.mock.calls[0][1].agentsMdBlocks;
 		expect(blocks).toHaveLength(2);
 		expect(blocks[0]).toContain("global: use Chinese");
 		expect(blocks[1]).toContain("project: never skip tests");
@@ -1414,7 +1409,7 @@ describe("index wiring (integration)", () => {
 		await handlers["before_agent_start"][0]({ systemPrompt: "no AGENTS.md here" }, uiCtx());
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hello" }] }, uiCtx());
 
-		expect(runExtractMock.mock.calls[0][0].agentsMdBlocks).toEqual([]);
+		expect(runTaskMock.mock.calls[0][1].agentsMdBlocks).toEqual([]);
 	});
 
 	it("agent_end does nothing when extract is disabled", async () => {
@@ -1424,10 +1419,10 @@ describe("index wiring (integration)", () => {
 
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hello" }] }, uiCtx());
 
-		expect(runExtractMock).not.toHaveBeenCalled();
+		expect(runTaskMock).not.toHaveBeenCalled();
 	});
 
-	it("/dream hands the store, the line limit and the 7-action tool set to runDream", async () => {
+	it("/dream hands the store, the line limit and the headless port to runTask", async () => {
 		const confirm = vi.fn().mockResolvedValue(true);
 		const notify = vi.fn();
 		const { pi, commands, handlers } = createFakePi();
@@ -1447,13 +1442,14 @@ describe("index wiring (integration)", () => {
 			try {
 				await commands["dream"].handler("", uiCtx({ hasUI: true, ui: { confirm, notify, setStatus: vi.fn() } }));
 
-				expect(runDreamMock).toHaveBeenCalledTimes(1);
-				const args = runDreamMock.mock.calls[0][0];
-				expect(args.memoryDir).toBe(dir);
-				expect(args.maxLines).toBe(200);
-				expect(typeof args.store.withLogicalLock).toBe("function");
-				// 「7 个 action + memory 工具」由 core 的 runDream 决定（钉在 memory-core/tests/dream.test.ts）
-				expect(typeof runDreamMock.mock.calls[0][1].headless.run).toBe("function");
+				expect(runTaskMock).toHaveBeenCalledTimes(1);
+				expect(runTaskMock.mock.calls[0][0]).toBe(TASKS.dream);
+				const taskCtx = runTaskMock.mock.calls[0][2];
+				expect(taskCtx.cwd).toBe(dir);
+				expect(taskCtx.cfg.memIndexMaxLines).toBe(200);
+				expect(typeof taskCtx.store.withLogicalLock).toBe("function");
+				// 「7 个 action + memory 工具」由 core 的 TASKS.dream 决定；pi 只提供 headless 端口。
+				expect(typeof taskCtx.ports.headless.run).toBe("function");
 
 				// 成功回调（SessionManager.list → writeDreamMeta → notifyDream）必须在 unstub 前排空，
 				// 否则会漏到真实 ~/.pi；notify 断言证明回调确实在本用例内跑完。
@@ -1475,14 +1471,14 @@ describe("index wiring (integration)", () => {
 		await commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
 
 		expect(notify).toHaveBeenCalledWith("Memory not initialized.", "info");
-		expect(runDreamMock).not.toHaveBeenCalled();
+		expect(runTaskMock).not.toHaveBeenCalled();
 	});
 
-	// 取模型必须在改状态**之前**：requiredModel 抛错时不能把 "dream" 状态留在 UI 上
-	//（`/dream` 这条链只有 confirm 之后的 .finally，抛在它之前就没有人清）。
-	// 把 requiredModel 挖回 `runDream({...})` 的字面量里，本用例就变红。
+	// `runTask` 是 async：缺模型不会在调用点同步抛，而是作为 rejection 走 `/dream` 的两参
+	// `.then` 失败分支（报「Dream failed」），状态行由 `.finally` 兜底清除 —— 处理器本身照常 resolve。
 	it("/dream does not leave the dream status behind when the model disappeared mid-session", async () => {
 		const setStatus = vi.fn();
+		const notify = vi.fn();
 		const confirm = vi.fn().mockResolvedValue(true);
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -1493,11 +1489,17 @@ describe("index wiring (integration)", () => {
 		mockConfigValue.defaults.model = undefined;
 
 		await expect(
-			commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm, setStatus } })),
-		).rejects.toThrow('no model for dream — set "dream.model" or "defaults.model" in memory.json');
+			commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus } })),
+		).resolves.toBeUndefined();
+		await flush();
 
-		expect(setStatus).not.toHaveBeenCalled();
-		expect(runDreamMock).not.toHaveBeenCalled();
+		expect(setStatus).toHaveBeenCalledWith("dream", "Consolidating memory...");
+		expect(setStatus).toHaveBeenCalledWith("dream", undefined);
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify).toHaveBeenCalledWith(
+			'Dream failed: no model for dream — set "dream.model" or "defaults.model" in memory.json',
+			"error",
+		);
 	});
 
 	it("the session_start nudge path passes the same dream arguments", async () => {
@@ -1509,8 +1511,9 @@ describe("index wiring (integration)", () => {
 		await handlers["session_start"][0]({}, uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm, setStatus: vi.fn() } }));
 
 		expect(confirm).toHaveBeenCalled();
-		expect(runDreamMock).toHaveBeenCalledTimes(1);
-		expect(typeof runDreamMock.mock.calls[0][1].headless.run).toBe("function");
+		expect(runTaskMock).toHaveBeenCalledTimes(1);
+		expect(runTaskMock.mock.calls[0][0]).toBe(TASKS.dream);
+		expect(typeof runTaskMock.mock.calls[0][2].ports.headless.run).toBe("function");
 	});
 
 	// ── Plan C（spec §14 `/memory` 状态与 `/memory unlock`）─────────────────
@@ -1519,9 +1522,9 @@ describe("index wiring (integration)", () => {
 	// buildMemoryTool(spec)」—— 中间这条 `buildMemoryTool: (spec) => createMemoryTool(toolDeps, spec)`
 	// 的闭包以前没人钉：把 spec 参数丢掉，全部套件照样绿，而 dream 会静默失去重构索引的能力。
 	it("the dream port forwards the seven-action spec into createMemoryTool", async () => {
-		// `/dream` 先要一次 confirm；再让 runDream 永不 resolve —— 本用例只观察端口闭包，
+		// `/dream` 先要一次 confirm；再让 runTask 永不 resolve —— 本用例只观察端口闭包，
 		// 不放成功回调出去（它会 `await SessionManager.list(cwd)`，那会碰真实 ~/.pi）。
-		runDreamMock.mockImplementationOnce(() => new Promise(() => {}));
+		runTaskMock.mockImplementationOnce(() => new Promise(() => {}));
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, uiCtx());
@@ -1532,9 +1535,9 @@ describe("index wiring (integration)", () => {
 			uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } }),
 		);
 
-		expect(runDreamMock).toHaveBeenCalledTimes(1);
-		const ports = runDreamMock.mock.calls[0][1];
-		// runDream 被 mock 掉了，端口从没被调用过：这里亲手调一次来观察那个闭包。
+		expect(runTaskMock).toHaveBeenCalledTimes(1);
+		const ports = runTaskMock.mock.calls[0][2].ports;
+		// runTask 被 mock 掉了，端口从没被调用过：这里亲手调一次来观察那个闭包。
 		// 模型不可解析，runHeadlessAgent 会在**建完工具之后**抛错 —— 那正是观察点。
 		await expect(
 			ports.headless.run({
@@ -1565,7 +1568,7 @@ describe("index wiring (integration)", () => {
 
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx());
 
-		const ports = runExtractMock.mock.calls[0][1];
+		const ports = runTaskMock.mock.calls[0][2].ports;
 		await expect(
 			ports.headless.run({
 				task: "t",
@@ -1581,7 +1584,7 @@ describe("index wiring (integration)", () => {
 		expect(extractCall?.[1]?.actions).toHaveLength(5);
 		expect(typeof extractCall?.[1]?.onWrite).toBe("function");
 		// extract 没有整轮快照，所以**不得**带 skipSnapshot：每次写入都要留下自己的回滚点
-		expect(extractCall?.[1]?.skipSnapshot).toBeUndefined();
+		expect(extractCall?.[1]?.skipSnapshot).toBeFalsy();
 	});
 
 	it("/memory appends the 2.x migration hint when the detector finds old data", async () => {
@@ -2040,7 +2043,7 @@ describe("index wiring (integration)", () => {
 		const dirB = await mkdtemp(join(tmpdir(), "mem-wiring-b-"));
 		const notify = vi.fn();
 		// confirm 必须返回 true：它若为假值，即使没复位 store、守卫放行，`/dream` 也会先在
-		// `!ok` 处 return —— `runDreamMock` 的断言就成了假承重（review Minor #2/#3）。
+		// `!ok` 处 return —— `runTaskMock` 的断言就成了假承重（review Minor #2/#3）。
 		const confirm = vi.fn().mockResolvedValue(true);
 		const ctxB = () => uiCtx({ cwd: dirB, hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } });
 		try {
@@ -2055,7 +2058,7 @@ describe("index wiring (integration)", () => {
 			await commands["dream"].handler("", ctxB());
 
 			expect(notify).toHaveBeenCalledWith("Memory not initialized.", "info");
-			expect(runDreamMock).not.toHaveBeenCalled();
+			expect(runTaskMock).not.toHaveBeenCalled();
 		} finally {
 			restoreModelConfig();
 			await rm(dirB, { recursive: true, force: true });
@@ -2071,11 +2074,10 @@ describe("index wiring (integration)", () => {
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
 		// injectedFiles 是活 Set：必须在调用瞬间深拷贝（见 `does not surface the same entry file twice`）
-		runSideQueryMock.mockImplementation(async (...args: any[]) => {
-			injectedAtCall.push(new Set(args[0].injectedFiles));
-			return ["ssh.md"];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" };
 		});
-		injectSurfacedContentMock.mockResolvedValue("<relevant_memories>x</relevant_memories>");
 
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -2244,7 +2246,7 @@ describe("index wiring (integration)", () => {
 		expect(notify.mock.calls[1][0]).not.toContain(dir);
 		await commands["dream"].handler("", ctxUI());
 		expect(notify.mock.calls[2]).toEqual(["Memory not initialized.", "info"]);
-		expect(runDreamMock).not.toHaveBeenCalled();
+		expect(runTaskMock).not.toHaveBeenCalled();
 		expect(tools).toHaveLength(1);
 	});
 
@@ -2368,7 +2370,7 @@ describe("index wiring (integration)", () => {
 		// confirm 返回 true：守卫若失效，`/dream` 就会真的对上一 session 的目录跑一轮
 		await commands["dream"].handler("", ctxUI());
 		expect(notify.mock.calls[2]).toEqual(["Memory not initialized.", "info"]);
-		expect(runDreamMock).not.toHaveBeenCalled();
+		expect(runTaskMock).not.toHaveBeenCalled();
 		expect(confirm).not.toHaveBeenCalled();
 		// 已注册的工具不会因为错误态再注册一次
 		expect(tools).toHaveLength(1);

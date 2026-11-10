@@ -11,8 +11,9 @@
  * 用法：node scripts/registry-smoke.mjs [pi-memory|dsh-memory ...]
  *       （默认两个适配层都跑；需要先 `npm run build -w memory-core -w dsh-memory`）
  *
- * 未发布的适配层（`private: true`）在 registry 上找不到满足范围的核心版本时只打 notice 跳过：
- * 它还没有用户。去掉 `private` 之后同一条件变成失败 —— 发布前必须能在 registry 上装起来。
+ * 未发布的适配层（`private: true`），或「核心无可用版本且适配层自己也没发布」的发布进行中状态，只打
+ * notice 跳过 —— 那时这条路径客观上无法验证。但适配层已发布、而声明的范围在 registry 上不存在，仍然
+ * 硬失败（那是真的装不起来）。发布 core 之后 rerun 本 job，它会真的跑一遍。
  */
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -64,6 +65,15 @@ function coreRange(manifest, label) {
 
 let skipped = 0;
 
+/** `npm view <spec> version` 有结果 = 已发布。只用来区分「发布进行中」与「真的配错了」。 */
+function isPublished(spec) {
+	try {
+		return run("npm", ["view", spec, "version", `--registry=${REGISTRY}`]).trim() !== "";
+	} catch {
+		return false;
+	}
+}
+
 for (const target of targets) {
 	const dir = join(repoRoot, target);
 	const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
@@ -80,8 +90,22 @@ for (const target of targets) {
 			);
 			continue;
 		}
+		// 适配层自己也没发布 = 发布进行中：这条路径此刻**无法**验证（核心还没上 registry），
+		// 报失败只会让人把「还没发」当成「代码错」。发布 core 之后 rerun 本 job，它会真的跑一遍。
+		// 但适配层已发布、而声明的范围在 registry 上不存在，那是真错（例如改了范围忘了发 core）——
+		// 下面仍然硬失败。
+		const ownSpec = `${manifest.name}@${manifest.version}`;
+		if (!isPublished(ownSpec)) {
+			skipped += 1;
+			console.log(
+				`::notice::${label}: registry 上还没有满足 "${CORE}@${range}" 的版本，且 ${ownSpec} 也未发布` +
+					" —— 发布进行中，无法验证运行时路径。先发 memory-core，再 rerun 本 job（docs/guides/release.md）",
+			);
+			continue;
+		}
 		throw new Error(
-			`${label}: registry 上查不到满足 "${CORE}@${range}" 的版本。先按 docs/guides/release.md 发布 memory-core。`,
+			`${label}: registry 上查不到满足 "${CORE}@${range}" 的版本，而 ${ownSpec} 已发布 —— 这份声明装不起来。` +
+				"先按 docs/guides/release.md 发布 memory-core。",
 		);
 	}
 
