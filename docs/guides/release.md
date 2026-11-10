@@ -36,18 +36,24 @@ gh release create memory-core-v<新版本号> --target "$COMMIT" \
 
 `memory-core` 带 `prepublishOnly: npm run build`，所以发布前一定会重新构建 `dist/`；不要提交 `dist/`。
 
-## 让 `registry-smoke` 转绿
+## `registry-smoke` 的两段式：先跳过，发布后重跑
 
-core 2.0.0 引入 `runTask` / `TASKS`，而合并提交的 CI 里 `registry-smoke` 从 registry 装 core，所以**在
-core 2.0.0 上 registry 之前它预期是红的**（`@yandy0725/memory-core@^2.0.0` 查不到），不是代码错。发完
-core 之后，在同一合并提交的 workflow 上重跑：
+`registry-smoke` 把适配层的 tarball 装进干净目录、**从 registry** 拉 core 再 `import` 入口。所以当核心的新版本
+还没发布时，这条路径**客观上无法验证**。脚本因此分两种情形：
+
+- **发布进行中**（核心范围在 registry 上查不到，**且**适配层自己声明的版本也未发布）→ `::notice::` 跳过，
+  不报错。不要把它当成代码错，也不要把跳过看成验证通过。
+- **声明的范围真的不存在**（适配层已发布，而 `dependencies` 里的核心范围在 registry 上没有）」→ 硬失败。
+  这是真错：手改了范围却忘了发 core。
+
+所以发完 core 之后，***在同一条合并提交的 workflow 上重跑***，那一次它会真的装一遍：
 
 ```bash
-gh run rerun <run-id>
+gh run rerun <run-id> --failed
 ```
 
-`registry-smoke` 由红转绿后，再按上面的步骤发 `pi-memory-v4.0.0`。顺序不能反：先 `memory-core 2.0.0`，
-后 `pi-memory 4.0.0`（后者依赖 `^2.0.0`）。
+由「跳过」变成「通过」之后，再按上面的步骤发 `pi-memory-v4.0.0`。顺序不能反：先 `memory-core`，后
+`pi-memory`（后者依赖前者的新版本）。
 
 ## 验收：不要只看 workflow 绿
 
