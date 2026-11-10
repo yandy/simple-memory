@@ -40,7 +40,10 @@ describe("index wiring — agent_end / extract", () => {
 		dirOverrideRef.current = null;
 	});
 
-	it("agent_end counts the writes made through the extract tool and notifies once", async () => {
+	it.each([
+		{ writes: 1, message: "Extracted 1 memory." },
+		{ writes: 2, message: "Extracted 2 memories." },
+	])("agent_end reports $writes write(s) as '$message'", async ({ writes, message }) => {
 		mockConfigValue.extractMemories.enabled = true;
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
 		runTaskMock.mockImplementationOnce(
@@ -58,9 +61,9 @@ describe("index wiring — agent_end / extract", () => {
 
 		// customTools[0] 就是传给 extract 的真工具：直接跑它，onWrite 就是唯一的计数通道
 		const onWrite = runTaskMock.mock.calls[0][1].onWrite;
-		onWrite({ action: "add", name: "A" });
-		onWrite({ action: "add", name: "B" });
-		// `list` 是读、不计数：这条规则在 core 的 WRITE_ACTIONS 里（memory-core/tests/memory-handler.test.ts）。
+		for (let i = 0; i < writes; i++) onWrite({ action: "add", name: `A${i}` });
+		// index.ts 的 onWrite 是纯计数器（任何回调都 +1）；「list/stdout 这类读 action 不计数」是 core 的
+		// 规则，由 memory-core/tests/memory-handler.test.ts 钉住，这里不重复钉。
 		await flush();
 		expect(notify).not.toHaveBeenCalled();
 
@@ -68,34 +71,9 @@ describe("index wiring — agent_end / extract", () => {
 		await flush();
 
 		expect(notify).toHaveBeenCalledTimes(1);
-		expect(notify).toHaveBeenCalledWith("Extracted 2 memories.", "info");
+		expect(notify).toHaveBeenCalledWith(message, "info");
 	});
 
-	it("agent_end uses the singular form for exactly one write", async () => {
-		mockConfigValue.extractMemories.enabled = true;
-		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
-		runTaskMock.mockImplementationOnce(
-			() =>
-				new Promise((resolve) => {
-					resolveExtract = resolve;
-				}),
-		);
-		const notify = vi.fn();
-		const { pi, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-
-		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx(uiWith(notify)));
-		const onWrite = runTaskMock.mock.calls[0][1].onWrite;
-		onWrite({ action: "add", name: "A" });
-
-		resolveExtract?.({ skipped: false, result: "ok" });
-		await flush();
-
-		expect(notify).toHaveBeenCalledWith("Extracted 1 memory.", "info");
-	});
-
-	// Review Focus #4：没写东西就不该弹通知；被锁跳过也不该弹。
 	it("agent_end stays quiet when extract wrote nothing or was skipped", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		const notify = vi.fn();
@@ -114,8 +92,12 @@ describe("index wiring — agent_end / extract", () => {
 		expect(notify).not.toHaveBeenCalled();
 	});
 
-	it("agent_end does not notify a headless session about extracted memories", async () => {
+	it("agent_end never notifies a headless session", async () => {
 		mockConfigValue.extractMemories.enabled = true;
+		const headless = () =>
+			uiCtx({ hasUI: false, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } });
+
+		// 阶段一：成功也不通知
 		let resolveExtract: ((value: { skipped: boolean; result?: string }) => void) | undefined;
 		runTaskMock.mockImplementationOnce(
 			() =>
@@ -128,16 +110,17 @@ describe("index wiring — agent_end / extract", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, uiCtx());
 
-		await handlers["agent_end"][0](
-			{ messages: [{ role: "user", content: "hi" }] },
-			uiCtx({ hasUI: false, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }),
-		);
+		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, headless());
 		const onWrite = runTaskMock.mock.calls[0][1].onWrite;
 		onWrite({ action: "add", name: "A" });
-
 		resolveExtract?.({ skipped: false, result: "ok" });
 		await flush();
+		expect(notify).not.toHaveBeenCalled();
 
+		// 阶段二：失败也不通知
+		runTaskMock.mockImplementationOnce(() => Promise.reject(new Error("model exploded")));
+		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "a" }] }, headless());
+		await flush();
 		expect(notify).not.toHaveBeenCalled();
 	});
 
@@ -167,23 +150,6 @@ describe("index wiring — agent_end / extract", () => {
 		await flush();
 
 		expect(failed()).toHaveLength(2);
-	});
-
-	it("does not report an extract failure to a headless session", async () => {
-		mockConfigValue.extractMemories.enabled = true;
-		runTaskMock.mockImplementation(() => Promise.reject(new Error("model exploded")));
-		const notify = vi.fn();
-		const { pi, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-
-		await handlers["agent_end"][0](
-			{ messages: [{ role: "user", content: "a" }] },
-			uiCtx({ hasUI: false, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }),
-		);
-		await flush();
-
-		expect(notify).not.toHaveBeenCalled();
 	});
 
 	it("delivers 'Extracted' from the sync UI snapshot when the session dies mid-extract", async () => {
