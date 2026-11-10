@@ -123,7 +123,7 @@ cfg.memoryDir = expandTilde(cfg.memoryDir, ctx._platform ?? process.platform)
 ### 7.6 版本与发布
 
 - `memory-core` → `2.0.0`；`pi-memory` → `4.0.0`，其 `dependencies` 抬到 `^2.0.0`（与任务描述符刀同批发）。
-- `dsh-memory` 保持 `^1.1.0`：它用到的四个符号在 2.0.0 里都在，源码只随任务描述符刀改端口适配。
+- `dsh-memory` 也抬到 `^2.0.0`：它未发布、没有用户，不为兼容留代价。
 
 ## 8. 已接受的破坏（用户明确同意）
 

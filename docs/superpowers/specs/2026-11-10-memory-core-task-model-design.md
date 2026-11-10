@@ -36,13 +36,15 @@ dsh 0.2.2-rc.1 安装树（`~/.npm/_npx/b86ed90107c62dab/node_modules/@deepseek-
 
 **目标**
 
-- 一个任务 = 一份描述符：id、是否要模型、静态策略（轮数/超时/工具集/锁与快照）、prompt 构造、回复解析、
+- 一个任务 = 一份描述符：id、编排骨架（轮数/超时/工具集/锁与快照）、prompt 构造、回复解析、
   未完成时怎么呈现。三个任务都从这张表里长出来。
-- 一条通用编排循环（跑一次端口 + 解释结果 + 施加锁/快照），三个任务共用。
+- 一条通用编排循环（读 config + 跑一次端口 + 解释结果 + 施加锁/快照），三个任务共用。
+- **config 由 core 自己消费**：model / effort / sessionPersistence / 全部预算值在 `runTask` 里读，
+  适配层不再有「config → opts」那一道（§6.4）。
 - 端口返回**结构化结果**，替掉今天的 `string | null`；三个任务的失败词汇在同一处收口（P12 的修法）。
 - 适配层用一份声明表达「我实现了哪些任务」，替掉 `requiredModels(cfg, tasks?)` 的调用点补丁与 dsh 的
   `UNIMPLEMENTED_MODULES`。
-- 把两处错位的知识挪回它该在的地方：`nudge*` 归 pi、`sessionPersistence` 继承规则归 core 纯函数。
+- 把两处错位的知识挪回它该在的地方：`nudge*` 归 pi、`sessionPersistence` 继承规则归 core。
 
 **非目标**
 
@@ -51,11 +53,14 @@ dsh 0.2.2-rc.1 安装树（`~/.npm/_npx/b86ed90107c62dab/node_modules/@deepseek-
 - 不改 prompt 文本、磁盘格式、`memory` 工具的 action 语义（用户契约）。
 - 不改 `memory.json` 的任何用户可见键名（`nudge*` 只是从 core 的类型里搬走，文件仍是同一个、键名不变）。
 - 不改 pi-memory 的用户可观察行为：同一份配置、同一个时机、同一句通知。
+- **不为 `dsh-memory` 的未发布状态留任何兼容代价**：它的依赖范围直接抬到 `^2.0.0`，它的端口适配、
+  `UNIMPLEMENTED_MODULES`、`surfacing.ts` 里的 config 读取都可以直接重写（它没有用户）。
 
 **反目标（技术成功也算失败）**
 
 - 描述符变成「万能配置对象」：任何一项策略如果不是**至少一个任务**真的需要，就不许进描述符。
-- 适配层为了对齐描述符而开始复制 core 的业务判断（比如自己决定「哪些文件算候选」「对话怎么截断」）。
+- 适配层为了对齐描述符而开始复制 core 的业务判断（比如自己决定「哪些文件算候选」「对话怎么截断」），
+  或者重新开始读 core 已经自己消费的配置键。
 - 端口为了迁就某一个宿主长出第二组可选字段（今天的 `HeadlessRunRequest` 已经 9 个字段）。
 
 ## 4. dsh 消费者形状（调研结论，0.2.2-rc.1）
@@ -128,8 +133,11 @@ persistence 来自服务是否挂载（`ctx.sessionPersistence`），**没有 pe
 | B | 任务级端口（`runSurfacing` / `runExtract` / `runDream` 各一个） | prompt 与写入语义会分叉（两个宿主对同一份 `MEMORY.md` 的维护规则不同），且第三个宿主抄第三遍 |
 | C（已弃） | 只做归属纠正（nudge / sessionPersistence / implementedTasks），`run*` 形状不动 | dsh 的 §4 事实已经到手，现在收形状的成本最低；再等一轮等于把同一处签名改两次 |
 
-判定规则（写进 §7 的任务描述符纪律，用于拒绝未来的加项）：**一段逻辑的差异会不会让两个宿主对同一份磁盘
-记忆做出不同判断？会 → core；不会 → 适配层。**
+判定规则（用于拒绝未来的加项）：
+
+1. **一段逻辑的差异会不会让两个宿主对同一份磁盘记忆做出不同判断？** 会 → core；不会 → 适配层。
+2. **这个配置键的值会不会改变模型看到什么、写什么？** 会 → core 自己读（§6.4）；只有「怎么呈现/怎么落盘」
+   归适配层。
 
 ## 6. 核心模型
 
@@ -138,8 +146,8 @@ persistence 来自服务是否挂载（`ctx.sessionPersistence`），**没有 pe
 ```ts
 export type MemoryTaskId = "autoSurfacing" | "extractMemories" | "dream";
 
-/** 一次任务的静态策略：全是数字/枚举，不含宿主形状。 */
-export interface TaskPolicy {
+/** 编排骨架：全部是 core 的常量，或 core 自己从 cfg 里读的值。适配层不参与任何一项。 */
+export interface TaskPlan {
   /** 建议轮数上限。dsh 无法硬性执行（§4.2），适配层尽力。 */
   maxTurns?: number;
   timeoutMs: number;
@@ -155,27 +163,36 @@ export interface TaskPolicy {
 
 export interface MemoryTask<I, R> {
   readonly id: MemoryTaskId;
-  readonly policy: TaskPolicy;
+  readonly plan: TaskPlan;
   /**
-   * 输入 → prompt 全文。返回 `null` = **core 自己判定这一轮不跑**（候选为空、消息为空）。
-   * 今天这两处判定在 `runSideQuery` / `runExtract` 的头部，保留它们就意味着两个薄包装仍带业务判断；
-   * 收进这里之后 `runTask` 才是唯一循环。
+   * 输入 → prompt 全文。**预算值由 core 自己从 `cfg` 读**（见下表），适配层不转一道。
+   * 返回 `null` = core 自己判定这一轮不跑（候选为空、消息为空）。
    */
-  buildPrompt(input: I): string | null;
+  buildPrompt(cfg: MemoryConfig, input: I): string | null;
   /** 回复 → 结果。必须防御式：dsh 的 stream 通道拿不到强制结构化输出（§4.4）。 */
-  parse(text: string, input: I): R;
+  parse(cfg: MemoryConfig, text: string, input: I): R;
   /** 端口没跑完/跑飞时，这个任务怎么呈现（三个任务词汇不同的唯一合法处）。 */
-  incomplete(input: I, outcome: IncompleteOutcome): R;
+  incomplete(cfg: MemoryConfig, input: I, outcome: IncompleteOutcome): R;
 }
 ```
 
-三个任务的具体值（今天散在三个 `run*` 里，逐字搬过来）：
+编排骨架（core 常量，从三个 `run*` 里逐字搬过来）：
 
 | 任务 | maxTurns | timeout | builtinTools | memoryTool | lock |
 |---|---|---|---|---|---|
 | autoSurfacing | 1 | 30 s | none | null | none |
 | extractMemories | 5（best-effort） | 120 s | none | `MAIN_AGENT_ACTIONS` + skipLogicalLock | logical（`tryWithLogicalLock`，拿不到就跳过） |
 | dream | 无 | 600 s | none | `DREAM_ACTIONS` + skipLogicalLock + skipSnapshot | logical+snapshot（整轮持锁 + 进入时全目录快照） |
+
+**从 `cfg` 自读的预算值**（今天全部由适配层读出来再当参数传，§6.4 说明为何改）：
+
+| 任务 | 从 `cfg` 读的值 | 落在哪 |
+|---|---|---|
+| autoSurfacing | `maxFiles` | 侧查询 prompt 与 `parse` 的 slice |
+| autoSurfacing | `maxEntryBytes` / `maxInjectionBytes` | `renderSurfacedBlock`（core） |
+| extractMemories | `maxContextTokens` / `maxToolResultChars` / `maxAssistantChars` | `buildExtractTask` / `renderConversation` |
+| dream | `memIndexMaxLines` | `buildDreamTask(maxLines)` |
+| 三个任务 | `model`（`requiredModel`）、`thinkLevel`、`sessionPersistence`（per-task ?? `defaults`） | `HeadlessRunRequest` |
 
 ### 6.2 端口结果词汇（替掉 `string | null`）
 
@@ -191,13 +208,13 @@ export type HeadlessOutcome =
    *  **`timeout` 只是 dsh 的路：** pi 的超时今天在 `createPiHeadlessAgent` 里 throw（`agent-runner.ts:170-180`），
    *  本轮不改 —— 端口级异常继续抛，由任务的决定沿用今天的行为（surfacing 吞 / extract 上抛 / dream 上抛）。 */
   | { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
+
+/** 描述符的 `incomplete` 收的那一半：除 "completed" 之外的一切。 */
+export type IncompleteOutcome = Exclude<HeadlessOutcome, { status: "completed" }>;
 ```
 
-**core 自己的「不跑」不进端口词汇**：`runTask` 另有一个只属于 core 的返回类型，避免把 core 的判定伪装成宿主的语言：
-
-```ts
-export type TaskRunResult<R> = { kind: "ran"; value: R } | { kind: "skipped"; cause: "no-input" | "lock-busy" };
-```
+**core 自己的「不跑」不进端口词汇**：`runTask` 另有一个只属于 core 的返回类型 `TaskRunResult`（§6.3），
+避免把 core 的判定伪装成宿主的语言。
 
 三个任务各自把它映射成自己的词汇（**这是本轮唯一允许「三套词汇」的地方**）：
 
@@ -213,26 +230,39 @@ export type TaskRunResult<R> = { kind: "ran"; value: R } | { kind: "skipped"; ca
 ### 6.3 通用编排 + 声明的任务集
 
 ```ts
+export interface TaskContext {
+  /** 配置：model / effort / sessionPersistence / 全部预算值都从这里读，适配层不拆。 */
+  cfg: MemoryConfig;
+  store: MemoryStore;
+  headless: HeadlessAgentPort;
+  /** 子会话 cwd：三个任务恒为 memoryDir。 */
+  cwd: string;
+  signal?: AbortSignal;
+}
+
+export type TaskRunResult<R> =
+  | { kind: "ran"; value: R }
+  | { kind: "skipped"; cause: "no-input" | "lock-busy" };
+
 export async function runTask<I, R>(
   task: MemoryTask<I, R>,
   input: I,
-  req: {
-    model: string;
-    effort?: string;
-    cwd: string;
-    signal?: AbortSignal;
-    sessionPersistence?: SessionPersistenceConfig;
-    /** extract 用它数「本轮真的写了几条」（`HeadlessRunRequest.memoryTool.onWrite` 的唯一来源）。
-     *  放在 task input 而不是这里：它是任务的结果统计，不是宿主形状。见 §11。 */
-  },
-  deps: { store: MemoryStore; headless: HeadlessAgentPort },
+  ctx: TaskContext,
 ): Promise<TaskRunResult<R>>;
 ```
 
-`runTask` 负责：`buildPrompt` 返回 `null` → `{ kind: "skipped", cause: "no-input" }`；施加 `policy.lock`
-（含 dream 的 `logicalLockActive()` 自检与进入时快照、extract 的 `tryWithLogicalLock` 拿不到就
-`lock-busy`）；构造 `HeadlessRunRequest`（轮数/超时/工具集全部来自 `policy`；适配层只是把这些字段原样交给
-宿主，**不再自己决定策略值**）；跑端口；按 §6.2 收口。
+`runTask` 负责（全部在 core 内）：
+
+1. 从 `ctx.cfg` 取 `model`（`requiredModel`）、`effort`（`cfg[task].thinkLevel`）、
+   `sessionPersistence`（per-task ?? `defaults`）、以及 §6.1 表里的预算值；
+2. `buildPrompt(cfg, input)` 返回 `null` → `{ kind: "skipped", cause: "no-input" }`；
+3. 施加 `plan.lock`（dream 的 `logicalLockActive()` 自检 + 进入时全目录快照；extract 的
+   `tryWithLogicalLock` 拿不到就 `lock-busy`）；
+4. 构造 `HeadlessRunRequest`（轮数/超时/工具集来自 `plan`）→ 跑端口；
+5. 按 §6.2 收口（`parse` / `incomplete`）。
+
+**适配层这时只剩三件事**：提供 `HeadlessAgentPort`（怎么调模型）、决定何时调 `runTask`（触发点）、
+呈现结果（投递通道 / 通知）。它不再读任何一个 `cfg` 字段 —— 这条是本轮的可检验不变量（§9）。
 
 适配层声明实现面：
 
@@ -264,6 +294,26 @@ export interface ModuleStatusRow {
 export function moduleStatusRows(cfg: MemoryConfig, tasks: readonly MemoryTaskId[]): ModuleStatusRow[];
 ```
 
+### 6.4 为什么 config 必须由 core 自己消费
+
+今天的分工是反的：**core 定义旋钮，适配层拧旋钮** —— 三个 `run*` 的入参全是扁平原语
+（`maxFiles: number`、`maxEntryBytes: number`、`maxContextTokens: number`、`maxLines: number`、
+`effort?: string`、`model: string`、`sessionPersistence?`），而**读 `MemoryConfig` 的是适配层**。
+这造成三个具体后果：
+
+1. 每个适配层各有一段「config → opts」胶水，两段必须逐字一致却无法互相校验
+   （`sessionPersistence` 的继承规则已经因此写了两遍：pi 的 `resolveDefault`、dsh 内联的 `?? defaults`）。
+2. 一个键是否生效取决于**每个调用点都记得传**：漏传一个 `maxEntryBytes` 就静默回退到函数的无默认值
+   （或 NaN），而测试只盖盖本校的调用点。
+3. §7.1 搬 `nudge*` 这类“错位知识”时，也无法从一个函数的签名判断它到底依赖哪些配置键。
+
+所以本轮把消费点收回 core：`runTask` 收 `cfg`，任务描述符的函数签名也收 `cfg`。适配层只传
+「它真正拥有的东西」：端口、cwd、signal、以及任务输入（用户这一轮的输入 / 本轮的原始消息）。
+
+这条与 §5 的判定规则同源，只是换了个问法：**这个键的值会改变模型看到什么或写什么吗？会 → core 读；
+它只是宿主怎么呈现/怎么落盘吗？→ 适配层读。** 后者的例子只剩 `nudge*`（已归 pi）与 dsh 的
+`resolveCallConfig` 可用性判定（那是宿主能力，不是配置值）。
+
 ## 7. 两处归属纠正
 
 1. **`nudge*` 归 pi**：`MemoryConfig.dream` 去掉 `nudgeAfterSessions` / `nudgeAfterHours`。它们只决定「何时
@@ -276,9 +326,9 @@ export function moduleStatusRows(cfg: MemoryConfig, tasks: readonly MemoryTaskId
      再次变成静默回归）。
    - `nudge.ts` 的 `shouldNudge` 签名从 `config.dream.*` 改成收 `PiHostConfig`；`/memory` 输出不变。
    - 副作用（好的）：dsh 的行 config 白名单是从 `DEFAULT_CONFIG` 派生的，这两个键因此自然不再被 dsh 接受。
-2. **`sessionPersistence` 继承归 core**：新增纯函数
-   `resolveSessionPersistence(cfg, task)`（per-task ?? `defaults`）。pi 的 `resolveDefault` 与 dsh 内联的
-   `?? defaults?.sessionPersistence` 都删掉 —— 这是跨宿主必须一致的语义。
+2. **`sessionPersistence` 继承归 core**：规则是 per-task ?? `defaults`。它不再是一个导出的纯函数，而是
+   `runTask` 内部读取的一部分（§6.3 第 1 步）。pi 的 `resolveDefault` 与 dsh 内联的
+   `?? defaults?.sessionPersistence` 两处都删掉 —— 这条语义本来就跨宿主必须一致。
 
 ## 8. 不动的东西
 
@@ -297,15 +347,19 @@ export function moduleStatusRows(cfg: MemoryConfig, tasks: readonly MemoryTaskId
 - `core` 的三个任务共用 `runTask`；三个 `run*` 函数退化为 `runTask` + 描述符的薄包装（保留导出名，
   避免适配层一次性全改）。
 - 同一组「outcome → 任务结果」的映射测试跑三个任务（表驱动），三个任务的差异只出现在期望值里。
-- `nudgeAfterSessions` 在 `memory-core/src` 与 `memory-core/README*` 里零命中。
+- **config 只被 core 消费**：`pi-memory/src` 与 `dsh-memory/src` 里搜 `maxContextTokens` / `maxEntryBytes` /
+  `maxInjectionBytes` / `maxFiles` / `maxToolResultChars` / `maxAssistantChars` / `memIndexMaxLines` /
+  `thinkLevel` / `requiredModel` / `taskModel` 均**零命中**（`/memory` 展示用的 `moduleStatusRows` 除外）。
+- `nudgeAfterSessions` 在 `memory-core/src` 与 `memory-core/README*` 里零命中，而 pi 侧的默认值（5 / 24）没变。
 - `pi-memory` 的**行为测试**期望值不变（`index-wiring`、`nudge`、`session-search` 等）；只有直接桩端口的单元测试要
   按新返回类型**构造** `HeadlessOutcome`（断言语义不变）—— 今天端口恒返回 `string`，改类型必然碰这类桩。
 - `pi-memory` 的 `agent-runner` 超时仍然是 throw（见 §6.2），那条 `rejects.toThrow(/timed out/)` 测试保持不动。
-- `dsh-memory` 的 `UNIMPLEMENTED_MODULES` 消失；`/memory` 的 `Modules:` 行由 `moduleStatusRows` 生成，
-  现有那条「dream=not implemented in this adapter」测试仍绿（文案不变，因为拼装仍在 dsh 侧）。
+- `dsh-memory` 直接改成新形状：依赖 `^2.0.0`、`UNIMPLEMENTED_MODULES` 删除、`surfacing.ts` 不再读 config、
+  `commands.ts` 用 `moduleStatusRows` 拼行；现有那条「dream=not implemented in this adapter」测试仍绿
+  （文案不变，拼装仍在 dsh 侧）。它未发布，所以**不保留任何兼容层**。
 - `grep -rn "loadConfigFrom" memory-core/src` 零命中（与 §10 的前置刀一致）。
-- 全量：`check:host-deps` / `check:memory-core-deps` / `typecheck` / `lint` / `test` / `test-dist` /
-  `smoke:registry` 全绿。
+- 全量：`check:host-deps` / `check:memory-core-deps` / `typecheck` / `lint` / `test` / `test-dist` 全绿；
+  `smoke:registry` 见 §10.1（合并时预期红，发布后 rerun 转绿）。
 
 ## 10. 与配置 IO 下放同批交付（已定：一次发 2.0.0）
 
@@ -346,3 +400,5 @@ export function moduleStatusRows(cfg: MemoryConfig, tasks: readonly MemoryTaskId
   结果统计，不是宿主形状；`runTask` 只负责把它透到 `HeadlessRunRequest.memoryTool.onWrite`。
 - `incomplete` 在 extract 里的精确返回形状（`{ skipped: false, result? }` 与 pi 现有通知逻辑的对接）。
 - 迁移期是否需要 `HeadlessAgentPort` 的兼容层（建议不要：两个适配层都在本仓内，一次改完）。
+- `dsh-memory` 既然没有用户，可以顺手删的东西：`row-config` 里为「未实现模块」保留的白名单备注、
+  `model.ts` 里重复的「有没有配 model」判定（`runTask` 现在会抛，dsh 只在需要降级时提前门一道）。
