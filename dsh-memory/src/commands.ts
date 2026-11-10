@@ -8,10 +8,14 @@ import {
 	moduleStatusRows,
 	readLockStatus,
 	resolveMemoryDir,
+	runTask,
+	TASKS,
 	taskModel,
 	withFsRetry,
 } from "@yandy0725/memory-core";
+import type { HeadlessAgentPort } from "@yandy0725/memory-core";
 import { errorMessage } from "./errors.js";
+import { parseModelRef } from "./model.js";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
@@ -24,9 +28,10 @@ export interface CommandDeps {
 	warnings: string[];
 	/**
 	 * 用户在行 config 里**确实写过**的白名单顶层键（照用户写的顺序，含已实现的 `autoSurfacing`）。
-	 * 由装配层用 `rowConfigSetKeys` 从原始行 config 算出来传进来；未实现的模块（如 `dream` /
-	 * `extractMemories`）能无声无息地通过配置校验 —— 是否就地报出来、怎么措辞，由
-	 * `renderStatus` 里的 `moduleStatusRows` 拼装决定。缺省为空：只为真写了它们的用户增加噪声。
+	 * 由装配层用 `rowConfigSetKeys` 从原始行 config 算出来传进来；没实现的任务
+	 * （`moduleStatusRows` 里 `implemented: false`）能无声无息地通过配置校验 —— 是否就地报出来、
+	 * 怎么措辞，由 `renderStatus` 里的 `moduleStatusRows` 拼装决定。缺省为空：只为真写了它们的
+	 * 用户增加噪声。（本轮三个任务全部实现了，所以这条就是给未来新增任务留的接口。）
 	 */
 	setKeys?: readonly string[];
 }
@@ -94,11 +99,11 @@ async function unlockMemory(memoryDir: string, force: boolean): Promise<{ kind: 
 	}
 }
 
-/** `Modules:` 行里未实现模块的后缀：写得很白，不给用户留「它也许在跑」的想像空间。 */
+/** `Modules:` 行里未实现任务的后缀：写得很白，不给用户留「它也许在跑」的想像空间。 */
 const NOT_IMPLEMENTED = "not implemented in this adapter";
 
 /** 本适配层实现了哪些 core 任务：行数据的 `implemented` 字段据此而来。 */
-const IMPLEMENTED_TASKS = ["autoSurfacing"] as const;
+const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
 
 /**
  * 错误态会话的目录重解：`/memory unlock` 是崩溃遗留 `.lock` 的**唯一**人工入口，所以以配置错误
@@ -118,9 +123,7 @@ async function reResolveMemoryDir(rt: SessionMemoryRuntime): Promise<string | nu
 }
 
 /**
- * 状态块。内容口径与 pi 的 `/memory` 一致（同一套 core 窗口核心），去掉本适配层没实现的行
- * （dream / extractMemories / Last dream）—— 例外：用户真在行 config 里写了它们时，`Modules:` 行
- * 会就地报 `not implemented in this adapter`（否则白名单静默接受、效果为零、且没有任何提示）。
+ * 状态块。内容口径与 pi 的 `/memory` 一致（同一套 core 窗口核心 + 同一套模块行数据）。
  * 三个「不是状态、而是诊断」的早退路径都返回可读文本：
  * 命令本身是成功的，坏的是记忆层（pi 用 `notify(..., "info")` 表达同一件事）。
  */
@@ -149,12 +152,12 @@ export async function renderStatus(
 	const cap = indexCapacity(indexRaw, rt.config.memIndexMaxLines, rt.config.memIndexMaxBytes);
 	const inject = indexInjectionCapacity(indexRaw, rt.config.memIndexInjectMaxLines, rt.config.memIndexInjectMaxBytes);
 
-	// 行数据来自 core 的 `moduleStatusRows`（顺序恒为 dream → extractMemories → autoSurfacing），
-	// dsh 用自己的顺序：`autoSurfacing` 在前，未实现的模块按 core 的顺序跟在后面。
-	// 未实现模块只在用户真写了该键时才显示：白名单是从 `DEFAULT_CONFIG` 派生的，所以 `dream` /
-	// `extractMemories` 能无声无息地通过校验（无告警）却没有任何效果 —— 用户写了
-	// `dream: { model: "…" }` 时，`/memory` 必须就地告诉他「配了但本适配层不跑」，否则他得到的
-	// 是一句「你没配 model」式的误导。不给其余人增加噪声。
+	// 行数据来自 core 的 `moduleStatusRows`（顺序恒为 dream → extractMemories → autoSurfacing）。
+	// dsh 用自己的顺序：`autoSurfacing` 在前（它的 on/off 由本会话的宿主可用性决定，不是 cfg），
+	// 其余任务按 core 的顺序跟在后面。未实现的任务只在用户真写了该键时才显示 —— 白名单是从
+	// `DEFAULT_CONFIG` 派生的，未实现的任务能无声无息地通过校验却没有任何效果，用户写了
+	// `dream: { model: "…" }` 时必须就地告诉他「配了但本适配层不跑」。本轮三个任务全部实现，
+	// 所以这条分支今天为空，保留它是为了让「新增任务忘实现」这件事仍然可见。
 	const rows = moduleStatusRows(rt.config, IMPLEMENTED_TASKS).filter(
 		(row) => row.implemented || setKeys.includes(row.id),
 	);
@@ -164,6 +167,10 @@ export async function renderStatus(
 		rt.surfacing.available
 			? `autoSurfacing=on(${taskModel(rt.config, "autoSurfacing") ?? "no model"})`
 			: `autoSurfacing=off(${rt.surfacing.reason ?? "disabled"})`,
+		// 已实现的任务：`off` 时不显示模型（用户问「为什么没生效」时答案在开关上，不在模型上）。
+		...rows
+			.filter((row) => row.implemented)
+			.map((row) => `${row.id}=${row.enabled ? `on(${row.model ?? "no model"})` : "off"}`),
 		...rows.filter((row) => !row.implemented).map((row) => `${row.id}=${NOT_IMPLEMENTED}`),
 	].join(", ");
 
@@ -224,6 +231,86 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 			return {
 				kind: "success",
 				text: await renderStatus(rt, deps.warnings, deps.setKeys ?? []),
+			};
+		},
+	};
+}
+
+/**
+ * `/dream` 命令需要的依赖：运行时（store + config + memoryDir）、按运行时现造的端口、
+ * 以及两条日志通道（dsh 的命令没有 `ui.notify`，宿主日志是唯一能报结果的地方）。
+ */
+export interface DreamCommandDeps {
+	registry: { get(sessionId: string): SessionMemoryRuntime | undefined };
+	headlessFor(rt: SessionMemoryRuntime): HeadlessAgentPort;
+	warn(message: string, ...params: unknown[]): void;
+	info(message: string, ...params: unknown[]): void;
+}
+
+/**
+ * `/dream`：把整目录记忆交给一个 headless 子会话整理。
+ *
+ * 与 pi 的两处**刻意不同**，都写进 README：
+ *
+ * 1. **没有确认框**：dsh 的命令处理器拿不到任何交互通道（pi 的 `ctx.ui.confirm` 在 dsh 侧没有
+ *    对应物），所以命令一进来就开始跑。代价是「误触发一次会真的改写记忆」，收益是不发明第二套
+ *    「半交互」语义。dream 进入时会拍整目录快照（core 的 `lock: "logical+snapshot"`），那是
+ *    用户唯一的回滚点。
+ * 2. **不 await 整轮**：dream 的 timeout 是 600s，把它 await 进命令处理器等于让宿主等十分钟。
+ *    所以命令立刻返回「已开始」，摘要与失败都写宿主日志（`logger.info` / `logger.warn`）。
+ *
+ * 缺模型 / 模型引用不像 `<provider>/<model>` 这类**能在发起前判定**的错误就地报在命令结果里：
+ * 让用户看到「为什么没跑」，而不是一条稍后才出现在日志里的 `host-refused`。
+ */
+export function createDreamCommand(deps: DreamCommandDeps): CommandDefinitionLike {
+	return {
+		name: "dream",
+		description: "Consolidate all memory files via a headless agent (starts immediately, runs in the background)",
+		input: { hint: "" },
+		async handler(inv) {
+			const rt = deps.registry.get(inv.agent.session.id);
+			if (rt === undefined) {
+				return {
+					kind: "error",
+					text: "Cannot dream: no memory runtime for this session. Run /memory in the session that owns the memory directory; if the plugin never activated here, look for a \"simple-memory\" warning in the host log and fix the row config.",
+				};
+			}
+			if (rt.error !== null) {
+				return { kind: "error", text: `Cannot dream: the memory layer is not initialized.\n${rt.error}` };
+			}
+			if (rt.store === null || rt.memoryDir === null) {
+				// store-registry 保证 store === null 时 error 必非空；这里只是防御，不是可达路径。
+				return { kind: "error", text: "Cannot dream: the memory layer is not initialized." };
+			}
+			const model = taskModel(rt.config, "dream");
+			if (model === undefined) {
+				return {
+					kind: "error",
+					text: 'Cannot dream: no model configured — set dream.model (or defaults.model) in the plugin row config.',
+				};
+			}
+			if (parseModelRef(model) === null) {
+				return {
+					kind: "error",
+					text: `Cannot dream: dream model "${model}" must be "<provider>/<model>" — fix dream.model (or defaults.model) in the plugin row config.`,
+				};
+			}
+
+			// `runTask` 是 async：缺模型这类错误不会在调用点同步抛，而是变成这条链的 rejection，
+			// 由下面的失败分支写日志。整轮持锁与进入时的全目录快照都在 core 里。
+			const run = runTask(TASKS.dream, {}, {
+				cfg: rt.config,
+				cwd: rt.memoryDir,
+				store: rt.store,
+				ports: { headless: deps.headlessFor(rt) },
+			});
+			void run.then(
+				(summary) => deps.info("simple-memory: dream finished:\n%s", summary),
+				(e: unknown) => deps.warn("simple-memory: dream failed: %s", errorMessage(e)),
+			);
+			return {
+				kind: "success",
+				text: "Dream started: consolidating memory files in the background. The summary is written to the host log.",
 			};
 		},
 	};

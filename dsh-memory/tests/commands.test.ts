@@ -180,34 +180,42 @@ describe("renderStatus", () => {
 		for (const w of warnings) expect(text).toContain(w);
 	});
 
-	it("names unimplemented modules in the Modules line, and only when the user configured them", async () => {
+	it("reports every implemented task with its own switch and effective model", async () => {
 		const memoryDir = join(dir, "mem");
 		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
 
-		// 没配 dream / extractMemories 的用户不该看到它们（避免噪声）。
+		// 默认配置：dream 没有包级开关（恒 on），extractMemories opt-in（默认 off）。
 		const quiet = await renderStatus(rt, []);
-		expect(quiet).toContain("Modules: autoSurfacing=on(no model)");
-		expect(quiet).not.toContain("not implemented");
+		expect(quiet).toContain("Modules: autoSurfacing=on(no model), dream=on(no model), extractMemories=off");
 
-		// 配了就地报：白名单从 DEFAULT_CONFIG 派生，这两棵子树天生能通过校验却没有任何效果。
-		const loud = await renderStatus(rt, [], ["dream", "extractMemories"]);
-		expect(loud).toContain(
-			"Modules: autoSurfacing=on(no model), dream=not implemented in this adapter, extractMemories=not implemented in this adapter",
-		);
+		// 配了模型 / 开了开关：两个任务各自报**生效模型**（per-task 优先，其次 defaults.model）。
+		const loud = makeRuntime(memoryDir, makeStore(memoryDir), {
+			config: makeConfig(memoryDir, {
+				defaults: { model: "prov/default" },
+				dream: { model: "prov/dream" },
+				extractMemories: { enabled: true, model: "prov/extract" },
+			}),
+		});
+		const loudText = await renderStatus(loud, []);
+		expect(loudText).toContain("dream=on(prov/dream), extractMemories=on(prov/extract)");
+		// 三个任务全部实现了：这一行里不该再出现「未实现」的告警。
+		expect(loudText).not.toContain("not implemented");
 	});
 
-	it("threads deps.setKeys into the rendered status", async () => {
+	it("renders the same Modules line regardless of deps.setKeys", async () => {
+		// `setKeys` 过滤管的是「未实现的任务只在用户真写了该键时才显示」。本轮三个任务全部实现了，
+		// 过滤今天没有任何可以隐藏的对象 —— 留着它是给「将来新增任务忘实现」的接口，此处钉住它
+		// 不会改变输出（否则「实现了」这件事会被静默退回成旧文案）。
 		const memoryDir = join(dir, "mem");
 		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
+		const inv = { agent: { session: { id: "s1" } }, rawInput: "" };
 
-		const result = await handlerFor(rt, [], { setKeys: ["dream"] })({
-			agent: { session: { id: "s1" } },
-			rawInput: "",
-		});
+		const withKeys = await handlerFor(rt, [], { setKeys: ["dream"] })(inv);
+		const without = await handlerFor(rt, [])(inv);
 
-		expect(result.kind).toBe("success");
-		expect(result.text).toContain("dream=not implemented in this adapter");
-		expect(result.text).not.toContain("extractMemories=");
+		expect(withKeys.kind).toBe("success");
+		expect(withKeys.text).toContain("dream=on(no model)");
+		expect(withKeys.text).toBe(without.text);
 	});
 });
 

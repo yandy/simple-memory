@@ -1,6 +1,10 @@
 import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET } from "@yandy0725/memory-core";
-import { createMemoryCommand } from "./commands.js";
+import type { HeadlessAgentPort } from "@yandy0725/memory-core";
+import { runNestedSession } from "./agent-session.js";
+import type { AgentsLike } from "./agent-session.js";
+import { createDreamCommand, createMemoryCommand } from "./commands.js";
 import { errorMessage } from "./errors.js";
+import { createTurnStoppingListener } from "./extract.js";
 import { createDshHeadless } from "./headless.js";
 import type { LlmLike } from "./headless.js";
 import type { Context, HostPreStepDecision, HostPromptSection, HostToolDefinition } from "./host-types.js";
@@ -12,15 +16,16 @@ import { resolveRowConfig, rowConfigSetKeys } from "./row-config.js";
 import { createSessionSearch } from "./session-search.js";
 import type { SessionQueryLike } from "./session-search.js";
 import { createStoreRegistry, isRootAgent } from "./store-registry.js";
-import type { AgentLike, HostDirLike } from "./store-registry.js";
+import type { AgentLike, HostDirLike, SessionMemoryRuntime } from "./store-registry.js";
 import { createPreStepListener } from "./surfacing.js";
+import { createDshTranscript } from "./transcript.js";
 
 /**
  * dsh-memory 的 cordis 插件入口：把九个模块装配成一个 bundle。
  *
- * 装配顺序：行 config → auto-surfacing 可用性 → 四个 per-session 容器 →
- * 全局注册（section + `/memory`，每进程一次）→ per-agent 生命周期（created / disposed）→
- * 每轮召回（pre-step waterfall）。
+ * 装配顺序：行 config → auto-surfacing 可用性 → 四个 per-session 容器 → 端口（零工具侧查询 /
+ * 嵌套子会话）→ 全局注册（section + `/memory` + `/dream`，每进程一次）→ per-agent 生命周期
+ * （created / disposed）→ 每轮召回（pre-step waterfall）→ 每轮结束的抽取（turn-stopping）。
  *
  * 两条贯穿全局的约束：
  *
@@ -37,8 +42,21 @@ export const name = "simple-memory";
  * 用到的服务逐个列全（宿主插件实践文档 `practices.md`）：`inject` 里任一服务缺席时，插件保持
  * inactive（fiber pending）而不是在激活时抛错。所以精简 profile 里缺 `sessionQuery` 的表现是
  * 「记忆层整体不挂」—— 这正是想要的：宁可整体不挂，也不要半挂着（半挂意味着索引在、召回静默失效）。
+ *
+ * `agents` 是 extract / dream 必需的：它们的子会话必须跑真实的工具循环，而 dsh 里只有 agent 会跑
+ * （`ctx.llm.stream()` 不带工具循环）。缺 `agents` 时整个 bundle 不挂，而不是「召回在、dream 静默
+ * 不工作」—— 后者是更难查的半挂状态。
  */
-export const inject = ["tools", "systemPrompt", "llm", "commands", "workingDirectory", "sessionQuery", "logger"] as const;
+export const inject = [
+	"tools",
+	"systemPrompt",
+	"llm",
+	"agents",
+	"commands",
+	"workingDirectory",
+	"sessionQuery",
+	"logger",
+] as const;
 
 /** 索引 section 的名字与位次：宿主 `SECTION_ORDERS` 里 4000 未被占用（MCP_SERVERS 3100 … TOOLS_SDK 5000）。 */
 const INDEX_SECTION_NAME = "memory_index";
@@ -115,8 +133,37 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	// 4. per-session 容器：全部挂在闭包里（apply 每进程只跑一次，会话却有很多）。
 	const registry = createStoreRegistry(dirs);
 	const indexCache = createIndexCache();
-	const headless = createDshHeadless(llm);
 	const searchSessions = createSessionSearch(sessionQuery);
+	/** 零工具端口：autoSurfacing 的侧查询（零工具是意图本身，不需要会话、不需要工具循环）。 */
+	const zeroToolHeadless = createDshHeadless(llm);
+	/**
+	 * 宿主 agent 注册表的结构化接缝。extract / dream 的子会话由它创建（`ctx.agents.create`）：
+	 * 这是 dsh 里唯一能拿到「带工具循环的会话」的公开入口（设计稿 §4.1）。
+	 */
+	const agents: AgentsLike = ctx.agents;
+	/** extract 的对话来源与 `search scope=sessions` 共用一份 dsh 实现。 */
+	const transcript = createDshTranscript(searchSessions);
+	/**
+	 * 按会话运行时现造的端口。**为什么不是全局一个**：`memory` 工具必须绑到**这条会话**的
+	 * store / config / cwd 上（子会话自己拿不到运行时的写入通道），而 `run(req)` 的签名里没有
+	 * sessionId。所以端口在调用点按 `rt` 生成 —— 与 pi 的 `headlessFor(ctx)` 同款做法。
+	 *
+	 * 零工具的请求（autoSurfacing 侧查询）走 `llm.stream()`：它不需要会话，也就不会在宿主的会话
+	 * 日志里留下子会话。
+	 */
+	const headlessFor = (rt: SessionMemoryRuntime): HeadlessAgentPort => ({
+		run(req) {
+			if (req.builtinTools === "none" && req.memoryTool === null) return zeroToolHeadless.run(req);
+			return runNestedSession(req, {
+				agents,
+				// action 子集与两个 skip（逻辑锁 / 快照）都来自 core 的请求：extract 是 5 个 action、
+				// 自己已持逻辑锁；dream 是 7 个 action、持逻辑锁且进入时已拍过整目录快照。
+				buildMemoryTool: (options) =>
+					createMemoryTool(rt, { searchSessions, onWrite: options.onWrite }, options),
+				warn: (message, ...params) => ctx.logger.warn(message, ...params),
+			});
+		},
+	});
 	/** sessionId → 本会话已注入过召回的 entry 文件名。surfacing 读写它，装配层负责在会话结束时销账。 */
 	const injected = new Map<string, Set<string>>();
 	/** sessionId → 工具注册的清理项。 */
@@ -154,11 +201,21 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		},
 	};
 	ctx.systemPrompt.section(section);
-	// 用户在行 config 里写过的白名单顶层键，交给 `/memory` 就地报出未实现的模块
-	//（哪些算未实现、是否只在真写了该键时才显示、怎么措辞，都在 commands.ts 的 renderStatus）。
+	// 用户在行 config 里写过的白名单顶层键，交给 `/memory` 就地报出未实现的任务
+	//（那些算未实现、是否只在真写了该键时才显示、怎么措辞，都在 commands.ts 的 renderStatus）。
 	const setKeys = rowConfigSetKeys(config);
 	ctx.commands.register(
 		createMemoryCommand({ registry, indexCache, warnings: resolved.warnings, setKeys }),
+	);
+	// `/dream`：整目录整理。命令立刻返回「已开始」，摘要在宿主日志里（dream 的 timeout 是 600s，
+	// 不能把命令处理器挂在那里等）。
+	ctx.commands.register(
+		createDreamCommand({
+			registry,
+			headlessFor,
+			warn: (message, ...params) => ctx.logger.warn(message, ...params),
+			info: (message, ...params) => ctx.logger.info(message, ...params),
+		}),
 	);
 
 	// 6. `agent/created`：串行、且在创建完成前被 await —— 这是唯一的异步窗口。记忆目录要探 git remote
@@ -229,7 +286,9 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	const recall = createPreStepListener({
 		registry,
 		indexCache,
-		headless,
+		// 召回是零工具侧查询（`TASKS.autoSurfacing` 的 `builtinTools: "none"` + `memoryTool: null`），
+		// 所以固定用零工具端口：不建子会话，也不在宿主会话日志里留痕。
+		headless: zeroToolHeadless,
 		injected,
 		warn: (message, ...args) => ctx.logger.warn(message, ...args),
 	});
@@ -246,7 +305,21 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		{ prepend: true },
 	);
 
-	// 9. `apply` 的 disposer 只拥有 apply 自己创建的东西（per-session 账本）。宿主注册归 fiber：
+	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
+	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
+	//    `enabled` / 子 agent / 无运行时这三道门禁都在 extract.ts 里（触发点决策属于适配层）。
+	ctx.on(
+		"agent/turn-stopping",
+		createTurnStoppingListener({
+			registry,
+			headlessFor,
+			transcript,
+			warn: (message, ...params) => ctx.logger.warn(message, ...params),
+			info: (message, ...params) => ctx.logger.info(message, ...params),
+		}),
+	);
+
+	// 10. `apply` 的 disposer 只拥有 apply 自己创建的东西（per-session 账本）。宿主注册归 fiber：
 	//    它们在 `apply` 内部就已经被宿主的 `register()` 包进 `ctx.fiber.effect(...)`，fiber 卸载时
 	//    自动撤销，不经过这个返回值。这里的清理对宿主是幂等的重复。
 	return () => {

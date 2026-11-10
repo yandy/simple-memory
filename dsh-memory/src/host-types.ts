@@ -12,11 +12,12 @@
  *    `HostAgent` / `HostCommandDefinition`（边界文档；index.ts 靠上下文类型拿到它们，未显式命名）。
  *    其余模块一律用本地结构化接缝（`AgentLike` / `LlmLike` / `SessionQueryLike` / `ToolDefinitionLike` …），
  *    这样它们脱离宿主也能单测：宿主类型只在接线边界出现一次。
- * 2. **`inject` 里那七个服务在宿主侧的真身**。导出它们不只是为了文档化边界：宿主是用
+ * 2. **`inject` 里那八个服务在宿主侧的真身**。导出它们不只是为了文档化边界：宿主是用
  *    `declare module '@deepseek-ai/cordis' { interface Context { … } }` 的**增广**把服务挂到 `Context`
  *    上的，只有把对应包的类型拉进编译单元，`ctx.systemPrompt` / `ctx.tools` / `ctx.llm` … 才存在。
- *    `@deepseek-ai/dsh-agent` 同时增广了 `Events`（`agent/created` / `agent/disposed` / `agent/pre-step`）
- *    与 `AssembleContext.agent`（section 的 `text` 回调靠它拿当前会话）。
+ *    `@deepseek-ai/dsh-agent` 同时增广了 `Events`（`agent/created` / `agent/disposed` /
+ *    `agent/pre-step` / `agent/turn-stopping`）、`Context.agents`（`AgentRegistry`）与
+ *    `AssembleContext.agent`（section 的 `text` 回调靠它拿当前会话）。
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, PreStepDecision } from "@deepseek-ai/dsh-agent";
@@ -44,11 +45,13 @@ export type { CommandDefinition as HostCommandDefinition };
 /** `agent/pre-step` waterfall 的裁决：`{kind:"reject"}` 或 `{kind:"enter", messages: UserMessage[]}`。 */
 export type { PreStepDecision as HostPreStepDecision };
 
-/** `inject` 声明的七个服务在宿主侧的类型（顺序与 `inject` 一致，便于逐条对照）。 */
+/** `inject` 声明的八个服务在宿主侧的类型（顺序与 `inject` 一致，便于逐条对照）。 */
 export type { ToolsService as HostTools };
 export type { SystemPrompt as HostSystemPrompt };
 export type { LlmRuntime as HostLlm };
+/** `agents`：extract / dream 的嵌套子会话经它的 `create()` 创建（`AgentHandle` 是拥有权凭证）。 */
+export type { AgentRegistry as HostAgents, AgentHandle as HostAgentHandle } from "@deepseek-ai/dsh-agent";
 export type { CommandRuntime as HostCommands };
 export type { WorkingDirectoryService as HostWorkingDirectory };
 export type { SessionQueryEngine as HostSessionQuery };
-/** 第七个服务 `logger` 由 cordis 自己声明在 `Context` 上（`LoggerService`），不需要增广。 */
+/** 第八个服务 `logger` 由 cordis 自己声明在 `Context` 上（`LoggerService`），不需要增广。 */
