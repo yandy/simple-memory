@@ -210,15 +210,25 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 
 ## 验证状态
 
-单元测试与跨 harness 共享测试全绿（dsh-memory `281 passed`，memory-core `487 passed | 4 skipped`，
-pi-memory `234 passed`）。**尚未对真实运行的宿主验证**，两处缺口尤其要说清：
+单元测试全绿（dsh-memory `284 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上跑过（隔离 `DSH_HOME`
++ `file:` 装包，流程见 [docs/guides/dsh-real-host-smoke.md](../docs/guides/dsh-real-host-smoke.md)）。
 
-1. 装进真实 dsh profile 的端到端、以及召回消息用 `form: "notice"` 时正文是否确实进模型（单测只钉住
-   了「消息的 content 含完整正文、summary 是短摘要」）；
-2. 嵌套子会话（extract / dream）在真宿主上的行为：`agents.create` → `setup` 里的 `tools.restrict`
-   → `followup` / `whenIdle` / `cancel` 这条链只在假宿主上验证过。子会话的工具面、`maxTurns`
-   尽力而为的上界与超时打断都需要真实宿主跑一轮才算数。
+真机已确认：
 
-别把这两样当成已验证。真机验收的可复制流程（隔离 `DSH_HOME` + 从模板建 profile + 本地 `file:` 装包 +
+- 插件**真的会激活**（`inject` 里曾经多写了 `logger` —— 它是 `Context` 的普通属性、不是服务，
+  写进去会让 fiber 永久 `pending`，插件一次都不会生效）。
+- `memory_index` 段与 `memory` 工具在真会话里出现（请求头里能看到 25 个工具，含 `memory`），
+  模型主动 `add` 的记忆落盘正确：`MEMORY.md` 索引行 + 条目文件。
+- `/memory`、`/dream` 两个命令注册成功（空 `input.hint` 会让宿主拒绝注册并回滚整个 bundle）。
+
+**未验证 / 已知阻塞**：extract 与 dream 的**嵌套子会话创建**在真机上抛
+`cannot create effect on inactive context`。`AgentRegistry.create()` 用 `this.ctx` 作为子 agent 的
+owner，而 cordis 的 traceable 机制把 `this.ctx` 解析成「访问服务时的调用方作用域」——在
+`agent/turn-stopping`（以及 `agent/status`）的派发里创建子会话会失败；同样调用在 `apply` 期间、
+以及 `agent/created` 期间**都是成功的**。插件作用域绑定、agent 作用域（`agent.ctx.agents`）绑定、
+宏任务延迟三种写法均复现，所以 owner 的解析点还没定位到。
+
+因此：dsh 侧的 auto-surfacing、索引注入、`memory` 工具是**真机可用**的；extract / dream 目前
+**不可用**（每轮会静默跳过：core 把 `not-run` 映射成 `{skipped: true}`）。别把它们当成可用。真机验收的可复制流程（隔离 `DSH_HOME` + 从模板建 profile + 本地 `file:` 装包 +
 `zstdcat` 读子会话、断言工具面只剩 `memory`）见
 [docs/guides/dsh-real-host-smoke.md](../docs/guides/dsh-real-host-smoke.md)。
