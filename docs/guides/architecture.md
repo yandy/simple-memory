@@ -41,6 +41,11 @@ spec 与迁移说明。
 `.gitattributes` 固定 `* text=auto eol=lf`。Windows runner 默认 CRLF 检出，会把 `\r\n` 带进
 `prompts.ts` 的模板字面量（也就是发给模型的 prompt 本体）。
 
+## 测试
+
+`PI_CODING_AGENT_DIR` 隔离、`tests/helpers/wiring-harness.ts` 的 import 顺序、临时目录与失败
+注入的边界，见 [testing.md](./testing.md)。
+
 ## 仓内解析 vs 发布形态
 
 `pi-memory` 与 `dsh-memory` 的 `vitest.config.ts` 用 `resolve.alias`、`tsconfig.json` 用 `paths`，把
