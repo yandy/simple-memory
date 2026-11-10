@@ -43,8 +43,23 @@ export interface TurnStoppingPayloadLike {
 	};
 }
 
-export function createTurnStoppingListener(deps: ExtractListenerDeps): (payload: TurnStoppingPayloadLike) => void {
-	return (payload) => {
+export interface ExtractTrigger {
+	/** `agent/turn-stopping` 的监听器本体（同步返回，抽取在后台继续）。 */
+	(payload: TurnStoppingPayloadLike): void;
+	/**
+	 * 尽力等完在途的抽取（最多 `timeoutMs`）。
+	 *
+	 * 为什么需要：抽取是 fire-and-forget，而 `dsh headless` 这种一次性宿主在父轮结束后**立刻退出
+	 * 进程**，在途的子会话会被 `aborted/disposed` 打断（真机实测）。长寿命宿主（web / TUI）本来
+	 * 就不会退出，但卸载/切会话时同样需要这个窗口。返回 false 表示还有任务没跑完。
+	 */
+	drain(timeoutMs?: number): Promise<boolean>;
+}
+
+export function createTurnStoppingListener(deps: ExtractListenerDeps): ExtractTrigger {
+	const inFlight = new Set<Promise<unknown>>();
+
+	const listener = (payload: TurnStoppingPayloadLike): void => {
 		// 整个函数同步返回；内部任何一步失败都只记一行 —— 这是宿主 await 的串行监听器，
 		// 抛错会变成「这一轮收口失败」，而抽取只是增强。
 		try {
@@ -105,6 +120,10 @@ export function createTurnStoppingListener(deps: ExtractListenerDeps): (payload:
 				},
 			);
 
+			// 记账：卸载/退出时 `drain()` 用它等在途的抽取。
+			const tracked = run.finally(() => inFlight.delete(tracked));
+			inFlight.add(tracked);
+
 			// 两参 `.then`（而不是 `.then().catch()`）：成功分支自己抛错只会进它自己的分支，
 			// 不会被失败回调接住而误报成抽取失败。
 			void run.then(
@@ -121,4 +140,21 @@ export function createTurnStoppingListener(deps: ExtractListenerDeps): (payload:
 			deps.warn("simple-memory: extract skipped: %s", errorMessage(e));
 		}
 	};
+
+	return Object.assign(listener, {
+		async drain(timeoutMs = 5_000): Promise<boolean> {
+			if (inFlight.size === 0) return true;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = new Promise<false>((resolve) => {
+				timer = setTimeout(() => resolve(false), timeoutMs);
+				timer.unref?.();
+			});
+			try {
+				const done = await Promise.race([Promise.allSettled([...inFlight]).then(() => true as const), timeout]);
+				return done === true;
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+		},
+	});
 }

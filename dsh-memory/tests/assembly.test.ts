@@ -622,12 +622,12 @@ describe("apply — 启动期降级与每轮召回", () => {
 	});
 });
 
-describe("apply — extract 触发点（agent/turn-stopping）", () => {
+describe("apply — extract 的常驻 worker（agent/created 建、turn-stopping 用）", () => {
 	const ONE_USER_TURN = [
 		{ type: "user/message", data: { content: [{ type: "text", text: "remember X" }], source: { kind: "user" } } },
 	];
 
-	it("runs an extract sub-session when extractMemories is enabled", async () => {
+	it("prepares the extract worker at session start and drives it at turn end", async () => {
 		const { fake } = await setup(
 			{
 				childRun: () => ({
@@ -644,32 +644,41 @@ describe("apply — extract 触发点（agent/turn-stopping）", () => {
 		const agent = fake.makeAgent({ id: "s1", cwd, events: ONE_USER_TURN });
 		await fake.emitter.agentCreated(agent);
 
-		await fake.emitter.turnStopping({ agent });
-		await vi.waitFor(() => expect(fake.childSessions).toHaveLength(1));
-
+		// 子会话在**会话启动**阶段就建好（`agents.create()` 只在那个阶段能成功）。
+		expect(fake.childCreateOptions).toHaveLength(1);
 		const [options] = fake.childCreateOptions;
-		// 子会话是 subagent（`isRootAgent` 因此不再给它挂记忆层），cwd 是这条会话的记忆目录。
 		expect(options.meta).toMatchObject({ origin: "subagent", cwd: memoryDirFor(cwd) });
-		// 模型与思考档位都由 core 从 cfg 读出来（`extractMemories.thinkLevel` 默认 high），
-		// 装配层只负责把 `<provider>/<model>` 拆开交给宿主的 agentOptions。
 		expect(options.agentOptions).toEqual({ provider: "prov", model: "extract", reasoningEffort: "high" });
 
 		// 子会话唯一的工具是作用域里的 `memory`：全局工具被 restrict 全部关掉。
 		const childRestriction = fake.restrictions.find((entry) => entry.agentId.endsWith(":child"));
 		expect(childRestriction?.filter).toEqual({ allow: [] });
 
-		// 跑完一定 dispose（否则长寿命宿主进程里会积一堆子会话）。
-		await vi.waitFor(() => expect(fake.childSessions[0].disposed).toBe(true));
+		// 轮次收口时只 followup，不再新建会话。
+		await fake.emitter.turnStopping({ agent });
+		await vi.waitFor(() => expect(fake.childSessions[0].messages.length).toBe(1));
+		expect(fake.childCreateOptions).toHaveLength(1);
 	});
 
-	it("starts nothing when extractMemories is off", async () => {
+	it("creates a second worker only when the user configured a dream key", async () => {
+		const { fake } = await setup(
+			{ childRun: () => ({ events: [{ type: "assistant/message", data: { message: { content: [{ type: "text", text: "ok" }] } } }] }) },
+			rowConfig({ defaults: { model: "prov/x" }, extractMemories: { enabled: true }, dream: { model: "prov/dream" } }),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd, events: ONE_USER_TURN });
+		await fake.emitter.agentCreated(agent);
+
+		// extract（5 个 action）+ dream（7 个 action）各一个：能力面不同，不能共用一个。
+		expect(fake.childCreateOptions).toHaveLength(2);
+	});
+
+	it("creates no worker when extractMemories is off and no dream key is configured", async () => {
 		const { fake } = await setup({}, rowConfig({ defaults: { model: "prov/extract" } }));
 		const agent = fake.makeAgent({ id: "s1", cwd, events: ONE_USER_TURN });
 		await fake.emitter.agentCreated(agent);
 
-		await fake.emitter.turnStopping({ agent });
-
 		expect(fake.childCreateOptions).toEqual([]);
-		expect(fake.childSessions).toEqual([]);
+		await fake.emitter.turnStopping({ agent });
+		expect(fake.childCreateOptions).toEqual([]);
 	});
 });

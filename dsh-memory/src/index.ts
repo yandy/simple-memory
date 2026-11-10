@@ -1,7 +1,7 @@
-import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET } from "@yandy0725/memory-core";
+import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET, TASKS, taskModel } from "@yandy0725/memory-core";
 import type { HeadlessAgentPort } from "@yandy0725/memory-core";
-import { runNestedSession } from "./agent-session.js";
-import type { AgentsLike } from "./agent-session.js";
+import { createSessionWorker } from "./agent-session.js";
+import type { AgentsLike, SessionWorker } from "./agent-session.js";
 import { createDreamCommand, createMemoryCommand } from "./commands.js";
 import { errorMessage } from "./errors.js";
 import { createTurnStoppingListener } from "./extract.js";
@@ -169,16 +169,38 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	 */
 	const headlessFor = (rt: SessionMemoryRuntime): HeadlessAgentPort => ({
 		run(req) {
+			// 零工具的侧查询（autoSurfacing）不需要会话，直接走 `llm.stream()`。
 			if (req.builtinTools === "none" && req.memoryTool === null) return zeroToolHeadless.run(req);
-			return runNestedSession(req, {
-				// 优先用 agent 作用域的绑定（owner = 这条会话的 agent），兜底才是插件作用域。
-				agents: agentAgents.get(rt.sessionId) ?? agents,
-				// action 子集与两个 skip（逻辑锁 / 快照）都来自 core 的请求：extract 是 5 个 action、
-				// 自己已持逻辑锁；dream 是 7 个 action、持逻辑锁且进入时已拍过整目录快照。
-				buildMemoryTool: (options) =>
-					createMemoryTool(rt, { searchSessions, onWrite: options.onWrite }, options),
-				warn: (message, ...params) => ctx.logger.warn(message, ...params),
-			});
+
+			const slot = workers.get(rt.sessionId);
+			if (slot === undefined) {
+				return Promise.resolve({
+					status: "not-run" as const,
+					cause: "host-refused" as const,
+					detail: "no memory worker is prepared for this session",
+				});
+			}
+			if (slot.failure !== null) {
+				return Promise.resolve({ status: "not-run" as const, cause: "host-refused" as const, detail: slot.failure });
+			}
+			// 按 action 集（= 任务）挑 worker：extract 5 个、dream 7 个，两者能力面不同，不能混用。
+			const memoryTool = req.memoryTool;
+			if (memoryTool === null) {
+				return Promise.resolve({ status: "not-run" as const, cause: "host-refused" as const, detail: "no memory tool requested" });
+			}
+			const actions = memoryTool.actions;
+			const isDream = actions === TASKS.dream.plan.memoryTool;
+			const worker = isDream ? slot.dream : slot.extract;
+			if (worker === null) {
+				return Promise.resolve({
+					status: "not-run" as const,
+					cause: "host-refused" as const,
+					detail: isDream
+						? "dream has no prepared worker for this session: this adapter creates its sub-session at session start, so add a \"dream\" key (for example dream: { model: \"<provider>/<model>\" }) to the plugin row config and restart the session"
+						: "extractMemories has no prepared worker for this session",
+				});
+			}
+			return worker.run(req);
 		},
 	});
 	/** sessionId → 本会话已注入过召回的 entry 文件名。surfacing 读写它，装配层负责在会话结束时销账。 */
@@ -193,6 +215,15 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	 * agent（活着），子会话也因此随 agent 一起被回收。
 	 */
 	const agentAgents = new Map<string, AgentsLike>();
+	/**
+	 * sessionId → 该会话的**常驻子会话**（extract / dream 各一个）。
+	 *
+	 * 为什么常驻：`agents.create()` 只有在**会话启动阶段**（`agent/created`）才能成功；在
+	 * `agent/turn-stopping` 的派发里创建会抛 `cannot create effect on inactive context`（真机实测，
+	 * 三种绑定方式 + 宏任务延迟全部复现）。所以建会话提前到这里，每一轮只往里 `followup` 一条消息。
+	 * 代价：每个会话多一条**空的**子会话记录（只在相关任务启用时才建，见下方的门禁）。
+	 */
+	const workers = new Map<string, { extract: SessionWorker | null; dream: SessionWorker | null; failure: string | null }>();
 	/** sessionId → 工具注册的清理项。 */
 	const cleanups = new Map<string, SessionCleanup>();
 
@@ -261,6 +292,54 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// 记住这条会话 agent 作用域下的 `agents` 服务（子会话的 owner 用它）。
 		const scopedAgents = (like as unknown as { ctx?: { agents?: AgentsLike } }).ctx?.agents;
 		if (scopedAgents !== undefined) agentAgents.set(sessionId, scopedAgents);
+
+		// 会话启动阶段（允许建子会话的唯一时机）把 worker 建好。零成本默认：只有相关任务被显式
+		// 启用（extract）或用户写了 `dream` 键时才建，避免给每个会话留一对空子会话。
+		// dream worker 只在用户**显式配了** dream 键时才建（`/dream` 是手动命令，没写就别为它留一个空
+		// 子会话）。没建时 `/dream` 会返回一条可操作的报错，而不是静默什么都不做。
+		const wantsDream = setKeys.includes("dream");
+		if (rt.store !== null && rt.memoryDir !== null) {
+			const ownerAgents = scopedAgents ?? agents;
+			const extractPlan = TASKS.extractMemories.plan;
+			const dreamPlan = TASKS.dream.plan;
+			const buildTool = (options: Parameters<typeof createMemoryTool>[2] & { onWrite?: unknown }): unknown =>
+				createMemoryTool(rt, { searchSessions, onWrite: options?.onWrite as never }, options);
+			const makeWorker = async (task: "extractMemories" | "dream") => {
+				const plan = task === "dream" ? dreamPlan : extractPlan;
+				const model = taskModel(rt.config, task);
+				if (model === undefined || plan.memoryTool === null) return { worker: null, error: null };
+				const result = await createSessionWorker({
+					agents: ownerAgents,
+					cwd: rt.memoryDir as string,
+					model,
+					effort: rt.config[task]?.thinkLevel,
+					actions: plan.memoryTool,
+					skipLogicalLock: plan.lock !== "none",
+					skipSnapshot: plan.lock === "logical+snapshot",
+					maxTurns: plan.maxTurns,
+					buildMemoryTool: buildTool,
+					warn: (message, ...params) => ctx.logger.warn(message, ...params),
+				});
+				return "error" in result ? { worker: null, error: result.error } : { worker: result, error: null };
+			};
+
+			const slot = { extract: null as SessionWorker | null, dream: null as SessionWorker | null, failure: null as string | null };
+			if (rt.config.extractMemories?.enabled === true) {
+				const made = await makeWorker("extractMemories");
+				slot.extract = made.worker;
+				if (made.error !== null) slot.failure = `extract worker: ${made.error}`;
+			}
+			if (wantsDream) {
+				const made = await makeWorker("dream");
+				slot.dream = made.worker;
+				if (made.error !== null && slot.failure === null) slot.failure = `dream worker: ${made.error}`;
+			}
+			workers.set(sessionId, slot);
+			for (const extra of [slot.extract, slot.dream]) {
+				if (extra !== null && extra.sessionId !== "") ctx.logger.debug("simple-memory: sub-session %s prepared", extra.sessionId);
+			}
+		}
+
 		const tool = createMemoryTool(rt, {
 			searchSessions,
 			// 写入成功后刷新索引快照。core 的 onWrite 是同步回调（handler.ts:183 不 await 它），
@@ -307,6 +386,13 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		registry.forget(sessionId);
 		indexCache.forget(sessionId);
 		agentAgents.delete(sessionId);
+		const slot = workers.get(sessionId);
+		workers.delete(sessionId);
+		// 先尽力等在途抽取跑完（一次性宿主退出时这是唯一的宽限窗口），再拆 worker。
+		void extractTrigger
+			.drain()
+			.catch(() => false)
+			.then(() => Promise.allSettled([slot?.extract?.dispose(), slot?.dream?.dispose()]));
 		injected.delete(sessionId);
 	});
 
@@ -341,16 +427,17 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
 	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
 	//    `enabled` / 子 agent / 无运行时这三道门禁都在 extract.ts 里（触发点决策属于适配层）。
-	ctx.on(
-		"agent/turn-stopping",
-		createTurnStoppingListener({
-			registry,
-			headlessFor,
-			transcript,
-			warn: (message, ...params) => ctx.logger.warn(message, ...params),
-			info: (message, ...params) => ctx.logger.info(message, ...params),
-		}),
-	);
+	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
+	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
+	//    `enabled` / 子 agent / 无运行时这三道门禁都在 extract.ts 里（触发点决策属于适配层）。
+	const extractTrigger = createTurnStoppingListener({
+		registry,
+		headlessFor,
+		transcript,
+		warn: (message, ...params) => ctx.logger.warn(message, ...params),
+		info: (message, ...params) => ctx.logger.info(message, ...params),
+	});
+	ctx.on("agent/turn-stopping", extractTrigger);
 
 	// 10. `apply` 的 disposer 只拥有 apply 自己创建的东西（per-session 账本）。宿主注册归 fiber：
 	//    它们在 `apply` 内部就已经被宿主的 `register()` 包进 `ctx.fiber.effect(...)`，fiber 卸载时
@@ -361,6 +448,12 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			registry.forget(sessionId);
 			indexCache.forget(sessionId);
 		}
+		const slots = [...workers.values()];
+		workers.clear();
+		void extractTrigger
+			.drain()
+			.catch(() => false)
+			.then(() => Promise.allSettled(slots.flatMap((slot) => [slot.extract?.dispose(), slot.dream?.dispose()])));
 		cleanups.clear();
 		agentAgents.clear();
 		injected.clear();
