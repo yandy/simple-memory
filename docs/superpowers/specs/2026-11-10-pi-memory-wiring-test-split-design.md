@@ -1,9 +1,11 @@
-# `pi-memory` 接线测试拆分 + 配置层去 mock
+# `pi-memory` 接线测试拆分 + 配置层去 mock（A + C）
 
 日期：2026-11-10
 状态：**待批准**
 范围：只动 `pi-memory/tests/**`。`pi-memory/index.ts` 与 `pi-memory/src/**` **一行不改**。
 同批：补 `docs/guides/testing.md`（见 §7.7，三处注释已在引用一个本仓不存在的文件）。
+选定方案：**A + C**（A = 共享 harness 收走 mock 前导；C = 配置层走真实 `memory.json`）—— 两者
+正交，§6 分开陈述。
 
 ---
 
@@ -21,9 +23,10 @@
 
 ## 2. 目标
 
-- 2427 行切成 8 个按宿主关注点的文件，每个 250–450 行；另加 `tests/helpers/` 与一个纯函数测试文件。
+- **A**：2427 行切成 8 个按宿主关注点的文件，每个 250–450 行；另加 `tests/helpers/` 与一个纯函数
+  测试文件。
 - 合并 8 个重复/近重复用例：88 → 80 个（全仓 234 → 226）。
-- 配置层从「替换行为」改成「**默认真实 + 按需注入失败**」：`mockConfigValue`、`dirRef`、
+- **C**：配置层从「替换行为」改成「**默认真实 + 按需注入失败**」：`mockConfigValue`、`dirRef`、
   `dirOverrideRef`、`breakModelConfig()` / `restoreModelConfig()` 全部删除。
 - **契约覆盖不减**：任何一条现有断言代表的用户可见行为，改动后仍至少有一条用例钉着；合并只发生在
   「同一条契约被两三个用例重复钉」的情形。
@@ -61,17 +64,35 @@
 
 ## 6. 方案与取舍
 
-三条路都基于同一套去重清单（§7.5）与同一种文件切分（§7.1），差别在「mock 怎么办」：
+这里其实有**两个互相独立**的轴，不是三选一：
+
+- **轴一：mock 前导怎么共享**（拆成 8 个文件之后必然要回答）
+- **轴二：配置层是假的还是真的**（与切分无关的独立决定）
+
+### 轴一
 
 | 方案 | 内容 | 取舍 |
 |---|---|---|
-| A | 共享 harness 收走全部 `vi.hoisted` + 7 个 `vi.mock` | 改动最小；但 `mockConfigValue` / `dirRef` / `dirOverrideRef` 这套假货原样搬进 harness，只是换了个位置 |
+| **A（选定）** | 一个 `tests/helpers/wiring-harness.ts` 收走全部 `vi.hoisted` + 7 个 `vi.mock`，每个文件首行 import 它 | 不重复；代价是一条「import 必须在前」的约定（失败是响的，见 §5）。前提是 §7.4 的去 mock 已完成，否则这套假货只是换了个文件放 |
 | B | 每个文件自带约 50 行 mock 前导 | 没有顺序约定；代价是 8 × 50 ≈ 400 行重复，改一个 mock 要改 8 处 |
-| **C（选定）** | 配置层走**真实** `loadConfig`（从 `PI_CODING_AGENT_DIR` 下的 `memory.json` 读）+ 按需注入失败；目录解析留 3 行 stub | 删掉整层手搓 fixture；配置错误态用例读起来像用户操作；代价是约 30 个用例要重写 setup 段（断言基本不动） |
 
-选 C 的理由：A 只是把「假货」换个文件放，B 用 400 行重复换一条约定。C 是唯一真正消掉问题根源
-（配置由手写对象变成磁盘文件）的一条，而它的额外风险（配置错误态覆盖缩水）可以用 §4 第二条 +
-§7.6 的验收清单盯住。
+### 轴二
+
+| 方案 | 内容 | 取舍 |
+|---|---|---|
+| **C（选定）** | 配置层走**真实** `loadConfig`（从 `PI_CODING_AGENT_DIR` 下的 `memory.json` 读）+ 按需注入失败；目录解析留 3 行 stub | 删掉整层手搓 fixture（`mockConfigValue` / `dirRef` / `dirOverrideRef` / 6 行复原 / `breakModelConfig()`）；配置错误态用例读起来像用户操作；代价是约 30 个用例要重写 setup 段（断言基本不动） |
+| 保留现状 | `loadConfig` / `resolveMemoryDir` 的 mock 继续喂手写对象 | 改动最小；但「配置坏掉」测的仍是另一个手写对象，不是用户动作 |
+
+### 选定：**A + C**
+
+两者正交且互补，缺一个都不成立：
+
+- **只做 A**：假货原样搬进 harness，只是换了个位置 —— 节点还在，问题没解。
+- **只做 C**：2427 行的单体还在，只是里面的 fixture 变干净了。
+- **A + C**：切分把维护热区拆开，去 mock 让每块内部不再有手搓配置；harness 也因此从约 250 行缩到约 120 行
+  —— 因为 `mockConfigValue` / `dirRef` / `dirOverrideRef` 这一整套不再需要了。
+
+C 的额外风险（配置错误态覆盖缩水）用 §4 第二条 + §7.6 的验收清单盯住。
 
 ## 7. 已定的怎么做
 
@@ -79,7 +100,7 @@
 
 | 文件 | 内容 | 用例数 |
 |---|---|---|
-| `tests/helpers/wiring-harness.ts` | hoisted 状态、8 个 `vi.mock`、纯 fixture、`setupSession()` | — |
+| `tests/helpers/wiring-harness.ts` | hoisted 状态、7 个 `vi.mock`、纯 fixture、`setupSession()` | — |
 | `wiring-session-start.test.ts` | 工具注册（含「只注册一次」）、端到端写入、`injectedFiles` 每次启动清空、只配 `defaults.model` 也能初始化 | 4 |
 | `wiring-index-section.test.ts` | 索引 section 冻结、resume/fork/reload 录制值、磁盘回退、无 `sections` 的旧 SDK 退路、空值、`session_compact` 刷新 | 12 |
 | `wiring-shutdown.test.ts` | 等在途、超时放弃、空闲不挂定时器、定时器清理 | 4 |
@@ -94,9 +115,10 @@
 
 ### 7.2 `tests/helpers/wiring-harness.ts`
 
-内容：原来的两个 `vi.hoisted` 块 + 8 个 `vi.mock`（`../src/config`、`@yandy0725/memory-core`、
+内容：原来的两个 `vi.hoisted` 块 + 7 个 `vi.mock`（`../src/config`、`@yandy0725/memory-core`、
 `../src/nudge`、`../src/memory-tool`、`../src/legacy-hint`、`../src/session-search`、
-`../src/index-source`、`@earendil-works/pi-coding-agent` 如需要），导出：
+`../src/index-source`；目前**没有**对 `@earendil-works/pi-coding-agent` 的 mock，`SessionManager.list`
+是在个别用例里用 `vi.spyOn` 临时压住的），导出：
 
 - mock 句柄：`loadConfigMock`、`scanEntriesMock`、`runTaskMock`、`shouldNudgeMock`、
   `readRecordedMemoryIndexMock`、`dreamMetaMock`、`detectLegacyMemoryDirMock`、`createMemoryToolSpy`、
