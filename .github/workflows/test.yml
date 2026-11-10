@@ -33,6 +33,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check:host-deps
+      - run: npm run check:memory-core-deps
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
@@ -66,6 +67,24 @@ jobs:
       - run: npm test -w dsh-memory
         env:
           MEMORY_CORE_FROM_DIST: "1"
+
+  # 上一个 job 打的是**仓内**的 memory-core/dist（workspace 符号链接）。用户机器上解析到的是
+  # registry 上的那个版本，所以这里真装一次：把适配层打成 tarball，装进干净目录、依赖只从 registry
+  # 拉，再断言解析到的 memory-core 在干净目录内、版本满足声明的范围、且能真读写。
+  # 未发布的适配层（dsh-memory 目前 private: true）在 registry 上没有满足范围的版本时只打 notice 跳过；
+  # 去掉 private 之后同一条件变成失败。
+  registry-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w memory-core && npm run build -w dsh-memory
+      - run: npm run smoke:registry
 
   # 20.16.0 是 memory-core 的 engines 下限（dsh 生态声明的最低宿主版本），24 是开发版本。
   # 这个 job 只验证运行时形状，不跑 vitest：开发工具链的 Node 下限高于 engines。
