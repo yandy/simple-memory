@@ -11,6 +11,7 @@ import { PI_HOST_DEFAULTS } from "../../src/config";
  * **import 顺序是硬约定**：本模块注册了下面 7 个 `vi.mock`，所以引用它必须排在引用 `../index`
  * 之前。顺序错了 mock 不会注册，用例会去读真实 `~/.pi` 配置然后整片变红（不会静默绿）。
  * 根 `biome.json` 的 `files.includes` 排除了 tests 目录，Biome 不会重排把它改坏。
+ * 完整约定（含 `PI_CODING_AGENT_DIR` 隔离与临时目录）见 docs/guides/testing.md。
  *
  * `vi.hoisted` 创建的变量**不能**直接 export（`SyntaxError: Cannot export hoisted variable`），
  * 所以这里把 hoisted 的结果留作模块内常量，只导出它们的派生句柄。
