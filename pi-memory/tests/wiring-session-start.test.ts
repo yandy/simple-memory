@@ -39,7 +39,7 @@ describe("index wiring — session_start", () => {
 		dirOverrideRef.current = null;
 	});
 
-	it("registers exactly one memory tool with the five main-agent actions", async () => {
+	it("registers exactly one memory tool with the five main-agent actions, even across sessions", async () => {
 		const { pi, tools, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
 
@@ -62,15 +62,9 @@ describe("index wiring — session_start", () => {
 		expect(Object.keys(tools[0].parameters.properties)).not.toContain("new_name");
 		expect(commands["memory"]).toBeDefined();
 		expect(commands["dream"]).toBeDefined();
-	});
 
-	it("registers the tool only once across sessions", async () => {
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
-
+		// 跨 session 也只注册一次：第二次 session_start 不得再注册
 		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["session_start"][0]({}, uiCtx());
-
 		expect(tools).toHaveLength(1);
 	});
 
