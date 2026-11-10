@@ -6,10 +6,10 @@
 
 ## 顺序：`memory-core` 必须在 `pi-memory` 之前
 
-`pi-memory` 的 `dependencies` 指向 `@yandy0725/memory-core@^1.0.0`。
+`pi-memory` 的 `dependencies` 指向 `@yandy0725/memory-core@^2.0.0`。
 
 - **core 不在 registry 上就发 `pi-memory`，得到的是一个装不上的包**：用户会拿到
-  `No matching version found for @yandy0725/memory-core@^1.0.0`。
+  `No matching version found for @yandy0725/memory-core@^2.0.0`。
 - 反过来安全：只发 core、不发 `pi-memory`，不影响任何现有用户。
 
 ## 步骤
@@ -36,13 +36,26 @@ gh release create memory-core-v<新版本号> --target "$COMMIT" \
 
 `memory-core` 带 `prepublishOnly: npm run build`，所以发布前一定会重新构建 `dist/`；不要提交 `dist/`。
 
+## 让 `registry-smoke` 转绿
+
+core 2.0.0 引入 `runTask` / `TASKS`，而合并提交的 CI 里 `registry-smoke` 从 registry 装 core，所以**在
+core 2.0.0 上 registry 之前它预期是红的**（`@yandy0725/memory-core@^2.0.0` 查不到），不是代码错。发完
+core 之后，在同一合并提交的 workflow 上重跑：
+
+```bash
+gh run rerun <run-id>
+```
+
+`registry-smoke` 由红转绿后，再按上面的步骤发 `pi-memory-v4.0.0`。顺序不能反：先 `memory-core 2.0.0`，
+后 `pi-memory 4.0.0`（后者依赖 `^2.0.0`）。
+
 ## 验收：不要只看 workflow 绿
 
 npm 的 publish 成功不等于 registry 立刻可查（会先返回「being processed」）。按这三步确认：
 
 ```bash
 # 1. 轮询版本文档到 200
-curl -s -o /tmp/v.json -w "%{http_code}\n" https://registry.npmjs.org/@yandy0725%2Fmemory-core/1.0.0
+curl -s -o /tmp/v.json -w "%{http_code}\n" https://registry.npmjs.org/@yandy0725%2Fmemory-core/2.0.0
 # 2. 把 dist.shasum 与 publish 日志里 npm notice 打的 shasum: 逐字比对
 node -e 'console.log(require("/tmp/v.json").dist.shasum)'
 # 3. 确认 dist-tags.latest 已翻到新版本

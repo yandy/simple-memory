@@ -14,6 +14,9 @@
 
 `memory-core/src/**` 只许 import `node:*` 与相对路径（`tests/**` 另许 `vitest`）。
 
+`memory-core` 不读任何配置文件：配置文件在哪、读哪几个、项目是否受信任，是适配层的事（core 只给默认值
+与合并语义 `mergeConfig`）。
+
 执行点是 `memory-core/tests/neutrality.test.ts`，它同时禁止 core 里出现只有本仓才读得懂的坐标
 （spec 章节号、决策编号、宿主斜杠命令、宿主事件名）。放宽这条等于让第二个 harness 装不上这个包。
 
