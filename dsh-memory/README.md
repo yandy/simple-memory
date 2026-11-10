@@ -221,6 +221,11 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 - **extract 端到端可用**：父会话被要求「不要调用任何工具」，仅 1 轮 1 步；`MEMORY.md` 仍出现两条
   记忆，来自 extract 的子会话 —— 该子会话 `request/header` 里工具面只有 `["memory"]`，调用序列是
   `memory list` → `memory add` ×2，`turn/end: completed`。
+- **`/dream` 端到端可用**：在预置 4 条（含两条互相冲突的「锁文件」记忆）的目录上执行 `/dream`，
+  子会话工具面是 `["memory"]`（7 个 action）、调用序列 `list → search ×2 → rebuild_index`，
+  `turn/end: completed`；结果是**真的合并了**两条冲突记忆（`lock-never-auto-reclaimed` +
+  `lock-files-stick-around` → `lock-files-never-auto-reclaimed`，旧文件已删除）、改写了另一条的
+  description、并把索引重建为 3 行。同时在 `<memoryDir>/.backups/` 留下了整目录快照（回滚点）。
 - `/memory`、`/dream` 两个命令注册成功（空 `input.hint` 会让宿主拒绝注册并回滚整个 bundle）。
 
 ### 子会话为什么是「常驻 worker」
