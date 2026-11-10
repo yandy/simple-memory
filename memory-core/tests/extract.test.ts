@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	MAIN_AGENT_ACTIONS,
 	MemoryStore,
+	TASKS,
 	type ExtractMessage,
 	type RunExtractOpts,
 	type StoreConfig,
@@ -371,7 +372,7 @@ describe("runExtract", () => {
 		expect(headlessRun).not.toHaveBeenCalled();
 	});
 
-	it("asks for no builtin tools, five actions, maxTurns=5 and a 120s timeout", async () => {
+	it("asks for the full extract prompt and the configured model", async () => {
 		const out = await extract(
 			opts({
 				model: "deepseek/deepseek-v4-flash",
@@ -383,16 +384,8 @@ describe("runExtract", () => {
 		expect(headlessRun).toHaveBeenCalledTimes(1);
 		expect(headlessRun).toHaveBeenCalledWith(
 			expect.objectContaining({
-				cwd: dir,
-				effort: "high",
-				maxTurns: 5,
-				timeoutMs: 120_000,
-				// 「关 builtin、只留 memory 工具」在 core 里就是这两个字段；
-				// 白名单陷阱（宿主的 tools: [] 会连 customTools 一起滤掉）由适配层躲开。
-				builtinTools: "none",
-				memoryTool: { actions: MAIN_AGENT_ACTIONS, skipLogicalLock: true, onWrite: undefined },
+				task: expect.stringContaining("memory extraction agent"),
 				model: "deepseek/deepseek-v4-flash",
-				sessionPersistence: { enabled: true },
 			}),
 		);
 	});
@@ -436,5 +429,18 @@ describe("runExtract", () => {
 		headlessRun.mockRejectedValueOnce(new Error("extract failed"));
 		await expect(extract(opts())).rejects.toThrow("extract failed");
 		expect(store.logicalLockActive()).toBe(false);
+	});
+});
+
+describe("TASKS.extractMemories", () => {
+	// 这些值以前是 runExtract 手写进请求里的；搬到描述符后，请求只剩 task 与 model 需要断言。
+	it("declares the plan: five turns, 120s, five actions, logical lock, rethrow", () => {
+		expect(TASKS.extractMemories.plan).toEqual({
+			maxTurns: 5,
+			timeoutMs: 120_000,
+			memoryTool: MAIN_AGENT_ACTIONS,
+			lock: "logical",
+			errorPolicy: "rethrow",
+		});
 	});
 });

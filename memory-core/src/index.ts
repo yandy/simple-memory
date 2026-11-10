@@ -104,18 +104,19 @@ export type { EntryManifest } from "./injection.js";
 // dream / extract / 侧查询行为（prompt 文本、锁与快照边界、截断预算、错误语义）。
 export { runDream } from "./orchestration/dream.js";
 export type { RunDreamOpts } from "./orchestration/dream.js";
-export { runExtract } from "./orchestration/extract.js";
-export type { ExtractPorts, RunExtractOpts } from "./orchestration/extract.js";
-export { renderConversation } from "./orchestration/conversation.js";
-export type { ConversationLimits } from "./orchestration/conversation.js";
 export { runTask, TASKS } from "./orchestration/task.js";
 export type {
 	Incomplete,
 	MemoryTask,
+	MemoryToolOnWrite,
 	TaskContext,
 	TaskDeps,
 	TaskPlan,
 } from "./orchestration/task.js";
+export { runExtract } from "./orchestration/extract.js";
+export type { ExtractInput, ExtractPorts, ExtractResult, RunExtractOpts } from "./orchestration/extract.js";
+export { renderConversation } from "./orchestration/conversation.js";
+export type { ConversationLimits } from "./orchestration/conversation.js";
 export { runSideQuery } from "./orchestration/surfacing.js";
 export type { RunSideQueryOpts, SurfacingInput, SurfacingResult } from "./orchestration/surfacing.js";
 export { buildDreamTask, buildExtractTask } from "./orchestration/prompts.js";

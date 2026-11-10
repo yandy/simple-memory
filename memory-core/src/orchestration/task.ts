@@ -13,6 +13,7 @@ import type {
 	IncompleteOutcome,
 	OrchestrationPorts,
 } from "./ports.js";
+import { extractMemories } from "./extract.js";
 import { autoSurfacing } from "./surfacing.js";
 
 /** 任务描述符里的编排骨架：全是 core 常量；两个 skip 由 `lock` 派生，不再单独编码。 */
@@ -80,10 +81,10 @@ export interface MemoryTask<I, R> {
 /**
  * 任务注册表。
  *
- * 本轮只有 autoSurfacing 一个描述符（Task 4）；Task 6 在 dream 落地后把它扩成
+ * Task 4 落 autoSurfacing、Task 5 落 extractMemories；Task 6 在 dream 落地后把它扩成
  * `Record<ModelTask, MemoryTask<any, any>>`，中间任务不得为缺失条目造假对象。
  */
-export const TASKS = { autoSurfacing } as const;
+export const TASKS = { autoSurfacing, extractMemories } as const;
 
 /**
  * 构造端口请求：plan 的取值与调用方的宿主参数在这里合流，`runTask` 与过渡期的 `runSideQuery` 共用。

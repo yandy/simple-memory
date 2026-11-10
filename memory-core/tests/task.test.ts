@@ -9,7 +9,9 @@ import {
 	mergeConfig,
 	runTask,
 	type EntryManifest,
+	type ExtractMessage,
 	type HeadlessRunRequest,
+	type HostTranscriptPort,
 	type MemoryTask,
 	type StoreConfig,
 	type SurfacingInput,
@@ -54,6 +56,11 @@ function ctx(over: Partial<TaskContext> = {}): TaskContext {
 		ports: { headless: { run: async () => ({ status: "completed", text: "" }) } },
 		...over,
 	};
+}
+
+/** 透传的假 transcript：core 测试直接给中立的 `ExtractMessage`。 */
+function transcript(mapping: (raw: unknown[]) => ExtractMessage[]): HostTranscriptPort {
+	return { toExtractMessages: mapping, searchSessions: async () => "" };
 }
 
 describe("runTask(TASKS.autoSurfacing)", () => {
@@ -202,5 +209,110 @@ describe("runTask(TASKS.autoSurfacing)", () => {
 			}),
 		);
 		expect(out).toEqual({ files: [], content: "" });
+	});
+});
+
+describe("runTask(TASKS.extractMemories)", () => {
+	const cfg = () => mergeConfig(DEFAULT_CONFIG, { defaults: { model: "provider/base" } });
+	const extractPorts = (headless: TaskContext["ports"]["headless"]): TaskContext["ports"] => ({
+		headless,
+		transcript: transcript((raw) => raw as ExtractMessage[]),
+	});
+
+	it("checks for an empty transcript before taking the logical lock", async () => {
+		const order: string[] = [];
+		const fake = {
+			tryWithLogicalLock: async () => {
+				order.push("lock");
+				return {};
+			},
+		} as unknown as MemoryStore;
+		const out = await runTask(
+			TASKS.extractMemories,
+			{ messages: [], agentsMdBlocks: [] },
+			{
+				cfg: cfg(),
+				cwd: "/mem",
+				store: fake,
+				ports: extractPorts({ run: async () => ({ status: "completed", text: "" }) }),
+			},
+		);
+		expect(order).toEqual([]);
+		expect(out).toEqual({ skipped: true });
+	});
+
+	it("reports a lock-busy round as skipped", async () => {
+		const out = await runTask(
+			TASKS.extractMemories,
+			{ messages: [{ role: "user", text: "hi" }], agentsMdBlocks: [] },
+			{
+				cfg: cfg(),
+				cwd: "/mem",
+				store: { tryWithLogicalLock: async () => null } as unknown as MemoryStore,
+				ports: extractPorts({ run: async () => ({ status: "completed", text: "" }) }),
+			},
+		);
+		expect(out).toEqual({ skipped: true });
+	});
+
+	it("treats max-tokens as ran-with-partial-result, never as skipped", async () => {
+		const out = await runTask(
+			TASKS.extractMemories,
+			{ messages: [{ role: "user", text: "hi" }], agentsMdBlocks: [] },
+			{
+				cfg: cfg(),
+				cwd: "/mem",
+				store,
+				ports: extractPorts({ run: async () => ({ status: "incomplete", cause: "max-tokens" }) }),
+			},
+		);
+		expect(out.skipped).toBe(false);
+	});
+
+	it("returns an empty result, never skipped, for a completed-but-empty reply", async () => {
+		const out = await runTask(
+			TASKS.extractMemories,
+			{ messages: [{ role: "user", text: "hi" }], agentsMdBlocks: [] },
+			{
+				cfg: cfg(),
+				cwd: "/mem",
+				store,
+				ports: extractPorts({ run: async () => ({ status: "no-output" }) }),
+			},
+		);
+		expect(out).toEqual({ skipped: false, result: "" });
+	});
+
+	it("treats a not-run outcome as skipped", async () => {
+		const out = await runTask(
+			TASKS.extractMemories,
+			{ messages: [{ role: "user", text: "hi" }], agentsMdBlocks: [] },
+			{
+				cfg: cfg(),
+				cwd: "/mem",
+				store,
+				ports: extractPorts({ run: async () => ({ status: "not-run", cause: "host-refused" }) }),
+			},
+		);
+		expect(out).toEqual({ skipped: true });
+	});
+
+	it("rethrows a transport failure (errorPolicy rethrow)", async () => {
+		await expect(
+			runTask(
+				TASKS.extractMemories,
+				{ messages: [{ role: "user", text: "hi" }], agentsMdBlocks: [] },
+				{
+					cfg: cfg(),
+					cwd: "/mem",
+					store,
+					ports: extractPorts({
+						run: async () => {
+							throw new Error("boom");
+						},
+					}),
+				},
+			),
+		).rejects.toThrow("boom");
 	});
 });
