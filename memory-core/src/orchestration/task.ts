@@ -1,10 +1,14 @@
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	requiredModel,
 	type MemoryConfig,
 	type ModelTask,
 	type SessionPersistenceConfig,
 } from "../config.js";
-import type { MemoryStore } from "../store/memory-store.js";
+import { BACKUP_DIR, type MemoryStore } from "../store/memory-store.js";
+import { createSnapshot } from "../store/snapshot.js";
+import { isReservedWindowsName } from "../store/windows-names.js";
 import type { MemoryAction } from "../tool/actions.js";
 import type {
 	HeadlessOutcome,
@@ -136,6 +140,20 @@ function errorMessage(error: unknown): string {
 	}
 }
 
+/** 进入时快照要拍的目录条目：跳过 dotfile；win32 上再跳过保留设备名（CON 等）。 */
+async function snapshotFiles(memoryDir: string, platform: NodeJS.Platform = process.platform): Promise<string[]> {
+	const entries = await readdir(memoryDir, { withFileTypes: true }).catch(() => []);
+	return (
+		entries
+			.filter((entry) => entry.isFile() && !entry.name.startsWith("."))
+			// win32：保留设备名文件按名打开会命中设备（CON 等），`createSnapshot` 的 cp 会失败；
+			// dream 是 fail-closed 的，一次 cp 失败就打断整轮（与 `MemoryStore` 的 `#entryFiles` 同一契约）。
+			.filter((entry) => !(platform === "win32" && isReservedWindowsName(entry.name)))
+			.map((entry) => entry.name)
+			.sort()
+	);
+}
+
 /**
  * 三个 LLM 任务的通用编排。顺序是契约：
  *
@@ -190,8 +208,30 @@ export async function runTask<I, R>(task: MemoryTask<I, R>, input: I, ctx: TaskC
 			if (result === null) return task.notCompleted(cfg, deps, input, { status: "lock-busy" });
 			return result;
 		}
-		case "logical+snapshot":
-			// 只有 dream 用这档锁，而 dream 描述符在 Task 6 才落地；在此之前没有任务能走到这里。
-			throw new Error(`lock "${task.plan.lock}" is not implemented yet`);
+		case "logical+snapshot": {
+			// 只有 dream 用这档锁。整轮持锁是刻意的：dream 的多次 `replace` / `remove` 必须对
+			// 同进程的 `memory add` 与 extract 呈现为**一个**原子区间，否则用户会在 dream 中途读到
+			// 半合并的状态。锁在进程内（不是 `.lock`），所以跨进程的其它 worktree 仍能正常写入 ——
+			// 它们的每次物理写入只被挡毫秒级。
+			//
+			// 其内部的每个原语调用必须带 `{ skipLogicalLock: true, skipSnapshot: true }`（由
+			// `memoryTool` 请求字段表达，适配层据此构造子会话的工具），否则它们会去抢自己已持有的
+			// 锁而自锁到超时，并且会为同一批变更各拍一次快照。
+			return ctx.store.withLogicalLock(async () => {
+				// 启动自检：忘了包 withLogicalLock 会静默失去整轮互斥。
+				if (!ctx.store.logicalLockActive()) {
+					throw new Error("dream must run under the memory logical lock");
+				}
+
+				// 进入时对整目录拍一次快照；这一轮里各原语的逐文件快照被 skipSnapshot 跳过。
+				const files = await snapshotFiles(ctx.cwd, ctx.store.cfg.platform);
+				await createSnapshot(join(ctx.cwd, BACKUP_DIR), "dream", files, ctx.cwd, {
+					keep: ctx.store.cfg.lock.snapshotKeep,
+					platform: ctx.store.cfg.platform,
+				});
+
+				return run();
+			});
+		}
 	}
 }

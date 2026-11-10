@@ -172,7 +172,7 @@ describe("runDream", () => {
 		headlessRun.mockResolvedValueOnce({ status: "not-run", cause: "host-refused" });
 
 		// 静默返回空摘要会让用户以为合并成功了；dream 是显式触发的，必须显式失败。
-		await expect(dream(opts())).rejects.toThrow("the host did not run the dream round");
+		await expect(dream(opts())).rejects.toThrow(/dream round/);
 		expect(store.logicalLockActive()).toBe(false);
 	});
 

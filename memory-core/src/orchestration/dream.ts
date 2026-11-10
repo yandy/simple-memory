@@ -1,12 +1,9 @@
-import { readdir } from "node:fs/promises";
-import { join } from "node:path";
-import type { SessionPersistenceConfig } from "../config.js";
-import { BACKUP_DIR, type MemoryStore } from "../store/memory-store.js";
-import { createSnapshot } from "../store/snapshot.js";
-import { isReservedWindowsName } from "../store/windows-names.js";
+import { DEFAULT_CONFIG, mergeConfig, type SessionPersistenceConfig } from "../config.js";
+import type { MemoryStore } from "../store/memory-store.js";
 import { DREAM_ACTIONS } from "../tool/actions.js";
 import { buildDreamTask } from "./prompts.js";
 import type { HeadlessAgentPort } from "./ports.js";
+import { runTask, type MemoryTask } from "./task.js";
 
 export interface RunDreamOpts {
 	/** 必填：模型来自显式配置（启动校验已保证可解析），没有父模型回退。 */
@@ -21,63 +18,61 @@ export interface RunDreamOpts {
 	sessionPersistence?: SessionPersistenceConfig;
 }
 
-async function snapshotFiles(memoryDir: string, platform: NodeJS.Platform = process.platform): Promise<string[]> {
-	const entries = await readdir(memoryDir, { withFileTypes: true }).catch(() => []);
-	return (
-		entries
-			.filter((entry) => entry.isFile() && !entry.name.startsWith("."))
-			// win32：保留设备名文件按名打开会命中设备（CON 等），`createSnapshot` 的 cp 会失败；
-			// dream 是 fail-closed 的，一次 cp 失败就打断整轮（与 `MemoryStore` 的 `#entryFiles` 同一契约）。
-			.filter((entry) => !(platform === "win32" && isReservedWindowsName(entry.name)))
-			.map((entry) => entry.name)
-			.sort()
-	);
+/** `incomplete` / `not-run` 的短诊断：`cause`，`not-run` 带上 `detail`。 */
+function describe(why: { cause: string; detail?: string }): string {
+	return why.detail ? `${why.cause} (${why.detail})` : why.cause;
 }
 
-/**
- * 跑一轮 dream：整轮持有进程内逻辑锁 → 对整目录拍一次快照 → 起一个只有 `memory` 工具的
- * headless 会话。
- *
- * 整轮持锁是刻意的：dream 的多次 `replace` / `remove` 必须对同进程的 `memory add` 与 extract
- * 呈现为**一个**原子区间，否则用户会在 dream 中途读到半合并的状态。锁在进程内（不是 `.lock`），
- * 所以跨进程的其它 worktree 仍能正常写入 —— 它们的每次物理写入只被挡毫秒级。
- *
- * 其内部的每个原语调用必须带 `{ skipLogicalLock: true, skipSnapshot: true }`（由 `memoryTool`
- * 请求字段表达，适配层据此构造子会话的工具），否则它们会去抢自己已持有的锁而自锁到超时，
- * 并且会为同一批变更各拍一次快照。
- */
-
-export async function runDream(opts: RunDreamOpts, ports: { headless: HeadlessAgentPort }): Promise<string> {
-	return opts.store.withLogicalLock(async () => {
-		// 启动自检：忘了包 withLogicalLock 会静默失去整轮互斥。
-		if (!opts.store.logicalLockActive()) {
-			throw new Error("dream must run under the memory logical lock");
+/** dream 描述符：core 自读 `cfg.memIndexMaxLines`，适配层只给触发点与端口。 */
+export const dream: MemoryTask<Record<string, never>, string> = {
+	id: "dream",
+	plan: {
+		timeoutMs: 600_000,
+		memoryTool: DREAM_ACTIONS,
+		lock: "logical+snapshot",
+		errorPolicy: "rethrow",
+	},
+	buildPrompt(cfg) {
+		return buildDreamTask(cfg.memIndexMaxLines);
+	},
+	parse(_cfg, _deps, _input, text) {
+		return text;
+	},
+	notCompleted(_cfg, _deps, _input, why) {
+		switch (why.status) {
+			case "no-input":
+				// 理论不可达（dream 的 prompt 恒有值），但用户显式触发的任务不许静默报成功。
+				throw new Error("dream has no input to work with");
+			case "lock-busy":
+				throw new Error("the dream round could not start: the memory logical lock is busy");
+			case "no-output":
+				throw new Error("the host ran the dream round but produced no summary");
+			case "incomplete":
+			case "not-run":
+				throw new Error(`the dream round did not complete (${describe(why)})`);
 		}
+	},
+};
 
-		// 进入时对整目录拍一次快照；这一轮里各原语的逐文件快照被 skipSnapshot 跳过。
-		const files = await snapshotFiles(opts.memoryDir, opts.store.cfg.platform);
-		await createSnapshot(join(opts.memoryDir, BACKUP_DIR), "dream", files, opts.memoryDir, {
-			keep: opts.store.cfg.lock.snapshotKeep,
-			platform: opts.store.cfg.platform,
-		});
-
-		const result = await ports.headless.run({
-			task: buildDreamTask(opts.maxLines),
+/**
+ * 跑一轮 dream。
+ *
+ * 【过渡】Task 7 删除本入口：适配层将直接调 `runTask(TASKS.dream, {}, ctx)`。
+ * 保留期间保持旧签名与旧行为，适配层无需改动。
+ */
+export async function runDream(opts: RunDreamOpts, ports: { headless: HeadlessAgentPort }): Promise<string> {
+	return runTask(
+		dream,
+		{},
+		{
+			cfg: mergeConfig(DEFAULT_CONFIG, {
+				defaults: { model: opts.model, sessionPersistence: opts.sessionPersistence },
+				memIndexMaxLines: opts.maxLines,
+				dream: { thinkLevel: opts.effort, sessionPersistence: opts.sessionPersistence },
+			}),
 			cwd: opts.memoryDir,
-			model: opts.model,
-			effort: opts.effort,
-			maxTurns: undefined,
-			timeoutMs: 600_000,
-			// 没有裸写权限：dream 的重构能力边界由 7 个原语定义，因此首次可被单测覆盖。
-			builtinTools: "none",
-			// dream 专属的 7 个 action；整轮持锁与进入时的全目录快照都在外面，所以两个 skip 都开。
-			memoryTool: { actions: DREAM_ACTIONS, skipLogicalLock: true, skipSnapshot: true },
-			sessionPersistence: opts.sessionPersistence,
-		});
-		// 不是 `completed` = 宿主没跑完这一轮（`not-run` / `incomplete` / `no-output`）。
-		// dream 是用户显式触发的（`/dream` 或 nudge 确认后），静默返回空摘要会让用户以为合并成功了
-		// —— 显式抛错，由适配层转成失败通知。
-		if (result.status !== "completed") throw new Error("the host did not run the dream round");
-		return result.text;
-	});
+			store: opts.store,
+			ports,
+		},
+	);
 }

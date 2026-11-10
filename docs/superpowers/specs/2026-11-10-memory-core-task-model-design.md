@@ -168,13 +168,17 @@ export interface MemoryTask<I, R> {
   memoryToolHooks?(input: I): { onWrite?: (info: { action: MemoryAction; name?: string }) => void } | undefined;
 }
 
-/** 任务注册表：描述符的唯一声明处；Task 6 在 dream 落地后扩成 `Record<ModelTask, MemoryTask<any, any>>`。 */
-export const TASKS = { autoSurfacing } as const;
+/** 任务注册表：描述符的唯一声明处，住在 `orchestration/tasks.ts`（不是 `task.ts`，避免模块环）。 */
+export const TASKS = {
+  autoSurfacing,
+  extractMemories,
+  dream,
+} as const satisfies Record<ModelTask, MemoryTask<any, any>>;
 ```
 
-`TASKS` 在本轮（Task 4）只声明已实现的 `autoSurfacing`，用 `as const` 固定这一个键；Task 6 落 dream 时再
-显式放宽成 `Record<ModelTask, MemoryTask<any, any>>`。中间任务**不得**为缺失的描述符造假对象：`TASKS.dream`
-此刻不存在，比存在一个会抛错的占位对象诚实。
+`TASKS` 住在 `orchestration/tasks.ts` 而不是 `task.ts`：注册表 → 描述符 → `task.ts` 的单向依赖拆掉了模块环。
+三个描述符到齐后，`satisfies Record<ModelTask, MemoryTask<any, any>>` 让注册表**可证明完整** —— 漏一个
+描述符或键名写错会直接编译报错，而不是等调用方在运行时撞 `TASKS.dream === undefined`。
 
 编排骨架（core 常量，从三个 `run*` 逐字搬来）：
 
@@ -273,6 +277,10 @@ export async function runTask<I, R>(
 `task.notCompleted(…, { status: "lock-busy" })`）→ 构造 `HeadlessRunRequest` 跑端口 →
 `completed` 走 `task.parse`，其余结果走 `task.notCompleted`（含 `errorPolicy`）。
 
+`runTask` / `MemoryTask` 住在 `orchestration/task.ts`；`TASKS` 注册表单独住在
+`orchestration/tasks.ts`（三个描述符到齐后加 `satisfies Record<ModelTask, MemoryTask<any, any>>`，
+见 §6.1）。
+
 **适配层只剩三件事**：提供端口（怎么调模型）、决定何时调 `runTask`（含 `enabled` 判定）、呈现结果。
 
 「实现了哪些任务」是**适配层的一个常量声明**，不进端口：
@@ -358,7 +366,8 @@ core 自己的三个编排测试（`tests/orchestration/{surfacing,extract,dream
 |---|---|
 | `memory-core/src/orchestration/{surfacing,extract,dream}.ts` | 退化为 `TASKS` 里的三个描述符；三个 `run*` 与 `Run*Opts` 删除（§6.4） |
 | `memory-core/src/orchestration/ports.ts` | `HeadlessAgentPort.run` 返回 `HeadlessOutcome`；其余不动 |
-| `memory-core/src/orchestration/task.ts`（新） | `runTask` / `TaskPlan` / `TaskDeps` / `TaskContext` / `Incomplete` / `buildRequest` / `TASKS` |
+| `memory-core/src/orchestration/task.ts`（新） | `runTask` / `TaskPlan` / `TaskDeps` / `TaskContext` / `Incomplete` / `buildRequest` |
+| `memory-core/src/orchestration/tasks.ts`（新） | `TASKS` 注册表（三个描述符 + `satisfies Record<ModelTask, MemoryTask<any, any>>` 完整性检查） |
 | `memory-core/src/config.ts` | 去掉 `nudge*`；其余不动 |
 | `memory-core/src/index.ts` | 导出面增删（新增 `runTask` / `TASKS` / `moduleStatusRows` / `HeadlessOutcome` 等；删三个 `run*` 与 Opts） |
 | `memory-core/tests/orchestration/{surfacing,extract,dream}.test.ts` | 改为跑 `runTask` + 描述符；端口桩返回 `HeadlessOutcome`；`toHaveBeenCalledWith` 的请求断言改按新构造；dream 的错误文案变成带 cause 的版本 |

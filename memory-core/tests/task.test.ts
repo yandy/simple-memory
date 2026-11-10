@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	DEFAULT_CONFIG,
+	DREAM_ACTIONS,
 	MemoryStore,
 	TASKS,
 	mergeConfig,
@@ -269,7 +270,7 @@ describe("runTask(TASKS.extractMemories)", () => {
 		expect(out.skipped).toBe(false);
 	});
 
-	it("returns an empty result, never skipped, for a completed-but-empty reply", async () => {
+	it("returns an empty result, never skipped, for a no-output reply", async () => {
 		const out = await runTask(
 			TASKS.extractMemories,
 			{ messages: [{ role: "user", text: "hi" }], agentsMdBlocks: [] },
@@ -314,5 +315,52 @@ describe("runTask(TASKS.extractMemories)", () => {
 				},
 			),
 		).rejects.toThrow("boom");
+	});
+});
+
+describe("runTask(TASKS.dream)", () => {
+	const cfg = () => mergeConfig(DEFAULT_CONFIG, { defaults: { model: "provider/base" } });
+
+	it("takes one snapshot at entry and none per write (skipSnapshot on the inner tool)", async () => {
+		const requests: HeadlessRunRequest[] = [];
+		const out = await runTask(
+			TASKS.dream,
+			{},
+			{
+				cfg: mergeConfig(DEFAULT_CONFIG, { defaults: { model: "p/m" }, memIndexMaxLines: 150 }),
+				store,
+				cwd: dir,
+				ports: {
+					headless: {
+						run: async (r) => {
+							requests.push(r);
+							return { status: "completed", text: "merged 2" };
+						},
+					},
+				},
+			},
+		);
+		const snapshots = (await readdir(join(dir, ".backups")).catch(() => [])).filter((name) =>
+			name.endsWith("-dream"),
+		);
+		expect(snapshots).toHaveLength(1);
+		expect(requests[0].memoryTool).toMatchObject({
+			actions: DREAM_ACTIONS,
+			skipLogicalLock: true,
+			skipSnapshot: true,
+		});
+		expect(requests[0].task).toContain("hard limit of 150 lines");
+		expect(out).toBe("merged 2");
+	});
+
+	it("throws when the host did not run the round", async () => {
+		await expect(
+			runTask(TASKS.dream, {}, {
+				cfg: cfg(),
+				store,
+				cwd: dir,
+				ports: { headless: { run: async () => ({ status: "not-run", cause: "host-refused" }) } },
+			}),
+		).rejects.toThrow(/dream round/);
 	});
 });
