@@ -63,3 +63,13 @@ loadConfigMock.mockRejectedValueOnce(new Error("getAgentDir failed"));
   装回去（`pi-memory` 的 harness 用一个 hoisted 的可变引用记住那个分派函数）。
 - 「会话中途配置被改坏」不要用改文件来模拟：会话内的配置是 `session_start` 那一刻的快照，
   改文件不影响运行中的会话（真实用户也要改完重启）。要测「运行中失败」，注入那次调用的 rejection。
+
+## 什么时候必须上真机
+
+假宿主能覆盖语义，但覆盖不了**宿主自己的行为**：服务注入是否成立、`tools.restrict()` 的真实语义、
+子会话在哪个阶段建得起来、进程退出会不会打断后台任务。`dsh-memory` 就在这几处栽过（单测全绿、
+真机上插件一次都没激活）。
+
+各包把「真机验过什么、怎么验、还有哪些限制」写在**自己的 README**（`## 验证状态`）；
+`memory-core` 另有两个冒烟脚本替它守发布形态（`scripts/pack-smoke.mjs`、`scripts/registry-smoke.mjs`）。
+这里不重复这些内容，避免同一份实现被两处文档追着改。

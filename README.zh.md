@@ -11,7 +11,7 @@
 |---|---|---|
 | [memory-core](./memory-core) | 与 harness 无关的基础层：磁盘格式、`MemoryStore`、两级锁、快照、项目路径、注入策略、dream/extract 编排，以及中立的 `memory` 工具契约（JSON Schema + handler）。只 import `node:*`。 | `@yandy0725/memory-core` |
 | [pi-memory](./pi-memory) | pi 适配层：extension 装配、`/memory` 与 `/dream`、typebox schema + pi-tui 渲染、prompt cache 的 section 冻结、headless 子会话、会话搜索。 | `@yandy0725/pi-memory` |
-| [dsh-memory](./dsh-memory) | DeepSeek harness（`@deepseek-ai/dsh`，cordis）适配层：cordis bundle 装配、`memory_index` 段、`memory` 工具与 `/memory`、每轮召回；`extractMemories`/`dream` 本轮未实现。 | `@yandy0725/dsh-memory` |
+| [dsh-memory](./dsh-memory) | DeepSeek harness（`@deepseek-ai/dsh`，cordis）适配层：cordis bundle 装配、`memory_index` 段、`memory` 工具与 `/memory`、每轮召回、每轮抽取与 `/dream` —— 与 `pi-memory` 共享同一份磁盘记忆。 | `@yandy0725/dsh-memory` |
 
 宿主专属的那一半（何时注入、怎么渲染、调哪个模型）由适配层负责；`memory-core` 负责必须处处一致的
 那一半 —— 下面的文件是共享的，不是每个 harness 各存一份。

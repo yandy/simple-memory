@@ -12,7 +12,7 @@ same files.
 |---|---|---|
 | [memory-core](./memory-core) | Harness-agnostic layer: disk format, `MemoryStore`, two-level locking, snapshots, project paths, injection policy, dream/extract orchestration, and the neutral `memory` tool contract (JSON Schema + handler). Imports only `node:*`. | `@yandy0725/memory-core` |
 | [pi-memory](./pi-memory) | pi adapter: extension wiring, `/memory` and `/dream`, typebox schema + pi-tui rendering, prompt-cache section freezing, headless sub-sessions, session search. | `@yandy0725/pi-memory` |
-| [dsh-memory](./dsh-memory) | DeepSeek harness (`@deepseek-ai/dsh`, cordis) adapter: cordis bundle, `memory_index` section, `memory` tool + `/memory`, per-turn recall — `extractMemories`/`dream` not this round. | `@yandy0725/dsh-memory` |
+| [dsh-memory](./dsh-memory) | DeepSeek harness (`@deepseek-ai/dsh`, cordis) adapter: cordis bundle, `memory_index` section, `memory` tool + `/memory`, per-turn recall, per-turn extraction and `/dream` — same on-disk memory as `pi-memory`. | `@yandy0725/dsh-memory` |
 
 An adapter owns the host-specific half — when to inject, how to render, which model to call. `memory-core`
 owns the half that must be identical everywhere, which is why the files below are shared rather than
