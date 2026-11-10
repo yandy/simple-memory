@@ -196,11 +196,11 @@ describe("renderStatus", () => {
 		);
 	});
 
-	it("threads deps.unimplementedModules into the rendered status", async () => {
+	it("threads deps.setKeys into the rendered status", async () => {
 		const memoryDir = join(dir, "mem");
 		const rt = makeRuntime(memoryDir, makeStore(memoryDir));
 
-		const result = await handlerFor(rt, [], { unimplementedModules: ["dream"] })({
+		const result = await handlerFor(rt, [], { setKeys: ["dream"] })({
 			agent: { session: { id: "s1" } },
 			rawInput: "",
 		});

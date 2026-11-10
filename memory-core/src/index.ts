@@ -104,6 +104,8 @@ export type { EntryManifest } from "./injection.js";
 // dream / extract / 侧查询行为（prompt 文本、锁与快照边界、截断预算、错误语义）。
 export { runTask } from "./orchestration/task.js";
 export { TASKS } from "./orchestration/tasks.js";
+export { moduleStatusRows } from "./orchestration/status.js";
+export type { ModuleStatusRow } from "./orchestration/status.js";
 export type {
 	Incomplete,
 	MemoryTask,

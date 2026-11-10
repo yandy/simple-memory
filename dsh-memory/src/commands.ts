@@ -5,6 +5,7 @@ import {
 	indexInjectionCapacity,
 	LOCK_FILE,
 	parseEntryIndex,
+	moduleStatusRows,
 	readLockStatus,
 	resolveMemoryDir,
 	taskModel,
@@ -15,19 +16,19 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
  * `/memory` 命令需要的依赖。命令定义只是数据（注册与生命周期在装配层），
- * 所以这里只拿「查运行时 + 刷索引 + 行 config 的警告 + 用户配了但本适配层没实现的模块」四样。
+ * 所以这里只拿「查运行时 + 刷索引 + 行 config 的警告 + 用户在行 config 里写过的白名单顶层键」四样。
  */
 export interface CommandDeps {
 	registry: { get(sessionId: string): SessionMemoryRuntime | undefined };
 	indexCache: { refresh(rt: SessionMemoryRuntime): Promise<void> };
 	warnings: string[];
 	/**
-	 * 用户在行 config 里**确实写了**、但本适配层没有实现的子树名（如 `dream` / `extractMemories`）。
-	 * 由装配层从原始行 config 算出来传进来：白名单是从 core 的 `DEFAULT_CONFIG` 派生的，所以这两个子树
-	 * 能无声无息地通过配置校验 —— 不就地报出来，用户得到的是「无告警、无效果、无提示」。
-	 * 缺省为空：只为真写了它们的用户增加噪声。
+	 * 用户在行 config 里**确实写过**的白名单顶层键（照用户写的顺序，含已实现的 `autoSurfacing`）。
+	 * 由装配层用 `rowConfigSetKeys` 从原始行 config 算出来传进来；未实现的模块（如 `dream` /
+	 * `extractMemories`）能无声无息地通过配置校验 —— 是否就地报出来、怎么措辞，由
+	 * `renderStatus` 里的 `moduleStatusRows` 拼装决定。缺省为空：只为真写了它们的用户增加噪声。
 	 */
-	unimplementedModules?: readonly string[];
+	setKeys?: readonly string[];
 }
 
 /**
@@ -96,6 +97,9 @@ async function unlockMemory(memoryDir: string, force: boolean): Promise<{ kind: 
 /** `Modules:` 行里未实现模块的后缀：写得很白，不给用户留「它也许在跑」的想像空间。 */
 const NOT_IMPLEMENTED = "not implemented in this adapter";
 
+/** 本适配层实现了哪些 core 任务：行数据的 `implemented` 字段据此而来。 */
+const IMPLEMENTED_TASKS = ["autoSurfacing"] as const;
+
 /**
  * 错误态会话的目录重解：`/memory unlock` 是崩溃遗留 `.lock` 的**唯一**人工入口，所以以配置错误
  * 启动的会话也必须能清锁 —— 不能因为启动时目录没解出来就死路一条。`rt.cwd` 在这条路径上通常
@@ -123,7 +127,7 @@ async function reResolveMemoryDir(rt: SessionMemoryRuntime): Promise<string | nu
 export async function renderStatus(
 	rt: SessionMemoryRuntime | undefined,
 	warnings: string[],
-	unimplementedModules: readonly string[] = [],
+	setKeys: readonly string[] = [],
 ): Promise<string> {
 	if (rt === undefined) {
 		return "Memory: not initialized — no memory runtime for this session";
@@ -145,11 +149,22 @@ export async function renderStatus(
 	const cap = indexCapacity(indexRaw, rt.config.memIndexMaxLines, rt.config.memIndexMaxBytes);
 	const inject = indexInjectionCapacity(indexRaw, rt.config.memIndexInjectMaxLines, rt.config.memIndexInjectMaxBytes);
 
+	// 行数据来自 core 的 `moduleStatusRows`（顺序恒为 dream → extractMemories → autoSurfacing），
+	// dsh 用自己的顺序：`autoSurfacing` 在前，未实现的模块按 core 的顺序跟在后面。
+	// 未实现模块只在用户真写了该键时才显示：白名单是从 `DEFAULT_CONFIG` 派生的，所以 `dream` /
+	// `extractMemories` 能无声无息地通过校验（无告警）却没有任何效果 —— 用户写了
+	// `dream: { model: "…" }` 时，`/memory` 必须就地告诉他「配了但本适配层不跑」，否则他得到的
+	// 是一句「你没配 model」式的误导。不给其余人增加噪声。
+	const rows = moduleStatusRows(rt.config, IMPLEMENTED_TASKS).filter(
+		(row) => row.implemented || setKeys.includes(row.id),
+	);
 	const modules = [
+		// autoSurfacing 的 on/off 不来自 core 的 `enabled`，而是本会话运行时的可用性判定
+		//（`rt.surfacing.available` / `.reason` 来自启动期的 `resolveSurfacingAvailability`）。
 		rt.surfacing.available
 			? `autoSurfacing=on(${taskModel(rt.config, "autoSurfacing") ?? "no model"})`
 			: `autoSurfacing=off(${rt.surfacing.reason ?? "disabled"})`,
-		...unimplementedModules.map((module) => `${module}=${NOT_IMPLEMENTED}`),
+		...rows.filter((row) => row.id !== "autoSurfacing").map((row) => `${row.id}=${NOT_IMPLEMENTED}`),
 	].join(", ");
 
 	const lines = [
@@ -208,7 +223,7 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 			if (rt !== undefined) await deps.indexCache.refresh(rt);
 			return {
 				kind: "success",
-				text: await renderStatus(rt, deps.warnings, deps.unimplementedModules ?? []),
+				text: await renderStatus(rt, deps.warnings, deps.setKeys ?? []),
 			};
 		},
 	};

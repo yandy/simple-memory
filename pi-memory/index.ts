@@ -9,6 +9,7 @@ import {
 	indexCapacity,
 	indexInjectionCapacity,
 	parseEntryIndex,
+	moduleStatusRows,
 	readLockStatus,
 	resolveMemoryDir,
 	runTask,
@@ -17,7 +18,7 @@ import {
 } from "@yandy0725/memory-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { legacyMemoryRoot, loadConfig, modelConfigErrors, taskModel, type LoadedConfig, type MemoryConfig } from "./src/config";
+import { legacyMemoryRoot, loadConfig, modelConfigErrors, type LoadedConfig, type MemoryConfig } from "./src/config";
 import { readRecordedMemoryIndex } from "./src/index-source";
 import { detectLegacyMemoryDir } from "./src/legacy-hint";
 import { applyIndexSection, buildInjection } from "./src/inject-pi";
@@ -82,18 +83,17 @@ function countInjectedBlocks(content: string): number {
  * `enabled`。模型是**生效值**（per-task 优先，其次 `defaults.model`），关闭的模块不显示模型：
  * 用户问「为什么没生效」时答案在开关上，而不在模型上。
  *
+ * 行数据来自 core 的 `moduleStatusRows`：core 只给 `implemented` / `enabled` / `model` 三个事实，
+ * 展示顺序与措辞（空格分隔、`on(…)` / `off`）仍是 pi 自己的事。
+ *
  * 导出供测试直接覆盖：正常会话里「模型解析不出」那条路径走不到（`session_start` 会先拦成
  * misconfigured），只能直接调纯函数。
  */
+export const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
+
 export function moduleStatusLine(cfg: MemoryConfig): string {
-	return (["dream", "extractMemories", "autoSurfacing"] as const)
-		.map((task) => {
-			// `?.` 是防御：`deepMerge` 会把用户写的 `"extractMemories": null` 原样带进来，
-			// 那时 `cfg[task].enabled` 会抛错，把整个 `/memory` 命令带崩。
-			const enabled = task === "dream" ? true : cfg[task]?.enabled;
-			if (!enabled) return `${task}=off`;
-			return `${task}=on(${taskModel(cfg, task) ?? "no model"})`;
-		})
+	return moduleStatusRows(cfg, IMPLEMENTED_TASKS)
+		.map((row) => `${row.id}=${row.enabled ? `on(${row.model ?? "no model"})` : "off"}`)
 		.join(" ");
 }
 
