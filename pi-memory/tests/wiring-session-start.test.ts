@@ -3,40 +3,23 @@
  *
  * harness 必须排在本文件其他 import 之前：它注册了 `vi.mock`，顺序错了 mock 不生效。
  */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { breakModelConfig, createFakePi, DISK_INDEX, dirOverrideRef, dirRef, mockConfigValue, resetWiringMocks, restoreModelConfig, runTaskMock, scanEntriesMock, sectionsEvent, uiCtx, uiWith } from "./helpers/wiring-harness";
+import { createFakePi, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, setupSession, uiCtx, uiWith } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 
+
 describe("index wiring — session_start", () => {
-	let dir: string;
+	let s: Awaited<ReturnType<typeof setupSession>>;
 
 	beforeEach(async () => {
-		dir = await mkdtemp(join(tmpdir(), "mem-wiring-"));
-		dirRef.current = dir;
-		await mkdir(dir, { recursive: true });
-		await writeFile(join(dir, "MEMORY.md"), DISK_INDEX, "utf8");
-
-		scanEntriesMock.mockReset();
+		s = await setupSession();
 		resetWiringMocks();
-
-		// 模型 fixture：默认走 defaults.model；各用例按需覆盖 mockConfigValue 的 model 段
-		mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: false } };
-		mockConfigValue.dream.model = undefined;
-		mockConfigValue.extractMemories.model = undefined;
-		mockConfigValue.autoSurfacing.model = undefined;
 	});
 
 	afterEach(async () => {
-		await rm(dir, { recursive: true, force: true });
-		delete (mockConfigValue.autoSurfacing as any).sessionPersistence;
-		mockConfigValue.autoSurfacing.maxFiles = 5;
-		mockConfigValue.autoSurfacing.thinkLevel = "off";
-		mockConfigValue.extractMemories.enabled = false;
-		mockConfigValue.lock = { timeoutMs: 5000, snapshotKeep: 5 };
-		dirOverrideRef.current = null;
+		await s.cleanup();
 	});
 
 	it("registers exactly one memory tool with the five main-agent actions, even across sessions", async () => {
@@ -47,7 +30,7 @@ describe("index wiring — session_start", () => {
 		expect(handlers["before_agent_start"]).toBeDefined();
 		expect(handlers["agent_end"]).toBeDefined();
 
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		expect(tools).toHaveLength(1);
 		expect(tools[0].name).toBe("memory");
@@ -64,14 +47,14 @@ describe("index wiring — session_start", () => {
 		expect(commands["dream"]).toBeDefined();
 
 		// 跨 session 也只注册一次：第二次 session_start 不得再注册
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 		expect(tools).toHaveLength(1);
 	});
 
 	it("writes through the store end to end", async () => {
 		const { pi, tools, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		const result = await tools[0].execute(
 			"call-1",
@@ -82,11 +65,11 @@ describe("index wiring — session_start", () => {
 		);
 
 		expect(result.content[0].text).toBe('Saved "Use real DB in tests" (Use-real-DB-in-tests.md).');
-		const raw = await readFile(join(dir, "Use-real-DB-in-tests.md"), "utf8");
+		const raw = await readFile(join(s.dir, "Use-real-DB-in-tests.md"), "utf8");
 		expect(raw).toContain("name: Use real DB in tests");
 		expect(raw).toContain("modified:");
 		expect(raw).not.toContain("updated:");
-		const index = await readFile(join(dir, "MEMORY.md"), "utf8");
+		const index = await readFile(join(s.dir, "MEMORY.md"), "utf8");
 		expect(index).toContain("- [SSH](ssh.md) — staging ssh config");
 		expect(index).toContain("- [Use real DB in tests](Use-real-DB-in-tests.md) — 不要 mock");
 	});
@@ -107,17 +90,17 @@ describe("index wiring — session_start", () => {
 
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), s.uiCtx());
 
 		// 中途一次「配置错误」启动（session_start 不建 store），再回到 healthy：三条路径都必须从
 		// 空集合开始。`resetSessionState()` 在每次 session_start 开头无条件清空它 —— 去掉那次
 		// clear，第二次观测就会看到上一轮注入过的 `ssh.md`，用例变红。
-		breakModelConfig();
-		await handlers["session_start"][0]({}, uiCtx());
-		restoreModelConfig();
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), uiCtx());
+		await s.writeConfig({ defaults: { sessionPersistence: { enabled: false } } });
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await s.writeConfig({ defaults: { model: "test/model", sessionPersistence: { enabled: false } } });
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), s.uiCtx());
 
 		expect(injectedAtCall).toHaveLength(2);
 		expect(injectedAtCall[0]).toEqual(new Set());
@@ -125,12 +108,12 @@ describe("index wiring — session_start", () => {
 	});
 
 	it("initialises when only defaults.model is set", async () => {
-		mockConfigValue.extractMemories.enabled = true;
+		await s.writeConfig({ extractMemories: { enabled: true } });
 		const notify = vi.fn();
 		const { pi, tools, handlers } = createFakePi();
 		memoryFactory(pi as any);
 
-		await handlers["session_start"][0]({}, uiCtx(uiWith(notify)));
+		await handlers["session_start"][0]({}, s.uiCtx(uiWith(notify)));
 
 		expect(tools).toHaveLength(1);
 		expect(notify).not.toHaveBeenCalled();

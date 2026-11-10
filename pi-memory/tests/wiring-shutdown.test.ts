@@ -3,40 +3,22 @@
  *
  * harness 必须排在本文件其他 import 之前：它注册了 `vi.mock`，顺序错了 mock 不生效。
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakePi, DISK_INDEX, setupSession, dirOverrideRef, dirRef, mockConfigValue, resetWiringMocks, runTaskMock, scanEntriesMock, uiCtx } from "./helpers/wiring-harness";
+import { createFakePi, resetWiringMocks, runTaskMock, setupSession, uiCtx } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
+import { loadConfig } from "../src/config";
+
 
 describe("index wiring — session_shutdown", () => {
-	let dir: string;
+	let s: Awaited<ReturnType<typeof setupSession>>;
 
 	beforeEach(async () => {
-		dir = await mkdtemp(join(tmpdir(), "mem-wiring-"));
-		dirRef.current = dir;
-		await mkdir(dir, { recursive: true });
-		await writeFile(join(dir, "MEMORY.md"), DISK_INDEX, "utf8");
-
-		scanEntriesMock.mockReset();
+		s = await setupSession();
 		resetWiringMocks();
-
-		// 模型 fixture：默认走 defaults.model；各用例按需覆盖 mockConfigValue 的 model 段
-		mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: false } };
-		mockConfigValue.dream.model = undefined;
-		mockConfigValue.extractMemories.model = undefined;
-		mockConfigValue.autoSurfacing.model = undefined;
 	});
 
 	afterEach(async () => {
-		await rm(dir, { recursive: true, force: true });
-		delete (mockConfigValue.autoSurfacing as any).sessionPersistence;
-		mockConfigValue.autoSurfacing.maxFiles = 5;
-		mockConfigValue.autoSurfacing.thinkLevel = "off";
-		mockConfigValue.extractMemories.enabled = false;
-		mockConfigValue.lock = { timeoutMs: 5000, snapshotKeep: 5 };
-		dirOverrideRef.current = null;
+		await s.cleanup();
 	});
 
 	it("setupSession writes a memory.json that the real loadConfig reads", async () => {
@@ -54,7 +36,7 @@ describe("index wiring — session_shutdown", () => {
 	});
 
 	it("session_shutdown waits for an in-flight extract", async () => {
-		mockConfigValue.extractMemories.enabled = true;
+		await s.writeConfig({ extractMemories: { enabled: true } });
 		let release: (() => void) | undefined;
 		runTaskMock.mockImplementationOnce(
 			() =>
@@ -64,12 +46,12 @@ describe("index wiring — session_shutdown", () => {
 		);
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
-		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx());
+		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, s.uiCtx());
 
 		let settled = false;
-		const shutdown = handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, uiCtx()).then(
+		const shutdown = handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, s.uiCtx()).then(
 			() => {
 				settled = true;
 			},
@@ -83,16 +65,16 @@ describe("index wiring — session_shutdown", () => {
 	});
 
 	it("session_shutdown gives up after lock.timeoutMs rather than hanging", async () => {
-		mockConfigValue.extractMemories.enabled = true;
-		mockConfigValue.lock = { timeoutMs: 30, snapshotKeep: 5 };
+		await s.writeConfig({ extractMemories: { enabled: true } });
+		await s.writeConfig({ lock: { timeoutMs: 30, snapshotKeep: 5 } });
 		runTaskMock.mockImplementationOnce(() => new Promise(() => {}));
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, s.uiCtx());
 
 		const started = Date.now();
-		await handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, uiCtx());
+		await handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, s.uiCtx());
 
 		expect(Date.now() - started).toBeLessThan(2000);
 	});
@@ -100,14 +82,14 @@ describe("index wiring — session_shutdown", () => {
 	it("session_shutdown resolves immediately when nothing is in flight", async () => {
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		// 空闲路径的契约是「根本不创建 give-up 定时器」（index.ts：`inFlight.size === 0` 直接 return）。
 		// fake timers 下：若回归成「先挂定时器再 race」，调用一返回 getTimerCount 就 > 0，且
 		// `await` 会悬死在不会推进的 fake 定时器上；`getTimerCount() === 0` 直接钉住「不挂 timer」。
 		vi.useFakeTimers();
 		try {
-			const shutdown = handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, uiCtx());
+			const shutdown = handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, s.uiCtx());
 			expect(vi.getTimerCount()).toBe(0);
 			await shutdown;
 		} finally {
@@ -116,8 +98,8 @@ describe("index wiring — session_shutdown", () => {
 	});
 
 	it("clears the shutdown give-up timer when the in-flight write finishes first", async () => {
-		mockConfigValue.extractMemories.enabled = true;
-		mockConfigValue.lock = { timeoutMs: 30, snapshotKeep: 5 };
+		await s.writeConfig({ extractMemories: { enabled: true } });
+		await s.writeConfig({ lock: { timeoutMs: 30, snapshotKeep: 5 } });
 		let release: (() => void) | undefined;
 		runTaskMock.mockImplementationOnce(
 			() =>
@@ -127,12 +109,12 @@ describe("index wiring — session_shutdown", () => {
 		);
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, s.uiCtx());
 
 		vi.useFakeTimers();
 		try {
-			const shutdown = handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, uiCtx());
+			const shutdown = handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, s.uiCtx());
 			// 兜底定时器已挂上（在途任务还没收尾）
 			expect(vi.getTimerCount()).toBeGreaterThan(0);
 			release?.();
