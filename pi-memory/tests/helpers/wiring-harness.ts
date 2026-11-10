@@ -17,50 +17,9 @@ import { PI_HOST_DEFAULTS } from "../../src/config";
  */
 
 const config = vi.hoisted(() => ({
-	mockConfigValue: {
-		memoryDir: "",
-		memIndexMaxLines: 200,
-		memIndexMaxBytes: 25600,
-		// 显式注入的 fixture 不该对 DEFAULT_CONFIG 撒谎：注入口径默认是「最新的 50 行 / 16 KiB」。
-		memIndexInjectMaxLines: 50,
-		memIndexInjectMaxBytes: 16384,
-		lock: { timeoutMs: 5000, snapshotKeep: 5 },
-		defaults: { model: "test/model", sessionPersistence: { enabled: false } },
-		dream: { thinkLevel: "high" as const },
-		sessionSearch: { maxSessions: 10, maxMatches: 5 },
-		autoSurfacing: {
-			enabled: true,
-			maxFiles: 5,
-			maxEntryBytes: 4096,
-			maxInjectionBytes: 20480,
-			thinkLevel: "off" as const,
-		},
-		extractMemories: {
-			enabled: false,
-			maxContextTokens: 2000,
-			maxToolResultChars: 500,
-			maxAssistantChars: 2000,
-			thinkLevel: "high" as const,
-		},
-	} as Record<string, any>,
-	// vi.mock 的工厂是 hoisted 的，拿不到 beforeEach 里创建的目录 —— 用一个可变引用桥接
-	// （docs/guides/testing.md 的「getAgentDir 隔离」一节）。
-	dirRef: { current: "" },
-	// Plan D（D1）：跨 session 复位的用例需要「不同 cwd → 不同 memoryDir」。为 null 时沿用
-	// dirRef.current，既有用例的行为一字不变。
-	dirOverrideRef: { current: null as null | ((cwd: string) => string) },
-	/**
-	 * C 阶段的**临时分派开关**：`true` = 尚未迁移的文件继续用 `mockConfigValue` 这套手写 fixture；
-	 * `setupSession()` 置 `false`，此后 `loadConfig` / `resolveMemoryDir` 走真实实现。
-	 * 每迁完一个文件它就不再需要那个分支，Task 20 整个删掉。
-	 */
-	legacyConfigActive: { value: true },
 	/** 工厂里不能 import node:path（hoisted 工厂先于模块体执行）：用它算「cwd 的末段」。 */
 	basename: (p: string) => String(p).split(/[\\/]/).filter(Boolean).pop() ?? "",
-	/**
-	 * `loadConfig` 的分派实现。工厂第一次执行时装进来（那时才拿得到 `actual`）；
-	 * `resetWiringMocks()` 在 `mockReset()` 之后靠它把实现装回去 —— reset 会连实现一起清掉。
-	 */
+	/** `loadConfig` 的分派实现，工厂执行时装进来；`resetWiringMocks()` 复位后靠它装回。 */
 	loadConfigDispatch: { current: null as null | ((ctx: unknown) => Promise<unknown>) },
 }));
 
@@ -88,16 +47,9 @@ vi.mock("../../src/config", async (importOriginal) => {
 			return config.loadConfigDispatch.current!(ctx);
 		}),
 		__loadConfigDispatch: (() => {
-			config.loadConfigDispatch.current = async (ctx: unknown) => {
-			if (config.legacyConfigActive.value) {
-				return {
-					config: { ...config.mockConfigValue, memoryDir: config.dirRef.current },
-					host: PI_HOST_DEFAULTS,
-				};
-			}
-				// 已迁移的文件：真实读 PI_CODING_AGENT_DIR 下的 memory.json
-				return actual.loadConfig(ctx as Parameters<typeof actual.loadConfig>[0]);
-			};
+			// 真实读 PI_CODING_AGENT_DIR 下的 memory.json
+			config.loadConfigDispatch.current = async (ctx: unknown) =>
+				actual.loadConfig(ctx as Parameters<typeof actual.loadConfig>[0]);
 		})(),
 	};
 });
@@ -114,9 +66,6 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 	return {
 		...actual,
 		resolveMemoryDir: mocks.resolveMemoryDirMock.mockImplementation(async (cfg: unknown, cwd: string) => {
-			if (config.legacyConfigActive.value) {
-				return config.dirOverrideRef.current ? config.dirOverrideRef.current(cwd) : config.dirRef.current;
-			}
 			// 真实 config 的 memoryDir + cwd 末段：不 spawn git，也不依赖任何可变引用
 			return join((cfg as { memoryDir: string }).memoryDir, config.basename(cwd));
 		}),
@@ -155,10 +104,6 @@ vi.mock("../../src/index-source", async (importOriginal) => {
 	return { ...actual, readRecordedMemoryIndex: mocks.readRecordedMemoryIndexMock };
 });
 
-export const mockConfigValue = config.mockConfigValue;
-export const dirRef = config.dirRef;
-export const dirOverrideRef = config.dirOverrideRef;
-
 export const loadConfigMock = mocks.loadConfigMock;
 export const resolveMemoryDirMock = mocks.resolveMemoryDirMock;
 export const scanEntriesMock = mocks.scanEntriesMock;
@@ -190,8 +135,8 @@ export const DISK_INDEX = "- [SSH](ssh.md) — staging ssh config\n";
 /**
  * 把 `beforeEach` 里的 mock 复位搬到这里，让 8 个测试文件共用同一套默认行为。
  *
- * **只含 mock 复位**：每个用例自己的目录（`dirRef.current`）与配置 fixture 的复原仍在各自的
- * `beforeEach` / `afterEach` 里 —— 它们与那个文件的具体场景绑在一起，混进来只会让复位顺序更难读。
+ * **只含 mock 复位**：目录与配置 fixture 由 `setupSession()` 负责，每个用例自带一份临时磁盘状态，
+ * 已不需要在这里复原任何全局对象。
  * `detectLegacyMemoryDirMock` 刻意不 reset：它靠逐条 `mockResolvedValueOnce` 驱动，
  * reset 会清掉创建时设的默认 `null`，让「探测器没发现旧数据」的用例失去前提。
  */
@@ -230,11 +175,6 @@ export function expectedDir(memoryDirRoot: string, cwd: string): string {
 	return join(memoryDirRoot, String(cwd).split(/[\\/]/).filter(Boolean).pop() ?? "");
 }
 
-/** 把一个文件切回「手写 fixture 模式」（只给 C 阶段自检用例在 finally 里复原）。 */
-export function useLegacyConfig(): void {
-	config.legacyConfigActive.value = true;
-}
-
 export interface SessionSetup {
 	/** 本会话的记忆目录 = `expectedDir(memoryDirRoot, cwd)` */
 	dir: string;
@@ -260,9 +200,8 @@ export interface SetupSessionOptions {
 /**
  * 建一个「真实配置」的会话运行环境：临时 cwd + 临时 agentDir + 一份真的 `memory.json`。
  *
- * 调用它即表示这个文件已迁移到 C 阶段：`legacyConfigActive` 被置 `false`，于是 `loadConfig`
- * 走真实实现、`resolveMemoryDir` 从真实 config 的 `memoryDir` 推导目录，不再需要任何手写对象
- * 或可变引用桥接。
+ * 从此 `loadConfig` 走真实实现、`resolveMemoryDir` 从真实 config 的 `memoryDir` 推导目录，
+ * 不再需要任何手写对象或可变引用桥接。
  */
 export async function setupSession(opts: SetupSessionOptions = {}): Promise<SessionSetup> {
 	const cwd = await mkdtemp(join(tmpdir(), "mem-wiring-"));
@@ -292,7 +231,6 @@ export async function setupSession(opts: SetupSessionOptions = {}): Promise<Sess
 	await writeConfig(initial);
 
 	vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
-	config.legacyConfigActive.value = false;
 
 	return {
 		dir,
@@ -303,7 +241,6 @@ export async function setupSession(opts: SetupSessionOptions = {}): Promise<Sess
 		uiCtx: (over: Record<string, unknown> = {}) => uiCtx({ cwd, ...over }),
 		cleanup: async () => {
 			vi.unstubAllEnvs();
-			config.legacyConfigActive.value = true;
 			await rm(cwd, { recursive: true, force: true });
 		},
 	};
@@ -354,9 +291,15 @@ export function fakeRegistry(ids: string[], availableIds: string[] = ids) {
 	} as any;
 }
 
+/**
+ * 一个最小可用的 `ExtensionContext` 形状。
+ *
+ * `cwd` 默认空串：真实用例一律经 `setupSession().uiCtx()` 拿到带正确 cwd 的版本；这里只是让
+ * 纯形状构造（`disposableCtx` 之类）也能用。
+ */
 export function uiCtx(over: Record<string, unknown> = {}) {
 	return {
-		cwd: dirRef.current,
+		cwd: "",
 		hasUI: false,
 		isProjectTrusted: () => true,
 		modelRegistry: fakeRegistry(["test/model"]),
@@ -378,20 +321,6 @@ export function sectionsEvent(prompt = "q") {
 /** 旧 SDK（本地类型 0.80.2）的 fake 事件：根本没有 `sections`。 */
 export function legacyEvent(prompt = "q") {
 	return { prompt, systemPrompt: "BASE_PROMPT", systemPromptOptions: {} };
-}
-
-/**
- * 用「模型缺失」把下一次 session_start 变成配置错误态（`failConfig` → `resetSessionState()`）。
- * 这是包级 `enabled` 移除后**唯一**能得到「无 store 会话」的路径，也正是这些用例原本真正想要
- * 的前置状态：一个不该沿用上一 session 目录/store 的启动。
- */
-export function breakModelConfig(): void {
-	mockConfigValue.defaults = { sessionPersistence: { enabled: false } };
-}
-
-/** 恢复 beforeEach 里的健康模型 fixture。 */
-export function restoreModelConfig(): void {
-	mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: false } };
 }
 
 /**
