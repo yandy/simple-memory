@@ -72,6 +72,8 @@ describe("surfacing context wiring", () => {
 		expect(ctx.cwd).toBe("/mem");
 		expect(ctx.store).toBe(store);
 		expect(ctx.ports.headless).toBe(deps.headless);
+		// 与 pi 的 twin 断言一致：上下文只允许这五个键，配置值一律收在 cfg 里。
+		expect(Object.keys(ctx).sort()).toEqual(["cfg", "cwd", "ports", "signal", "store"]);
 		// 配置值不再经适配层转手：input 只有宿主数据，没有 maxFiles / maxEntryBytes。
 		expect(Object.keys(input).sort()).toEqual(["injectedFiles", "manifest", "userPrompt"]);
 		expect((input as { maxFiles?: number }).maxFiles).toBeUndefined();

@@ -1,5 +1,4 @@
-import type { MemoryAction } from "../tool/actions.js";
-import { MAIN_AGENT_ACTIONS } from "../tool/actions.js";
+import { MAIN_AGENT_ACTIONS, type MemoryAction } from "../tool/actions.js";
 import { buildExtractTask } from "./prompts.js";
 import type { MemoryTask } from "./task.js";
 

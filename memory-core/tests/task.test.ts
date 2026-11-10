@@ -321,6 +321,40 @@ describe("runTask(TASKS.extractMemories)", () => {
 describe("runTask(TASKS.dream)", () => {
 	const cfg = () => mergeConfig(DEFAULT_CONFIG, { defaults: { model: "provider/base" } });
 
+	// `resolveSessionPersistence` 的继承顺序（per-task ?? defaults）是核心契约：反转 `??` 时
+	// 这个用例会红（per-task 值被 defaults 盖掉），所以它钉在「谁优先」而不是「值透传」。
+	it("prefers the per-task sessionPersistence and falls back to defaults when unset", async () => {
+		const requests: HeadlessRunRequest[] = [];
+		const headless: TaskContext["ports"]["headless"] = {
+			run: async (r) => {
+				requests.push(r);
+				return { status: "completed", text: "merged" };
+			},
+		};
+		const dreamCtx = (overlay: unknown) => ({
+			cfg: mergeConfig(DEFAULT_CONFIG, overlay),
+			cwd: dir,
+			store,
+			ports: { headless },
+		});
+
+		const perTask = { enabled: true, sessionDir: "/x" };
+		const defaults = { enabled: false };
+
+		await runTask(
+			TASKS.dream,
+			{},
+			dreamCtx({
+				defaults: { model: "provider/base", sessionPersistence: defaults },
+				dream: { sessionPersistence: perTask },
+			}),
+		);
+		expect(requests[0].sessionPersistence).toEqual(perTask);
+
+		await runTask(TASKS.dream, {}, dreamCtx({ defaults: { model: "provider/base", sessionPersistence: defaults } }));
+		expect(requests[1].sessionPersistence).toEqual(defaults);
+	});
+
 	it("takes one snapshot at entry and none per write (skipSnapshot on the inner tool)", async () => {
 		const requests: HeadlessRunRequest[] = [];
 		const out = await runTask(

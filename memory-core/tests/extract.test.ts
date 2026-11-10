@@ -41,30 +41,29 @@ interface ExtractOverrides {
 	onWrite?: (info: { action: MemoryAction; name?: string }) => void;
 }
 
-const extract = (o: Partial<ExtractOverrides> = {}) =>
-	runTask(
+// 预算 / 模型 / 目录的默认值只在 `opts` 里定义一份；`extract` 只负责消费，不再重复默认。
+const extract = (o: Partial<ExtractOverrides> = {}) => {
+	const x = opts(o);
+	return runTask(
 		TASKS.extractMemories,
-		{
-			messages: o.messages ?? [{ role: "user", text: "hello" }],
-			agentsMdBlocks: o.agentsMdBlocks ?? [],
-			onWrite: o.onWrite,
-		},
+		{ messages: x.messages!, agentsMdBlocks: x.agentsMdBlocks!, onWrite: x.onWrite },
 		{
 			cfg: mergeConfig(DEFAULT_CONFIG, {
-				defaults: { model: o.model ?? "deepseek/deepseek-v4-flash", sessionPersistence: o.sessionPersistence },
+				defaults: { model: x.model!, sessionPersistence: x.sessionPersistence },
 				extractMemories: {
-					thinkLevel: o.effort ?? "high",
-					maxContextTokens: o.maxContextTokens ?? 2000,
-					maxToolResultChars: o.maxToolResultChars ?? 500,
-					maxAssistantChars: o.maxAssistantChars ?? 2000,
-					sessionPersistence: o.sessionPersistence,
+					thinkLevel: x.effort!,
+					maxContextTokens: x.maxContextTokens!,
+					maxToolResultChars: x.maxToolResultChars!,
+					maxAssistantChars: x.maxAssistantChars!,
+					sessionPersistence: x.sessionPersistence,
 				},
 			}),
-			cwd: o.memoryDir ?? dir,
-			store: o.store ?? store,
+			cwd: x.memoryDir!,
+			store: x.store!,
 			ports,
 		},
 	);
+};
 
 const LIMITS = { maxToolResultChars: 500, maxAssistantChars: 2000, maxContextTokens: 100_000 };
 
@@ -95,6 +94,7 @@ function opts(over: Partial<ExtractOverrides> = {}): Partial<ExtractOverrides> {
 		maxToolResultChars: 500,
 		maxAssistantChars: 2000,
 		model: "deepseek/deepseek-v4-flash",
+		agentsMdBlocks: [],
 		...over,
 	};
 }

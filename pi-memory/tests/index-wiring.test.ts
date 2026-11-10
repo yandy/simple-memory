@@ -232,7 +232,9 @@ describe("index wiring (integration)", () => {
 			if (task.id === "dream") {
 				const model = ctx?.cfg?.dream?.model ?? ctx?.cfg?.defaults?.model;
 				if (model === undefined) {
-					throw new Error('no model for dream — set "dream.model" or "defaults.model" in memory.json');
+					return Promise.reject(
+						new Error('no model for dream — set "dream.model" or "defaults.model" in memory.json'),
+					);
 				}
 				return Promise.resolve("consolidated");
 			}
@@ -1472,10 +1474,11 @@ describe("index wiring (integration)", () => {
 		expect(runTaskMock).not.toHaveBeenCalled();
 	});
 
-	// 模型解析必须在改状态**之前**：runTask 在第一次 await 之前同步解析模型，缺模型直接抛，
-	// 不能把 "dream" 状态留在 UI 上（`/dream` 这条链只有 confirm 之后的 .finally）。
+	// `runTask` 是 async：缺模型不会在调用点同步抛，而是作为 rejection 走 `/dream` 的两参
+	// `.then` 失败分支（报「Dream failed」），状态行由 `.finally` 兜底清除 —— 处理器本身照常 resolve。
 	it("/dream does not leave the dream status behind when the model disappeared mid-session", async () => {
 		const setStatus = vi.fn();
+		const notify = vi.fn();
 		const confirm = vi.fn().mockResolvedValue(true);
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -1486,10 +1489,17 @@ describe("index wiring (integration)", () => {
 		mockConfigValue.defaults.model = undefined;
 
 		await expect(
-			commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm, setStatus } })),
-		).rejects.toThrow('no model for dream — set "dream.model" or "defaults.model" in memory.json');
+			commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus } })),
+		).resolves.toBeUndefined();
+		await flush();
 
-		expect(setStatus).not.toHaveBeenCalled();
+		expect(setStatus).toHaveBeenCalledWith("dream", "Consolidating memory...");
+		expect(setStatus).toHaveBeenCalledWith("dream", undefined);
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify).toHaveBeenCalledWith(
+			'Dream failed: no model for dream — set "dream.model" or "defaults.model" in memory.json',
+			"error",
+		);
 	});
 
 	it("the session_start nudge path passes the same dream arguments", async () => {

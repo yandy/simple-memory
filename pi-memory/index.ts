@@ -318,8 +318,8 @@ export default function (pi: ExtensionAPI) {
 					// Fire-and-forget: does not block session_start. The headless
 					// dream agent runs independently; completion notifies the user.
 					const dir = nudgeDir;
-					// `runTask` 在第一次 await 之前就同步解析模型（缺模型直接在这里抛），
-					// 所以状态行只会在模型可解析时才会被设置。
+					// `runTask` 是 async：缺模型不会在调用点同步抛，而是变成这条链的 rejection，
+					// 由下面的两参 `.then` 失败分支报「Dream failed」，`.finally` 负责清状态行。
 					const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } });
 					ui.setStatus("dream", "Consolidating memory...");
 					// dream 的 7 个 action 只注入它自己的 headless 子会话；整轮持锁与进入时的
@@ -452,7 +452,8 @@ export default function (pi: ExtensionAPI) {
 		// extract 的工具集与主 agent 相同（5 个 action），且**只**注入它自己的 headless 子会话；
 		// 不开 skipSnapshot：extract 没有整轮快照，它的每次写入都该留下自己的回滚点。
 		// 这两件事都由 core 的 runTask(TASKS.extractMemories) 表达，pi 只提供 onWrite 计数与两个端口。
-		// 模型解析在 runTask 的第一次 await 之前同步发生（缺模型在这里抛，早于 track 收尾链的挂接）。
+		// `runTask` 是 async：缺模型不在这里同步抛，而是作为 rejection 走下面的两参 `.then`
+		// 失败分支（消耗本 session 的失败配额、报「Extract failed」），track 的收尾链照常挂接。
 		const extractRun = runTask(
 			TASKS.extractMemories,
 			{
@@ -592,8 +593,8 @@ export default function (pi: ExtensionAPI) {
 			const ok = await ctx.ui.confirm("Dream", "Consolidate all memory files? This rewrites them in-place.");
 			if (!ok) return;
 			const dir = memoryDir;
-			// `runTask` 在第一次 await 之前同步解析模型（缺模型在这里抛）：先建 run 再改状态，
-			// 避免模型丢失时把 "dream" 状态留在 UI 上（这条链只有 confirm 之后的 .finally）。
+			// `runTask` 是 async：缺模型不在这里同步抛，而是作为 rejection 走下面的两参
+			// `.then` 失败分支（报「Dream failed」）；状态行由 `.finally` 兜底清除，不会残留。
 			const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } });
 			ui?.setStatus("dream", "Consolidating memory...");
 			track(dreamRun);
