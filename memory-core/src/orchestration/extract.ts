@@ -69,7 +69,9 @@ export async function runExtract(
 		}),
 	);
 
-	if (result === null) return { skipped: true };
-	return { skipped: false, result };
+	// 只有 `completed` 算「跑了」：`null`（拿不到锁）与其余 outcome（宿主没跑 / 跑了一半）
+	// 对 extract 都是「本轮没写」，一律 `skipped`。
+	if (result === null || result.status !== "completed") return { skipped: true };
+	return { skipped: false, result: result.text };
 }
 

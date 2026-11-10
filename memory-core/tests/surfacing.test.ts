@@ -34,7 +34,7 @@ beforeEach(() => {
 
 describe("runSideQuery", () => {
 	it("asks the host for one turn, no tools, a 30s timeout, and parses selected_files", async () => {
-		headlessRun.mockResolvedValueOnce('{"selected_files":["a.md"]}');
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: '{"selected_files":["a.md"]}' });
 
 		const result = await runSideQuery(
 			{ ...base, manifest: [manifest("a.md")], userPrompt: "how do I debug?", injectedFiles: new Set() },
@@ -58,7 +58,7 @@ describe("runSideQuery", () => {
 	// 取消信号必须原样落到端口的请求上：适配层在宿主会 await 的钩子里调用本函数，
 	// 信号到不了端口，用户取消后就要等满 timeoutMs 才拿得到一个没人要的结果。
 	it("forwards the abort signal to the port verbatim", async () => {
-		headlessRun.mockResolvedValueOnce('{"selected_files":[]}');
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: '{"selected_files":[]}' });
 		const controller = new AbortController();
 
 		await runSideQuery(
@@ -72,7 +72,7 @@ describe("runSideQuery", () => {
 
 	// 不传 signal 仍必须是合法调用：适配层可以不管取消，行为与加这个字段前完全一致。
 	it("still runs the round when no signal is given", async () => {
-		headlessRun.mockResolvedValueOnce('{"selected_files":["a.md"]}');
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: '{"selected_files":["a.md"]}' });
 		const result = await runSideQuery(
 			{ ...base, manifest: [manifest("a.md")], userPrompt: "q", injectedFiles: new Set() },
 			ports,
@@ -84,13 +84,13 @@ describe("runSideQuery", () => {
 	});
 
 	it("forwards the configured model string", async () => {
-		headlessRun.mockResolvedValueOnce('{"selected_files":[]}');
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: '{"selected_files":[]}' });
 		await runSideQuery({ ...base, manifest: [manifest("a.md")], userPrompt: "some query", injectedFiles: new Set() }, ports);
 		expect(headlessRun.mock.calls[0][0]).toMatchObject({ model: "deepseek/deepseek-v4-flash" });
 	});
 
 	it("drops files that are not in the manifest", async () => {
-		headlessRun.mockResolvedValueOnce('{"selected_files":["a.md","evil.md"]}');
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: '{"selected_files":["a.md","evil.md"]}' });
 		const result = await runSideQuery(
 			{ ...base, manifest: [manifest("a.md")], userPrompt: "q", injectedFiles: new Set() },
 			ports,
@@ -107,10 +107,10 @@ describe("runSideQuery", () => {
 		expect(result).toEqual([]);
 	});
 
-	// 端口的 `null` 语义是「宿主没跑这一轮」，与「跑了但没选出来」必须一样安全：
+	// 端口的 `not-run` 语义是「宿主没跑这一轮」，与「跑了但没选出来」必须一样安全：
 	// auto-surfacing 是纯增益，任何一条路径都不得打断用户这一轮。
 	it("returns [] when the host declines to run the round", async () => {
-		headlessRun.mockResolvedValueOnce(null);
+		headlessRun.mockResolvedValueOnce({ status: "not-run", cause: "host-refused" });
 		const result = await runSideQuery(
 			{ ...base, manifest: [manifest("a.md")], userPrompt: "q", injectedFiles: new Set() },
 			ports,
@@ -119,7 +119,7 @@ describe("runSideQuery", () => {
 	});
 
 	it("returns [] when the response has no valid JSON", async () => {
-		headlessRun.mockResolvedValueOnce("not json at all");
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: "not json at all" });
 		const result = await runSideQuery(
 			{ ...base, manifest: [manifest("a.md")], userPrompt: "some query", injectedFiles: new Set() },
 			ports,
@@ -137,7 +137,7 @@ describe("runSideQuery", () => {
 	});
 
 	it("filters out already-injected entry files", async () => {
-		headlessRun.mockResolvedValueOnce('{"selected_files":["a.md"]}');
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: '{"selected_files":["a.md"]}' });
 		const result = await runSideQuery(
 			{ ...base, manifest: [manifest("a.md"), manifest("b.md")], userPrompt: "q", injectedFiles: new Set(["b.md"]) },
 			ports,

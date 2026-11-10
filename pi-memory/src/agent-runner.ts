@@ -9,7 +9,7 @@ import {
 	SettingsManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { HeadlessAgentPort, HeadlessRunRequest } from "@yandy0725/memory-core";
+import type { HeadlessAgentPort, HeadlessOutcome, HeadlessRunRequest } from "@yandy0725/memory-core";
 import { FILE_IO_TOOLS } from "./agent-config";
 import type { SessionPersistenceConfig, ThinkLevel } from "./config";
 import { resolveModel } from "./model-resolver";
@@ -194,8 +194,8 @@ export function toHeadlessToolOptions(
 /** `HeadlessAgentPort` 的 pi 实现。 */
 export function createPiHeadlessAgent(deps: PiHeadlessDeps): HeadlessAgentPort {
 	return {
-		run(req: HeadlessRunRequest): Promise<string | null> {
-			return runHeadlessAgent({
+		async run(req: HeadlessRunRequest): Promise<HeadlessOutcome> {
+			const text = await runHeadlessAgent({
 				task: req.task,
 				cwd: req.cwd,
 				modelRegistry: deps.modelRegistry,
@@ -208,6 +208,8 @@ export function createPiHeadlessAgent(deps: PiHeadlessDeps): HeadlessAgentPort {
 				sessionPersistence: req.sessionPersistence as SessionPersistenceConfig | undefined,
 				...toHeadlessToolOptions(req, deps.buildMemoryTool),
 			});
+			// pi 本轮只产 `completed`（空回复是 `text: ""`）：超时仍由 `runHeadlessAgent` 抛，不在此处变成 outcome。
+			return { status: "completed", text };
 		},
 	};
 }

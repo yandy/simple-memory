@@ -74,9 +74,10 @@ export async function runDream(opts: RunDreamOpts, ports: { headless: HeadlessAg
 			memoryTool: { actions: DREAM_ACTIONS, skipLogicalLock: true, skipSnapshot: true },
 			sessionPersistence: opts.sessionPersistence,
 		});
-		// `null` = 宿主没跑这一轮。dream 是用户显式触发的（`/dream` 或 nudge 确认后），
-		// 静默返回空摘要会让用户以为合并成功了 —— 显式抛错，由适配层转成失败通知。
-		if (result === null) throw new Error("the host did not run the dream round");
-		return result;
+		// 不是 `completed` = 宿主没跑完这一轮（`not-run` / `incomplete` / `no-output`）。
+		// dream 是用户显式触发的（`/dream` 或 nudge 确认后），静默返回空摘要会让用户以为合并成功了
+		// —— 显式抛错，由适配层转成失败通知。
+		if (result.status !== "completed") throw new Error("the host did not run the dream round");
+		return result.text;
 	});
 }

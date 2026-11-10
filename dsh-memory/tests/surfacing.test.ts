@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, MemoryStore, mergeConfig } from "@yandy0725/memory-core";
-import type { HeadlessRunRequest, MemoryConfig } from "@yandy0725/memory-core";
+import type { HeadlessOutcome, HeadlessRunRequest, MemoryConfig } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPreStepListener, createRecallMessage, humanPromptText } from "../src/surfacing.js";
 import type { SurfacingDeps } from "../src/surfacing.js";
@@ -57,16 +57,16 @@ function makeDeps(over: Partial<SurfacingDeps> = {}): SurfacingDeps {
 	return {
 		registry: { get: vi.fn(() => undefined) },
 		indexCache: { refresh: vi.fn(async () => {}) },
-		headless: { run: vi.fn(async () => null) },
+		headless: { run: vi.fn(async (): Promise<HeadlessOutcome> => ({ status: "not-run", cause: "host-refused" })) },
 		warn: vi.fn(),
 		injected: new Map<string, Set<string>>(),
 		...over,
 	};
 }
 
-/** core 的 `parseSelectedFiles` 期望的回复格式：一个含 `selected_files` 数组的 JSON 对象。 */
-function selectJson(files: string[]): string {
-	return JSON.stringify({ selected_files: files });
+/** 端口成功返回的形状；`text` 是 core 的 `parseSelectedFiles` 期望的含 `selected_files` 的 JSON 对象。 */
+function selectOutcome(files: string[]): HeadlessOutcome {
+	return { status: "completed", text: JSON.stringify({ selected_files: files }) };
 }
 
 describe("humanPromptText", () => {
@@ -83,7 +83,7 @@ describe("humanPromptText", () => {
 
 describe("createPreStepListener", () => {
 	it("returns an inner reject unchanged and never runs the side query", async () => {
-		const headlessRun = vi.fn(async () => null);
+		const headlessRun = vi.fn(async (): Promise<HeadlessOutcome> => ({ status: "not-run", cause: "host-refused" }));
 		const refresh = vi.fn(async () => {});
 		const deps = makeDeps({ indexCache: { refresh }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
@@ -114,7 +114,7 @@ describe("createPreStepListener", () => {
 		// 端口 —— 那时 `expect(headlessRun).not.toHaveBeenCalled()` 恒真，钉不住 step 门禁本身。
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
 		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
@@ -141,7 +141,7 @@ describe("createPreStepListener", () => {
 		// 同上：没有 entry 时 core 会在调用端口之前短路，这条断言就变成恒真的空转测试。
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store, { surfacing: { available: false, reason: "no model" } });
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
 		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
@@ -165,7 +165,7 @@ describe("createPreStepListener", () => {
 		// 错误态运行时：`store === null` 而 memoryDir 非空。这是门禁的第三个条件，与 step / 可用性
 		// 两条独立 —— 目录解析失败的会话绝不该把空 cwd 发给侧查询端口。
 		const rt = makeRuntime(memoryDir, null, { error: "Failed to resolve memory directory: boom" });
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
 		const warn = vi.fn();
 		const deps = makeDeps({
@@ -201,7 +201,7 @@ describe("createPreStepListener", () => {
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		await store.addEntry({ name: "Beta", description: "beta note", body: "beta body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md", "Beta.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md", "Beta.md"]));
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
@@ -245,7 +245,7 @@ describe("createPreStepListener", () => {
 		const store = makeStore(memoryDir);
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 
@@ -285,7 +285,7 @@ describe("createPreStepListener", () => {
 		const store = makeStore(memoryDir);
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const listener = createPreStepListener(deps);
 
@@ -359,9 +359,9 @@ describe("createPreStepListener", () => {
 		const rt = makeRuntime(memoryDir, store);
 		// 第一轮选 Alpha；第二轮「想再选 Alpha + Beta」，但 Alpha 已被 injectedFiles 过滤。
 		const headlessRun = vi
-			.fn<(req: HeadlessRunRequest) => Promise<string>>()
-			.mockResolvedValueOnce(selectJson(["Alpha.md"]))
-			.mockResolvedValueOnce(selectJson(["Alpha.md", "Beta.md"]));
+			.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>()
+			.mockResolvedValueOnce(selectOutcome(["Alpha.md"]))
+			.mockResolvedValueOnce(selectOutcome(["Alpha.md", "Beta.md"]));
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
@@ -400,8 +400,8 @@ describe("createPreStepListener", () => {
 		const store = makeStore(memoryDir);
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<string>>().mockResolvedValue(
-			selectJson(["Alpha.md"]),
+		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>().mockResolvedValue(
+			selectOutcome(["Alpha.md"]),
 		);
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const listener = createPreStepListener(deps);
@@ -427,11 +427,11 @@ describe("createPreStepListener", () => {
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
 		const injected = new Map<string, Set<string>>();
-		let resolveRun: (value: string) => void = () => {};
+		let resolveRun: (value: HeadlessOutcome) => void = () => {};
 		// 一个「resolve 权在我们手上」的端口：resolve 前监听器一直挂在 runSideQuery 的 await 上。
 		const headlessRun = vi.fn(
 			() =>
-				new Promise<string>((resolve) => {
+				new Promise<HeadlessOutcome>((resolve) => {
 					resolveRun = resolve;
 				}),
 		);
@@ -452,7 +452,7 @@ describe("createPreStepListener", () => {
 
 		// 侧查询 in-flight 时取消；随后让被取消的侧查询「迟到」地返回选中结果（模拟 30s 窗口）。
 		controller.abort();
-		resolveRun(selectJson(["Alpha.md"]));
+		resolveRun(selectOutcome(["Alpha.md"]));
 		const decision = await pending;
 
 		if (decision.kind !== "enter") throw new Error("expected an enter decision");
@@ -467,7 +467,7 @@ describe("createPreStepListener", () => {
 		const store = makeStore(memoryDir);
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
 		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
 		const listener = createPreStepListener(deps);
@@ -491,7 +491,7 @@ describe("createPreStepListener", () => {
 		const store = makeStore(memoryDir);
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectJson(["Alpha.md"]));
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
 		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
@@ -529,8 +529,8 @@ describe("createPreStepListener", () => {
 		const rt = makeRuntime(memoryDir, store, { config });
 		// 两轮都选中 Alpha + Beta，但渲染恒为空。
 		const headlessRun = vi
-			.fn<(req: HeadlessRunRequest) => Promise<string>>()
-			.mockResolvedValue(selectJson(["Alpha.md", "Beta.md"]));
+			.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>()
+			.mockResolvedValue(selectOutcome(["Alpha.md", "Beta.md"]));
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
@@ -567,8 +567,8 @@ describe("createPreStepListener", () => {
 		const store = makeStore(memoryDir);
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<string>>().mockResolvedValue(
-			selectJson(["Alpha.md"]),
+		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>().mockResolvedValue(
+			selectOutcome(["Alpha.md"]),
 		);
 		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
 		const listener = createPreStepListener(deps);

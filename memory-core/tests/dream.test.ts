@@ -47,7 +47,7 @@ beforeEach(async () => {
 	dir = await mkdtemp(join(tmpdir(), "mem-dream-"));
 	store = new MemoryStore(CFG(dir));
 	headlessRun.mockReset();
-	headlessRun.mockResolvedValue("ok");
+	headlessRun.mockResolvedValue({ status: "completed", text: "ok" });
 });
 afterEach(async () => {
 	// win32 宿主上 rm(dir, { recursive: true }) 删不掉保留名文件，必须先经 \\?\ 前缀摘除
@@ -138,7 +138,7 @@ describe("runDream", () => {
 			await expect(shortStore.addEntry({ name: "B", body: "正文" })).rejects.toThrow(
 				/already running in this process/,
 			);
-			return "consolidated";
+			return { status: "completed", text: "consolidated" };
 		});
 
 		const summary = await dream(opts({ store: shortStore }));
@@ -148,7 +148,7 @@ describe("runDream", () => {
 	});
 
 	it("asks for no builtin tools and the seven dream-only actions, with both skips on", async () => {
-		headlessRun.mockResolvedValueOnce("ok");
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: "ok" });
 
 		await dream(opts({ model: "deepseek/deepseek-v4-flash" }));
 
@@ -169,7 +169,7 @@ describe("runDream", () => {
 	});
 
 	it("throws when the host declines to run the round, and releases the lock", async () => {
-		headlessRun.mockResolvedValueOnce(null);
+		headlessRun.mockResolvedValueOnce({ status: "not-run", cause: "host-refused" });
 
 		// 静默返回空摘要会让用户以为合并成功了；dream 是显式触发的，必须显式失败。
 		await expect(dream(opts())).rejects.toThrow("the host did not run the dream round");
@@ -177,7 +177,7 @@ describe("runDream", () => {
 	});
 
 	it("passes sessionPersistence through", async () => {
-		headlessRun.mockResolvedValueOnce("ok");
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: "ok" });
 		await dream(opts({ sessionPersistence: { enabled: true, sessionDir: "/custom" } }));
 		expect(headlessRun).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionPersistence: { enabled: true, sessionDir: "/custom" } }),
@@ -194,7 +194,7 @@ describe("runDream", () => {
 		headlessRun.mockImplementationOnce(async () => {
 			// 快照必须**先于** headless agent
 			expect(await backupDirs()).toHaveLength(1);
-			return "ok";
+			return { status: "completed", text: "ok" };
 		});
 		await dream(opts());
 
@@ -209,7 +209,7 @@ describe("runDream", () => {
 		await createReservedNameFixture(dir, "con.md", "正文");
 		await writeFile(join(dir, "ok.md"), "正文", "utf8");
 		await rm(join(dir, ".backups"), { recursive: true, force: true });
-		headlessRun.mockResolvedValueOnce("ok");
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: "ok" });
 
 		await dream(opts({ store: win }));
 
@@ -223,7 +223,7 @@ describe("runDream", () => {
 		await writeFile(join(dir, "con.md"), "正文", "utf8");
 		await writeFile(join(dir, "ok.md"), "正文", "utf8");
 		await rm(join(dir, ".backups"), { recursive: true, force: true });
-		headlessRun.mockResolvedValueOnce("ok");
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: "ok" });
 
 		await dream(opts({ store: posix }));
 
@@ -234,7 +234,7 @@ describe("runDream", () => {
 
 	it("prunes old dream snapshots down to lock.snapshotKeep", async () => {
 		const tiny = new MemoryStore(CFG(dir, { lock: { timeoutMs: 5000, snapshotKeep: 1 } }));
-		headlessRun.mockResolvedValue("ok");
+		headlessRun.mockResolvedValue({ status: "completed", text: "ok" });
 
 		await dream(opts({ store: tiny }));
 		await dream(opts({ store: tiny }));
@@ -264,7 +264,7 @@ describe("runDream", () => {
 	});
 
 	it("still snapshots when the memory directory is empty", async () => {
-		headlessRun.mockResolvedValueOnce("ok");
+		headlessRun.mockResolvedValueOnce({ status: "completed", text: "ok" });
 		await dream(opts());
 
 		const [snapshot] = await backupDirs();

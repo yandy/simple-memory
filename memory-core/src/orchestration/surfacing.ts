@@ -67,8 +67,8 @@ export async function runSideQuery(
 			memoryTool: null,
 			sessionPersistence: opts.sessionPersistence,
 		});
-		if (result === null) return [];
-		return parseSelectedFiles(result, candidates, opts.maxFiles);
+		if (result.status !== "completed") return [];
+		return parseSelectedFiles(result.text, candidates, opts.maxFiles);
 	} catch {
 		return [];
 	}

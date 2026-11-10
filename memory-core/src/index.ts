@@ -116,8 +116,10 @@ export { buildDreamTask, buildExtractTask } from "./orchestration/prompts.js";
 export type {
 	ExtractMessage,
 	HeadlessAgentPort,
+	HeadlessOutcome,
 	HeadlessRunRequest,
 	HostTranscriptPort,
+	IncompleteOutcome,
 	OrchestrationPorts,
 } from "./orchestration/ports.js";
 export { memoryToolSchema } from "./tool/schema.js";

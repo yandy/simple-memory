@@ -60,7 +60,7 @@ beforeEach(async () => {
 	dir = await mkdtemp(join(tmpdir(), "mem-extract-"));
 	store = new MemoryStore(CFG(dir));
 	headlessRun.mockClear();
-	headlessRun.mockResolvedValue("saved 2 memories");
+	headlessRun.mockResolvedValue({ status: "completed", text: "saved 2 memories" });
 });
 afterEach(async () => {
 	await rm(dir, { recursive: true, force: true });
