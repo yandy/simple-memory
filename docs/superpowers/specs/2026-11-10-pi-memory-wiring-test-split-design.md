@@ -179,6 +179,9 @@ afterEach(async () => { await s.cleanup(); vi.unstubAllEnvs(); });
 ### 7.6 验收
 
 - `npm test -w pi-memory`：226 个用例通过（当前 234 − 8），0 skip、0 只跑一半。
+  **补注**：实施计划另加了 2 条结构性自检（harness 是否真的加载、`setupSession` 写出的 `memory.json`
+  能否被真实 `loadConfig` 读到），两条都钉住§5 的隐含约定，所以实际终局是 228（当前 234 − 8 + 2）。
+  详见 `docs/superpowers/plans/2026-11-10-pi-memory-wiring-test-split.md`。
 - `npm run typecheck -w pi-memory` / `npm run lint -w pi-memory` 干净。
 - 逐条核对：§7.5 的 8 条合并之外，**没有任何一个原本存在的契约失去断言**（搬家用例逐个对照原文件）。
 - `git diff --stat` 只出现 `pi-memory/tests/**` 与 `docs/`。
