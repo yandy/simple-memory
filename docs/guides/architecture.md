@@ -40,12 +40,20 @@ spec 与迁移说明。
 
 ## 仓内解析 vs 发布形态
 
-`pi-memory` 的 `vitest.config.ts` 用 `resolve.alias`、`tsconfig.json` 用 `paths`，把
+`pi-memory` 与 `dsh-memory` 的 `vitest.config.ts` 用 `resolve.alias`、`tsconfig.json` 用 `paths`，把
 `@yandy0725/memory-core` 指到 `../memory-core/src/index.ts`，所以日常 `npm test` / `typecheck`
-不需要先 build。
+不需要先 build。`dsh-memory` 的 `tsconfig.build.json` 再把 `paths` 清空，构建因此经包 `exports`
+解析 `memory-core/dist`。
 
-CI 的 `test-dist` job 用 `MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到
-`memory-core/dist`（经包 `exports` 解析）—— 用户拿到的那条路径必须被真实执行过一次。
+发布形态有两条，分别由两个 job 覆盖：
+
+- **仓内的 `dist`**：`test-dist` 用 `MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到
+  `memory-core/dist`（经包 `exports` 解析）。
+- **registry 上的 core**：`registry-smoke` 把适配层打成 tarball 装进干净目录，依赖只从 registry 拉，
+  断言解析到的 core 在该目录内、版本满足声明的范围、并能真读写。用户装包时走的就是这条。
+
+解析路径的完整约定与静态闸门（`npm run check:memory-core-deps`）见
+[dependencies.md](./dependencies.md) 的「开发走仓内源码，运行走 registry」一节。
 
 ## CI job 各自的用途
 
@@ -54,8 +62,9 @@ CI 的 `test-dist` job 用 `MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套
 | job | 覆盖什么 |
 |-----|----------|
 | `lockfile-sync` | `package-lock.json` 与各 `package.json` 未漂移 |
-| `test` | 逻辑（ubuntu + windows），含 `check:host-deps` / `typecheck` / `lint` / `test` |
+| `test` | 逻辑（ubuntu + windows），含 `check:host-deps` / `check:memory-core-deps` / `typecheck` / `lint` / `test` |
 | `test-dist` | 发布形态的解析路径（见上节） |
+| `registry-smoke` | 适配层 tarball 从 registry 装上 memory-core 后能跑（见上节） |
 | `pack-smoke` | tarball 里带齐了 `dist/`、types 与 `pi-memory` 的 TS 入口；在干净目录装包后能跑 |
 
 `pack-smoke` 跑 Node 20.16.0（`memory-core` 的 `engines` 下限）与 24 两档，只验证运行时形状，

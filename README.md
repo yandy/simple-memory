@@ -67,6 +67,8 @@ npm test                      # memory-core, pi-memory and dsh-memory
 npm run typecheck && npm run lint
 npm run build -w memory-core  # dist/ (ESM + .d.ts + maps); CI validates the packed tarball
 npm run check:host-deps       # host packages must be peerDependencies, never dependencies
+npm run check:memory-core-deps # dev resolves the monorepo source, runtime the registry copy
+npm run smoke:registry        # installs the adapter tarball in a clean dir, pulling memory-core from the registry
 ```
 
 `memory-core`'s `src/**` may import only `node:*` and relative paths — `memory-core/tests/neutrality.test.ts`

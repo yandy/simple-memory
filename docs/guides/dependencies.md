@@ -48,6 +48,37 @@ typecheck。`src/host-types.ts` 从 `@deepseek-ai/dsh-agent` 取 `Agent`，而 `
 这九条精确版本各有一条 `.github/dependabot.yml` 的 `ignore`（与 `@earendil-works/*` 同样处理）：升级只能
 走一次独立变更，不能让自动 PR 越过它。
 
+## `@yandy0725/memory-core`：开发走仓内源码，运行走 registry
+
+适配层（`pi-memory` / `dsh-memory`）对 core 有两条互斥的解析路径，必须同时成立：
+
+| 时机 | 解析到 | 由什么保证 |
+|------|--------|-----------|
+| 开发（`npm test` / `npm run typecheck`） | `../memory-core/src/index.ts` | `vitest.config.ts` 的 `resolve.alias` + `tsconfig.json` 的 `compilerOptions.paths` |
+| 构建（`npm run build`） | 包 `exports` → `node_modules/@yandy0725/memory-core/dist` | `tsconfig.build.json` 里的 `"paths": {}`（清掉源码别名） |
+| 运行时（用户机器上装包后） | registry 上的 `@yandy0725/memory-core` | `dependencies` 里的 caret 范围 |
+
+推论：
+
+- core **只写进 `dependencies`**，不写进 `devDependencies`：workspace 已经会把它链接进
+  `node_modules`，重复声明只会制造第二份副本，让上面两条路径悄悄漂移。
+- 范围写 `^x.y.z`，不写 `file:` / `workspace:` / `*` / `latest`：发布出去后用户机器上解析不到。
+- 构建配置不得继承源码别名：否则产物可能对着**比 registry 上更新**的源码编出来，而用户拿到的
+  core 没有那些 API。
+
+执行点两条：
+
+- `npm run check:memory-core-deps`（`scripts/check-memory-core-deps.mjs`，CI 的 `test` job）—— 静态检查
+  上面三条，`package.json` / `vitest.config.ts` / `tsconfig*.json` 各有一类错误文案。
+- `npm run smoke:registry`（`scripts/registry-smoke.mjs`，CI 的 `registry-smoke` job）—— 把适配层打成
+  tarball 装进干净目录（依赖只从 registry 拉），断言解析到的 core 落在该目录内、版本满足声明的范围、
+  并能真读写。需要先 `npm run build -w memory-core -w dsh-memory`。未发布的适配层
+  （`private: true`）在 registry 上找不到满足范围的 core 时只打 notice 跳过；去掉 `private` 后同一条件
+  变成失败。
+
+CI 的 `test-dist` job 覆盖第三条：`MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到 **仓内** 的
+`memory-core/dist`。`registry-smoke` 补的是它管不到的那一段 —— 用户装到的 core 来自 registry。
+
 ## 依赖自动更新
 
 `.github/dependabot.yml` 的骨架与 `yandy/pi-packages` 保持一致（周更、限 5 个 PR、dev 依赖

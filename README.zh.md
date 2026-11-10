@@ -63,6 +63,8 @@ npm test                      # memory-core、pi-memory 与 dsh-memory
 npm run typecheck && npm run lint
 npm run build -w memory-core  # dist/（ESM + .d.ts + maps）；CI 另外验证打包出来的 tarball
 npm run check:host-deps       # 宿主提供的包必须在 peerDependencies，不能进 dependencies
+npm run check:memory-core-deps # 开发走仓内源码、运行走 registry，两条解析路径不得串线
+npm run smoke:registry        # 需要先 build：把适配层 tarball 装进干净目录，只从 registry 拉 memory-core
 ```
 
 `memory-core` 的 `src/**` 只许 import `node:*` 与相对路径 —— `memory-core/tests/neutrality.test.ts` 是这条

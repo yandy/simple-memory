@@ -156,6 +156,12 @@ npm run build -w memory-core && npm run build -w dsh-memory   # 顺序不能反�
 npm test -w dsh-memory
 ```
 
+`@yandy0725/memory-core` 有两条解析路径，与 `pi-memory` 同口径：**开发**（`npm test` / `typecheck`）
+经 `vitest.config.ts` 的 alias 与 `tsconfig.json` 的 `paths` 指向 `../memory-core/src/index.ts`，
+**构建与运行时**经包 `exports` 解析 `dist/`，用户机器上就是从 registry 装的那个版本。
+`npm run check:memory-core-deps` 静态守这条，`npm run smoke:registry` 真装一次验证（见
+[docs/guides/dependencies.md](../docs/guides/dependencies.md)）。
+
 设计保证：`dsh-memory/dist/**/*.js` 里 **零** `@deepseek-ai` 引用。宿主包全部只以 `import type`
 出现（tsc 擦除），运行时能力经 `inject` 进来的 `ctx` 服务拿 —— 所以产物 `.js` 里没有宿主 import。
 CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.d.ts` 里出现宿主类型是合法的，
