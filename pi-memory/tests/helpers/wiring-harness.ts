@@ -57,6 +57,11 @@ const config = vi.hoisted(() => ({
 	legacyConfigActive: { value: true },
 	/** 工厂里不能 import node:path（hoisted 工厂先于模块体执行）：用它算「cwd 的末段」。 */
 	basename: (p: string) => String(p).split(/[\\/]/).filter(Boolean).pop() ?? "",
+	/**
+	 * `loadConfig` 的分派实现。工厂第一次执行时装进来（那时才拿得到 `actual`）；
+	 * `resetWiringMocks()` 在 `mockReset()` 之后靠它把实现装回去 —— reset 会连实现一起清掉。
+	 */
+	loadConfigDispatch: { current: null as null | ((ctx: unknown) => Promise<unknown>) },
 }));
 
 const mocks = vi.hoisted(() => ({
@@ -79,16 +84,21 @@ vi.mock("../../src/config", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../src/config")>();
 	return {
 		...actual,
-		loadConfig: mocks.loadConfigMock.mockImplementation(async (ctx: unknown) => {
+		loadConfig: mocks.loadConfigMock.mockImplementation((ctx: unknown) => {
+			return config.loadConfigDispatch.current!(ctx);
+		}),
+		__loadConfigDispatch: (() => {
+			config.loadConfigDispatch.current = async (ctx: unknown) => {
 			if (config.legacyConfigActive.value) {
 				return {
 					config: { ...config.mockConfigValue, memoryDir: config.dirRef.current },
 					host: PI_HOST_DEFAULTS,
 				};
 			}
-			// 已迁移的文件：真实读 PI_CODING_AGENT_DIR 下的 memory.json
-			return actual.loadConfig(ctx as Parameters<typeof actual.loadConfig>[0]);
-		}),
+				// 已迁移的文件：真实读 PI_CODING_AGENT_DIR 下的 memory.json
+				return actual.loadConfig(ctx as Parameters<typeof actual.loadConfig>[0]);
+			};
+		})(),
 	};
 });
 
@@ -186,6 +196,10 @@ export const DISK_INDEX = "- [SSH](ssh.md) — staging ssh config\n";
  * reset 会清掉创建时设的默认 `null`，让「探测器没发现旧数据」的用例失去前提。
  */
 export function resetWiringMocks(): void {
+	// `mockReset` 会连实现一起清掉，所以接着把分派装回去；这样上一条用例遗留的
+	// `mockImplementationOnce` 队列也不会串到下一条用例。
+	mocks.loadConfigMock.mockReset();
+	if (config.loadConfigDispatch.current) mocks.loadConfigMock.mockImplementation(config.loadConfigDispatch.current);
 	scanEntriesMock.mockReset();
 	runTaskMock.mockReset();
 	runTaskMock.mockImplementation((task: { id?: string }, _input: unknown, ctx?: { cfg?: MemoryConfig }) => {

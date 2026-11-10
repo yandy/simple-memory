@@ -3,43 +3,24 @@
  *
  * harness 必须排在本文件其他 import 之前：它注册了 `vi.mock`，顺序错了 mock 不生效。
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, DISK_INDEX, dirOverrideRef, dirRef, disposableCtx, flush, mockConfigValue, resetWiringMocks, runTaskMock, scanEntriesMock, shouldNudgeMock, uiCtx, waitFor, writeDreamMetaMock } from "./helpers/wiring-harness";
+import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, flush, resetWiringMocks, runTaskMock, setupSession, shouldNudgeMock, uiCtx, waitFor, writeDreamMetaMock } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
-import { loadConfig } from "../src/config";
 import { DREAM_ACTIONS, TASKS } from "@yandy0725/memory-core";
 
+
+
 describe("index wiring — dream", () => {
-	let dir: string;
+	let s: Awaited<ReturnType<typeof setupSession>>;
 
 	beforeEach(async () => {
-		dir = await mkdtemp(join(tmpdir(), "mem-wiring-"));
-		dirRef.current = dir;
-		await mkdir(dir, { recursive: true });
-		await writeFile(join(dir, "MEMORY.md"), DISK_INDEX, "utf8");
-
-		scanEntriesMock.mockReset();
+		s = await setupSession();
 		resetWiringMocks();
-
-		// 模型 fixture：默认走 defaults.model；各用例按需覆盖 mockConfigValue 的 model 段
-		mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: false } };
-		mockConfigValue.dream.model = undefined;
-		mockConfigValue.extractMemories.model = undefined;
-		mockConfigValue.autoSurfacing.model = undefined;
 	});
 
 	afterEach(async () => {
-		await rm(dir, { recursive: true, force: true });
-		delete (mockConfigValue.autoSurfacing as any).sessionPersistence;
-		mockConfigValue.autoSurfacing.maxFiles = 5;
-		mockConfigValue.autoSurfacing.thinkLevel = "off";
-		mockConfigValue.extractMemories.enabled = false;
-		mockConfigValue.lock = { timeoutMs: 5000, snapshotKeep: 5 };
-		dirOverrideRef.current = null;
+		await s.cleanup();
 	});
 
 	// ── Review 修复轮（R47/R48/R49）：dream 两条链的 ctx 快照 / 定时器 / section 时机 ──
@@ -54,7 +35,7 @@ describe("index wiring — dream", () => {
 		);
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		const session = disposableCtx();
 		session.ctx.ui.confirm.mockResolvedValue(true);
@@ -88,7 +69,7 @@ describe("index wiring — dream", () => {
 
 		await handlers["session_start"][0](
 			{},
-			uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } }),
+			s.uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } }),
 		);
 		rejectDream?.("model exploded");
 		await flush();
@@ -106,26 +87,22 @@ describe("index wiring — dream", () => {
 		);
 		const { pi, handlers, commands } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		const session = disposableCtx();
 		session.ctx.ui.confirm.mockResolvedValue(true);
 		// 完成回调里的 `SessionManager.list(cwd)` 会去 getAgentDir() 下建会话目录：
-		// 按 docs/guides/testing.md 隔离到本用例的 temp dir（并行/沙箱下不得碰真实 ~/.pi）。
-		vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "agent"));
-		try {
-			const caught = await captureUnhandledRejections(async () => {
-				await commands["dream"].handler("", session.ctx);
-				session.dispose();
-				resolveDream?.("consolidated");
-				await waitFor(() => session.notify.mock.calls.length > 0, "dream completion notify");
-			});
+		const caught = await captureUnhandledRejections(async () => {
+			await commands["dream"].handler("", session.ctx);
+			session.dispose();
+			resolveDream?.("consolidated");
+			await waitFor(() => session.notify.mock.calls.length > 0, "dream completion notify");
+		});
 
-			expect(caught).toEqual([]);
-			expect(session.notify).toHaveBeenCalledWith("consolidated", "info");
-		} finally {
-			vi.unstubAllEnvs();
-		}
+		expect(caught).toEqual([]);
+		expect(session.notify).toHaveBeenCalledWith("consolidated", "info");
+	
+
 	});
 
 	it("does not reject unhandled when /dream fails after the session died", async () => {
@@ -138,7 +115,7 @@ describe("index wiring — dream", () => {
 		);
 		const { pi, handlers, commands } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		const session = disposableCtx();
 		session.ctx.ui.confirm.mockResolvedValue(true);
@@ -162,22 +139,18 @@ describe("index wiring — dream", () => {
 		const confirm = vi.fn().mockResolvedValue(true);
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		// 完成回调里的 `SessionManager.list(cwd)` 会碰 getAgentDir()：隔离到本用例的 temp dir。
-		vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "agent"));
-		try {
-			const caught = await captureUnhandledRejections(async () => {
-				await commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
-				// 成功分支先 `SessionManager.list`（真实 I/O）再写 meta；meta 写失败也只在 I/O 之后才发通知。
-				await waitFor(() => notify.mock.calls.length > 0, "dream meta-failure notify");
-			});
+		await handlers["session_start"][0]({}, s.uiCtx());
+		const caught = await captureUnhandledRejections(async () => {
+			await commands["dream"].handler("", s.uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
+			// 成功分支先 `SessionManager.list`（真实 I/O）再写 meta；meta 写失败也只在 I/O 之后才发通知。
+			await waitFor(() => notify.mock.calls.length > 0, "dream meta-failure notify");
+		});
 
-			expect(caught).toEqual([]);
-			expect(notify).toHaveBeenCalledTimes(1);
-			expect(notify.mock.calls[0]).toEqual(["Dream failed: meta write failed", "error"]);
-		} finally {
-			vi.unstubAllEnvs();
-		}
+		expect(caught).toEqual([]);
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify.mock.calls[0]).toEqual(["Dream failed: meta write failed", "error"]);
+	
+
 	});
 
 	it("/dream hands the store, the line limit and the headless port to runTask", async () => {
@@ -185,37 +158,34 @@ describe("index wiring — dream", () => {
 		const notify = vi.fn();
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
 		// 成功回调里的 `SessionManager.list(cwd)` 会去 getAgentDir() 下建会话目录：
-		// 按 docs/guides/testing.md 隔离到本用例的 temp dir（并行/沙箱下不得碰真实 ~/.pi）。
-		vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "agent"));
+		// 完成回调在 notify 之前 `await SessionManager.list(cwd)`，那是真实磁盘 I/O：把它固定拖慢到
+		// 一个 setTimeout(0) tick 之上，这条断言就必须等条件成立，不能靠"猜一个 tick"。
+		const listSpy = vi.spyOn(SessionManager, "list").mockImplementation(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			return [];
+		});
 		try {
-			// 完成回调在 notify 之前 `await SessionManager.list(cwd)`，那是真实磁盘 I/O：把它固定拖慢到
-			// 一个 setTimeout(0) tick 之上，这条断言就必须等条件成立，不能靠"猜一个 tick"。
-			const listSpy = vi.spyOn(SessionManager, "list").mockImplementation(async () => {
-				await new Promise((resolve) => setTimeout(resolve, 30));
-				return [];
-			});
-			try {
-				await commands["dream"].handler("", uiCtx({ hasUI: true, ui: { confirm, notify, setStatus: vi.fn() } }));
+			await commands["dream"].handler("", s.uiCtx({ hasUI: true, ui: { confirm, notify, setStatus: vi.fn() } }));
 
-				expect(runTaskMock).toHaveBeenCalledTimes(1);
-				expect(runTaskMock.mock.calls[0][0]).toBe(TASKS.dream);
-				const taskCtx = runTaskMock.mock.calls[0][2];
-				expect(taskCtx.cwd).toBe(dir);
-				expect(taskCtx.cfg.memIndexMaxLines).toBe(200);
-				expect(typeof taskCtx.store.withLogicalLock).toBe("function");
-				// 「7 个 action + memory 工具」由 core 的 TASKS.dream 决定；pi 只提供 headless 端口。
-				expect(typeof taskCtx.ports.headless.run).toBe("function");
+			expect(runTaskMock).toHaveBeenCalledTimes(1);
+			expect(runTaskMock.mock.calls[0][0]).toBe(TASKS.dream);
+			const taskCtx = runTaskMock.mock.calls[0][2];
+			expect(taskCtx.cwd).toBe(s.dir);
+			expect(taskCtx.cfg.memIndexMaxLines).toBe(200);
+			expect(typeof taskCtx.store.withLogicalLock).toBe("function");
+			// 「7 个 action + memory 工具」由 core 的 TASKS.dream 决定；pi 只提供 headless 端口。
+			expect(typeof taskCtx.ports.headless.run).toBe("function");
 
-				// 成功回调（SessionManager.list → writeDreamMeta → notifyDream）必须在 unstub 前排空，
-				// 否则会漏到真实 ~/.pi；notify 断言证明回调确实在本用例内跑完。
-				await waitFor(() => notify.mock.calls.length > 0, "dream completion notify");
-				expect(notify).toHaveBeenCalledWith("consolidated", "info");
-			} finally {
+			// 成功回调（SessionManager.list → writeDreamMeta → notifyDream）必须在 unstub 前排空，
+			// 否则会漏到真实 ~/.pi；notify 断言证明回调确实在本用例内跑完。
+			await waitFor(() => notify.mock.calls.length > 0, "dream completion notify");
+			expect(notify).toHaveBeenCalledWith("consolidated", "info");
+		
 				listSpy.mockRestore();
-			}
+		
 		} finally {
 			vi.unstubAllEnvs();
 		}
@@ -226,7 +196,7 @@ describe("index wiring — dream", () => {
 		const { pi, commands } = createFakePi();
 		memoryFactory(pi as any);
 
-		await commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
+		await commands["dream"].handler("", s.uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
 
 		expect(notify).toHaveBeenCalledWith("Memory not initialized.", "info");
 		expect(runTaskMock).not.toHaveBeenCalled();
@@ -234,20 +204,23 @@ describe("index wiring — dream", () => {
 
 	// `runTask` 是 async：缺模型不会在调用点同步抛，而是作为 rejection 走 `/dream` 的两参
 	// `.then` 失败分支（报「Dream failed」），状态行由 `.finally` 兜底清除 —— 处理器本身照常 resolve。
-	it("/dream does not leave the dream status behind when the model disappeared mid-session", async () => {
+	it("/dream reports a mid-session failure and never leaves the dream status behind", async () => {
 		const setStatus = vi.fn();
 		const notify = vi.fn();
 		const confirm = vi.fn().mockResolvedValue(true);
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 
-		// 启动校验通过之后配置被改坏（loadConfig 的返回值是浅拷贝，改嵌套对象才能被会话内的
-		// config 看到）：真实场景就是用户在会话中途删了 `defaults.model`。
-		mockConfigValue.defaults.model = undefined;
+		// C 之后会话内的 config 是 session_start 那一刻的快照 —— 中途改 `memory.json` 不会影响
+		// 运行中的会话（真实用户也要「改配置 + 重启」）。所以这里注入一次与 core 同文的失败，
+		// 钉 pi 自己的契约：rejection → 一条 `Dream failed: …` 通知 + 状态行必须被清掉。
+		runTaskMock.mockImplementationOnce(() =>
+			Promise.reject(new Error('no model for dream — set "dream.model" or "defaults.model" in memory.json')),
+		);
 
 		await expect(
-			commands["dream"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus } })),
+			commands["dream"].handler("", s.uiCtx({ hasUI: true, ui: { notify, confirm, setStatus } })),
 		).resolves.toBeUndefined();
 		await flush();
 
@@ -266,7 +239,7 @@ describe("index wiring — dream", () => {
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
 
-		await handlers["session_start"][0]({}, uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm, setStatus: vi.fn() } }));
+		await handlers["session_start"][0]({}, s.uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm, setStatus: vi.fn() } }));
 
 		expect(confirm).toHaveBeenCalled();
 		expect(runTaskMock).toHaveBeenCalledTimes(1);
@@ -285,12 +258,12 @@ describe("index wiring — dream", () => {
 		runTaskMock.mockImplementationOnce(() => new Promise(() => {}));
 		const { pi, commands, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
+		await handlers["session_start"][0]({}, s.uiCtx());
 		createMemoryToolSpy.mockClear();
 
 		await commands["dream"].handler(
 			"",
-			uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } }),
+			s.uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } }),
 		);
 
 		expect(runTaskMock).toHaveBeenCalledTimes(1);
@@ -300,7 +273,7 @@ describe("index wiring — dream", () => {
 		await expect(
 			ports.headless.run({
 				task: "t",
-				cwd: dir,
+				cwd: s.dir,
 				model: "nope/not-resolvable",
 				builtinTools: "none",
 				memoryTool: { actions: DREAM_ACTIONS, skipLogicalLock: true, skipSnapshot: true },
