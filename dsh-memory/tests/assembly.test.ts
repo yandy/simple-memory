@@ -106,8 +106,11 @@ function memoryToolOf(fake: Fake, agentId: string) {
 }
 
 function runMemoryCommand(fake: Fake, agent: unknown, rawInput = "") {
-	expect(fake.commands).toHaveLength(1);
-	return fake.commands[0].handler({ agent, rawInput, signal: new AbortController().signal });
+	expect(fake.commands).toHaveLength(2);
+	// 按名字取：`apply` 现在同时注册 `/memory` 与 `/dream`，顺序不是契约。
+	const command = fake.commands.find((candidate) => candidate.name === "memory");
+	expect(command).toBeDefined();
+	return command?.handler({ agent, rawInput, signal: new AbortController().signal });
 }
 
 /** 宿主 `agent/pre-step` waterfall 的裁决（fake ctx 里的形状）。 */
@@ -151,11 +154,11 @@ describe("apply — 全局注册（每进程一次）", () => {
 		expect(typeof section.text).toBe("function");
 	});
 
-	it("registers the /memory command once", async () => {
+	it("registers the /memory and /dream commands once", async () => {
 		const { fake } = await setup();
 
-		expect(fake.commands.map((command) => command.name)).toEqual(["memory"]);
-		expect(fake.commands[0].description.length).toBeGreaterThan(0);
+		expect(fake.commands.map((command) => command.name)).toEqual(["memory", "dream"]);
+		for (const command of fake.commands) expect(command.description.length).toBeGreaterThan(0);
 	});
 
 	it("returns \"\" from the section text for an agent that was never prepared, and for no agent at all", async () => {
@@ -180,11 +183,17 @@ describe("apply — 全局注册（每进程一次）", () => {
 			"tools",
 			"systemPrompt",
 			"llm",
+			"agents",
 			"commands",
 			"workingDirectory",
 			"sessionQuery",
-			"logger",
 		]);
+		// 反断言：cordis 在 Context 构造器里赋**普通属性**的那几个内置名字**不是服务**，写进 `inject`
+		// 会让 fiber 永远 pending（真宿主里插件一次都不激活，而假 ctx 测不出来）。`logger` 曾经就在
+		// 这个名单里 —— 那条 bug 让 dsh 的 memory 工具在真宿主上从未存在过。
+		for (const builtin of ["logger", "events", "registry", "reflect", "fiber", "root"]) {
+			expect([...inject]).not.toContain(builtin);
+		}
 		expect(name).toBe("simple-memory");
 	});
 });
@@ -290,9 +299,9 @@ describe("apply — per-agent 生命周期", () => {
 		expect(result.text).toContain('unknown config key "bogus" — ignored');
 	});
 
-	it("tells the user in /memory when they configured a module this adapter does not implement", async () => {
-		// 白名单从 DEFAULT_CONFIG 派生，`dream` / `extractMemories` 能无声无息地通过校验却没有任何效果：
-		// 用户写了就得在状态块里看见，不能只有 README 里的一句披露。
+	it("reports dream and extractMemories as implemented modules in /memory", async () => {
+		// 本轮三个任务全部实现：配了 `dream` / `extractMemories` 的用户看到的应该是真实开关与
+		// 生效模型，而不是（旧行为的）「配了但本适配层不跑」。
 		const { fake } = await setup(
 			{},
 			rowConfig({ dream: { model: "prov/dream" }, extractMemories: { enabled: true } }),
@@ -303,17 +312,20 @@ describe("apply — per-agent 生命周期", () => {
 		const result = await runMemoryCommand(fake, agent);
 
 		expect(result.kind).toBe("success");
-		expect(result.text).toContain("dream=not implemented in this adapter");
-		expect(result.text).toContain("extractMemories=not implemented in this adapter");
+		expect(result.text).toContain("dream=on(prov/dream)");
+		// `extractMemories` 没配 model，也没配 `defaults.model`：开着的模块必须把这件事说出来。
+		expect(result.text).toContain("extractMemories=on(no model)");
+		expect(result.text).not.toContain("not implemented");
 		// 它们没配错，所以不该额外产生告警。
 		expect(result.text).not.toContain("Config:");
 
-		// 没写它们的用户看不到这两段（避免噪声）。
+		// 没写它们的用户也看得到模块行（三个任务都实现了，不再是噪声）：默认 extractMemories 关着。
 		const quiet = createFakeCtx();
 		await apply(quiet.ctx, rowConfig());
 		const quietAgent = quiet.makeAgent({ id: "s2", cwd });
 		await quiet.emitter.agentCreated(quietAgent);
 		const quietResult = await runMemoryCommand(quiet, quietAgent);
+		expect(quietResult.text).toContain("dream=on(no model), extractMemories=off");
 		expect(quietResult.text).not.toContain("not implemented in this adapter");
 	});
 
@@ -322,7 +334,7 @@ describe("apply — per-agent 生命周期", () => {
 
 		// 配置坏了不等于插件坏了：section 与命令照常注册，用户才看得见原因。
 		expect(fake.sections.map((section) => section.name)).toEqual(["memory_index"]);
-		expect(fake.commands.map((command) => command.name)).toEqual(["memory"]);
+		expect(fake.commands.map((command) => command.name)).toEqual(["memory", "dream"]);
 
 		const agent = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(agent);
@@ -366,7 +378,7 @@ describe("apply — per-agent 生命周期", () => {
 		expect(typeof dispose).toBe("function");
 		dispose();
 		expect(fake.sections).toHaveLength(1);
-		expect(fake.commands).toHaveLength(1);
+		expect(fake.commands).toHaveLength(2);
 
 		fake.disposeAll();
 		expect(fake.sections).toEqual([]);
@@ -424,7 +436,10 @@ describe("apply — 三通道文案在 memory_index section 的落点", () => {
 		const fake = createFakeCtx();
 		const ensure = vi.spyOn(fake.ctx.workingDirectory, "ensure").mockRejectedValue(new Error("ensure boom"));
 		await apply(fake.ctx, rowConfig());
-		const agent = fake.makeAgent({ id: "s1", session: { id: "s1", header: { cwd: "" } } });
+		const agent = fake.makeAgent({
+			id: "s1",
+			session: { id: "s1", header: { cwd: "" }, seq: 0, snapshotEvents: () => [] },
+		});
 		await fake.emitter.agentCreated(agent);
 
 		// 错误态也要有工具文案（工具仍然注册，只是降级），索引正文为空。
@@ -508,7 +523,7 @@ describe("apply — 启动期降级与每轮召回", () => {
 		expect(typeof dispose).toBe("function");
 
 		expect(fake.sections.map((section) => section.name)).toEqual(["memory_index"]);
-		expect(fake.commands.map((command) => command.name)).toEqual(["memory"]);
+		expect(fake.commands.map((command) => command.name)).toEqual(["memory", "dream"]);
 		expect(resolveCallConfig).toHaveBeenCalledTimes(1);
 
 		const agent = fake.makeAgent({ id: "s1", cwd });
@@ -604,5 +619,66 @@ describe("apply — 启动期降级与每轮召回", () => {
 		expect(decision.messages[0].source.kind).toBe("simple-memory");
 		expect(decision.messages[0].content[0].text).toContain("the codeword is lantern");
 		expect(decision.messages[1].content[0].text).toBe("compacted");
+	});
+});
+
+describe("apply — extract 的常驻 worker（agent/created 建、turn-stopping 用）", () => {
+	const ONE_USER_TURN = [
+		{ type: "user/message", data: { content: [{ type: "text", text: "remember X" }], source: { kind: "user" } } },
+	];
+
+	it("prepares the extract worker at session start and drives it at turn end", async () => {
+		const { fake } = await setup(
+			{
+				childRun: () => ({
+					events: [
+						{
+							type: "assistant/message",
+							data: { message: { content: [{ type: "text", text: "nothing worth saving" }] } },
+						},
+					],
+				}),
+			},
+			rowConfig({ defaults: { model: "prov/extract" }, extractMemories: { enabled: true } }),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd, events: ONE_USER_TURN });
+		await fake.emitter.agentCreated(agent);
+
+		// 子会话在**会话启动**阶段就建好（`agents.create()` 只在那个阶段能成功）。
+		expect(fake.childCreateOptions).toHaveLength(1);
+		const [options] = fake.childCreateOptions;
+		expect(options.meta).toMatchObject({ origin: "subagent", cwd: memoryDirFor(cwd) });
+		expect(options.agentOptions).toEqual({ provider: "prov", model: "extract", reasoningEffort: "high" });
+
+		// 子会话唯一的工具是作用域里的 `memory`：全局工具被 restrict 全部关掉。
+		const childRestriction = fake.restrictions.find((entry) => entry.agentId.endsWith(":child"));
+		expect(childRestriction?.filter).toEqual({ allow: [] });
+
+		// 轮次收口时只 followup，不再新建会话。
+		await fake.emitter.turnStopping({ agent });
+		await vi.waitFor(() => expect(fake.childSessions[0].messages.length).toBe(1));
+		expect(fake.childCreateOptions).toHaveLength(1);
+	});
+
+	it("creates a second worker only when the user configured a dream key", async () => {
+		const { fake } = await setup(
+			{ childRun: () => ({ events: [{ type: "assistant/message", data: { message: { content: [{ type: "text", text: "ok" }] } } }] }) },
+			rowConfig({ defaults: { model: "prov/x" }, extractMemories: { enabled: true }, dream: { model: "prov/dream" } }),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd, events: ONE_USER_TURN });
+		await fake.emitter.agentCreated(agent);
+
+		// extract（5 个 action）+ dream（7 个 action）各一个：能力面不同，不能共用一个。
+		expect(fake.childCreateOptions).toHaveLength(2);
+	});
+
+	it("creates no worker when extractMemories is off and no dream key is configured", async () => {
+		const { fake } = await setup({}, rowConfig({ defaults: { model: "prov/extract" } }));
+		const agent = fake.makeAgent({ id: "s1", cwd, events: ONE_USER_TURN });
+		await fake.emitter.agentCreated(agent);
+
+		expect(fake.childCreateOptions).toEqual([]);
+		await fake.emitter.turnStopping({ agent });
+		expect(fake.childCreateOptions).toEqual([]);
 	});
 });

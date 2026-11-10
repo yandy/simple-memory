@@ -29,7 +29,15 @@ export interface FakeAgent {
 	sessionId: string;
 	cwd: string;
 	subagent: boolean;
-	session: { id: string; header: { cwd: string } };
+	session: {
+		id: string;
+		header: { cwd: string } & Record<string, unknown>;
+		/** `agent/turn-stopping` 的 extract 触发点会同步读它（宿主 `Session` 的结构化子集）。 */
+		seq: number;
+		snapshotEvents(from?: number, to?: number): readonly { type: string; data?: unknown }[];
+	};
+	/** 这条会话的事件日志（`snapshotEvents` 的来源）。 */
+	events?: Array<{ type: string; data?: unknown }>;
 }
 
 export interface FakeCtxOptions {
@@ -41,6 +49,11 @@ export interface FakeCtxOptions {
 	/** 让 `llm.stream` yield 终止 chunk `{ type:"finish", reason:{ kind:"aborted" } }`。 */
 	llmStreamAborted?: boolean;
 	sessions?: FakeSessionInfo[];
+	/**
+	 * `ctx.agents.create()` 的行为脚本：入参是适配层传来的 create options（含 `setup`），返回这一轮
+	 * 子会话要发生什么。缺省 = 一个默认步、事件为空、什么都不抛。
+	 */
+	childRun?: (options: any) => FakeChildScript | Promise<FakeChildScript>;
 	/**
 	 * 测试专用钩子：每次假 ctx 自己拥有的注册 disposer 执行时按注册种类（"section"/"context"/"tool"/"command"）
 	 * 回调，用于钉住 `disposeAll` 的逆序执行。effect 回调返回的 disposer 是用户代码，自行记录。
@@ -80,6 +93,40 @@ export interface RecordedCommand {
 	description: string;
 	input?: unknown;
 	handler: (inv: any) => Promise<any>;
+}
+
+/**
+ * 一次嵌套子会话的剧本。每一项都对应适配层必须翻成 core 词汇的一个宿主行为
+ * （`agent-session.ts` 的结果映射表）。
+ */
+export interface FakeChildScript {
+	/** `setup` 抛错（作用域装配失败：工具注册/限制失败都会走这里）。 */
+	setupThrows?: string;
+	/** `ctx.agents.create()` 本身拒绝（会话创建失败）。 */
+	createThrows?: string;
+	/** 这一轮跑多少个 step（默认 1）。`maxTurns` 的封顶靠它观察。 */
+	steps?: number;
+	/** 子会话这一轮落进日志的事件（`assistant/message` / `turn/end` …）。 */
+	events?: Array<{ type: string; data?: unknown }>;
+	/** `whenIdle` 拒绝（驱动层的传输级失败）。 */
+	idleThrows?: string;
+}
+
+/** 子会话在测试里可观察到的状态。 */
+export interface FakeChildSession {
+	sessionId: string;
+	meta: any;
+	agentOptions: any;
+	/** 落进日志的事件系数（按 `turn/end` 收口）。 */
+	events: Array<{ type: string; data?: unknown; seq: number }>;
+	/** `followup` 收到的那条用户消息。 */
+	messages: any[];
+	/** 实际跑过的 step 数。 */
+	stepsRun: number;
+	/** 被 `cancel()` 过（参数原样记录）。 */
+	cancelCauses: unknown[];
+	/** 有没有被 `dispose()`。 */
+	disposed: boolean;
 }
 
 /** dsh-system-prompt `SECTION_ORDERS`（recon §2.3，逐字）。 */
@@ -199,6 +246,7 @@ export function createFakeCtx(
 	emitter: {
 		agentCreated(agent: FakeAgent): Promise<void>;
 		agentDisposed(agent: FakeAgent): void;
+		turnStopping(payload: { agent: FakeAgent; turn?: number }): Promise<void>;
 		preStep(payload: {
 			agent: FakeAgent;
 			messages: any[];
@@ -212,6 +260,12 @@ export function createFakeCtx(
 	cwdFor: Map<string, string>;
 	disposeAll(): void;
 	effects: Array<{ label: string }>;
+	/** 每次 `agent.ctx.tools.restrict()` 的账（`builtinTools` / 工具集的断言靠它）。 */
+	restrictions: Array<{ agentId: string; filter: { allow?: readonly string[]; deny?: readonly string[] } }>;
+	/** `ctx.agents.create()` 建出来的子会话账本。 */
+	childSessions: FakeChildSession[];
+	/** 每次 `agents.create()` 的原始 create options（模型 / cwd / origin / setup 都在里面）。 */
+	childCreateOptions: any[];
 } {
 	const sections: RecordedSection[] = [];
 	const contexts: Array<RecordedSection & { required?: boolean }> = [];
@@ -258,6 +312,12 @@ export function createFakeCtx(
 	const createdListeners: ListenerEntry[] = [];
 	const disposedListeners: ListenerEntry[] = [];
 	const preStepListeners: ListenerEntry[] = [];
+	const turnStoppingListeners: ListenerEntry[] = [];
+
+	/** 每个 agent 作用域调过的 `tools.restrict()` 过滤器（按调用顺序）。 */
+	const restrictions: Array<{ agentId: string; filter: { allow?: readonly string[]; deny?: readonly string[] } }> = [];
+	/** 每次 `ctx.agents.create()` 的子会话账本（含 create options 与运行时状态）。 */
+	const childSessions: FakeChildSession[] = [];
 
 	function on(event: string, handler: (payload: any, next?: () => Promise<any>) => any, options?: boolean | { prepend?: boolean }): () => void {
 		const prepend = options === true || (typeof options === "object" && options.prepend === true);
@@ -265,6 +325,7 @@ export function createFakeCtx(
 		if (event === "agent/created") arr = createdListeners;
 		else if (event === "agent/disposed") arr = disposedListeners;
 		else if (event === "agent/pre-step") arr = preStepListeners;
+		else if (event === "agent/turn-stopping") arr = turnStoppingListeners;
 		if (!arr) throw new Error(`fake ctx: unknown event "${event}"`);
 		const entry: ListenerEntry = { handler, prepend };
 		if (prepend) arr.unshift(entry);
@@ -351,11 +412,73 @@ export function createFakeCtx(
 					if (i >= 0) list.splice(i, 1);
 				}, "tool");
 			},
+			/**
+			 * 忠实宿主 `ToolsService.restrict()`（`dsh-tools/lib/index.js:453-468`）的两条硬约束：
+			 * - `allow` / `deny` 全缺 → 抛（空过滤器是 bug）；但 `allow: []` 合法 = 隐藏全部全局工具；
+			 * - 名字必须是**已知全局工具**，否则抛（这是适配层必须与 `definitions()` 求交集的原因）。
+			 */
+			restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void {
+				if (filter.allow === undefined && filter.deny === undefined) {
+					throw new Error("tools.restrict({}) is a no-op: pass `allow` and/or `deny`");
+				}
+				const named = [...(filter.allow ?? []), ...(filter.deny ?? [])];
+				if (named.includes("run_code")) throw new Error('tools.restrict() cannot name reserved "run_code"');
+				const known = new Set(tools.keys());
+				const unknown = named.filter((name) => !known.has(name));
+				if (unknown.length > 0) {
+					throw new Error(`tools.restrict() names unknown global tool${unknown.length > 1 ? "s" : ""} ${unknown.map((n) => `"${n}"`).join(", ")}`);
+				}
+				restrictions.push({ agentId, filter });
+				return registerDisposer(() => {});
+			},
+			/** 全局视图（不传 scope）：宿主 `definitions()` 的无参形式。 */
+			definitions(): readonly RecordedTool[] {
+				return [...tools.values()];
+			},
 		};
+	}
+
+	/** dsh-commands 的 `COMMAND_NAME`：不许带斜杠、不许大写。 */
+	const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/;
+
+	/**
+	 * 忠实宿主 `normalizeDefinition`（`dsh-commands/lib/index.js:145-164`）。
+	 *
+	 * 这几条不是装饰：`register()` 抛错 → `apply` 抛错 → cordis 回滚**整个 bundle** 的注册（索引段、
+	 * 命令、工具全部消失）。假宿主曾经只查重名，于是一个 `input: { hint: "" }`（宿主会拒）在本地
+	 * 全绿、装进真宿主后却让整个记忆插件「根本不存在」。
+	 */
+	function validateCommandDefinition(definition: any): void {
+		const name = definition?.name;
+		if (typeof name !== "string" || !COMMAND_NAME.test(name)) {
+			throw new TypeError(`command name "${String(name)}" must match ${String(COMMAND_NAME)}`);
+		}
+		if (typeof definition.description !== "string") {
+			throw new TypeError(`command "${name}" description must be a string`);
+		}
+		if (definition.description.trim().length === 0) {
+			throw new TypeError(`command "${name}" description must not be empty`);
+		}
+		if (typeof definition.handler !== "function") {
+			throw new TypeError(`command "${name}" handler must be a function`);
+		}
+		const rawInput = definition.input;
+		if (rawInput !== undefined) {
+			if (typeof rawInput !== "object" || rawInput === null || !("hint" in rawInput) || typeof rawInput.hint !== "string") {
+				throw new TypeError(`command "${name}" input hint must be a string`);
+			}
+			if (rawInput.hint.trim().length === 0) {
+				throw new TypeError(`command "${name}" input hint must not be empty`);
+			}
+			if ("attachments" in rawInput && rawInput.attachments !== undefined && typeof rawInput.attachments !== "boolean") {
+				throw new TypeError(`command "${name}" input attachments flag must be a boolean`);
+			}
+		}
 	}
 
 	const commandsService = {
 		register(definition: any): () => void {
+			validateCommandDefinition(definition);
 			const rec: RecordedCommand = { ...definition };
 			if (commands.some((c) => c.name === rec.name)) {
 				throw new Error(`command "${rec.name}" is already registered`);
@@ -507,6 +630,148 @@ export function createFakeCtx(
 		debug: logMethod("debug"),
 	};
 
+	/**
+	 * 宿主 `ctx.agents.create()` 的最小忠实实现：
+	 *
+	 * - 先 `await setup(childCtx, childAgent)`（**未发布**的 agent 作用域）—— 抛错 = 创建失败；
+	 * - 返回 `{ agent, dispose }`；`followup()` 启动这一轮（按剧本走子会话的 `agent/pre-step`
+	 *   waterfall，被 `reject` 就收口），`whenIdle()` await 它，`cancel()` 只记账；
+	 * - `session.snapshotEvents()` 返回日志切片，`seq` 随事件递增（适配层据此取最终文本）。
+	 *
+	 * `childRun.hang` 模拟「永不收敛的模型调用」：只有 `timeoutMs` 真的能打断它，适配层的超时
+	 * 路径才被证明是活的（甲则 `whenIdle()` 会一直挂着）。
+	 */
+	const agents = {
+		async create(options: any): Promise<any> {
+			childCreateOptions.push(options);
+			const script: FakeChildScript & { hang?: boolean } = (await opts.childRun?.(options)) ?? {};
+			if (script.createThrows !== undefined) throw new Error(script.createThrows);
+
+			const sessionId = String(options.sessionId);
+			const state: FakeChildSession = {
+				sessionId,
+				meta: options.meta,
+				agentOptions: options.agentOptions,
+				events: [],
+				messages: [],
+				stepsRun: 0,
+				cancelCauses: [],
+				disposed: false,
+			};
+			childSessions.push(state);
+
+			const childPreStep: ListenerEntry[] = [];
+			/** 子作用域的 `session/event` 监听器：适配层靠 `turn/end` 判断这一轮收口。 */
+			const childSessionListeners: Array<(session: unknown, event: unknown) => unknown> = [];
+			const childErrorListeners: Array<(payload: unknown) => unknown> = [];
+			const childCtx = {
+				tools: makeAgentToolsService(`${sessionId}:child`),
+				on(event: string, handler: ListenerEntry["handler"], optionsArg?: unknown): () => void {
+					if (event === "agent/pre-step") {
+						const prepend =
+							optionsArg === true ||
+							(typeof optionsArg === "object" && (optionsArg as { prepend?: boolean })?.prepend === true);
+						const entry: ListenerEntry = { handler, prepend };
+						if (prepend) childPreStep.unshift(entry);
+						else childPreStep.push(entry);
+						return () => {
+							const i = childPreStep.indexOf(entry);
+							if (i >= 0) childPreStep.splice(i, 1);
+						};
+					}
+					const arr = event === "session/event" ? childSessionListeners : event === "agent/error" ? childErrorListeners : null;
+					if (arr === null) throw new Error(`fake ctx: child scope does not emit "${event}"`);
+					const listener = handler as unknown as (a: unknown, b?: unknown) => unknown;
+					arr.push(listener);
+					return () => {
+						const i = arr.indexOf(listener);
+						if (i >= 0) arr.splice(i, 1);
+					};
+				},
+			};
+
+			let pending: Promise<void> | undefined;
+			let settled = false;
+			const child: any = {
+				session: {
+					id: sessionId,
+					header: {
+						cwd: options.meta?.cwd,
+						origin: options.meta?.origin ?? "subagent",
+						delegationDepth: options.meta?.delegationDepth ?? 1,
+					},
+					get seq(): number {
+						return state.events.length;
+					},
+					snapshotEvents(from = 0, to = state.events.length): unknown[] {
+						return state.events.slice(from, to);
+					},
+				},
+				followup(message: any): void {
+					state.messages.push(message);
+					pending = runTurn();
+				},
+				/** 宿主 `Agent.status`：适配层的收敛判定会读它（见 `waitForIdle`）。 */
+				get status(): string {
+					return settled ? "idle" : "running";
+				},
+				whenIdle(): Promise<void> {
+					return (pending ?? Promise.resolve()).then(() => {
+						settled = true;
+					});
+				},
+				cancel(cause: unknown): void {
+					state.cancelCauses.push(cause);
+				},
+			};
+
+			async function runTurn(): Promise<void> {
+				// 被 cancel 过就不再走 step（忠实效地：取消后这一轮应该收口）。
+				const totalSteps = script.steps ?? 1;
+				for (let step = 1; step <= totalSteps; step++) {
+					if (state.cancelCauses.length > 0) break;
+					const decision = await runWaterfall(
+						childPreStep,
+						{ agent: child, turn: 1, step, signal: new AbortController().signal },
+						{ kind: "enter", messages: [] },
+					);
+					if (decision?.kind === "reject") break;
+					state.stepsRun += 1;
+				}
+				// 忠实效地：一轮总以 `turn/end` 收口（`hang` 这种病态剧本除外），并且宿主对每个 append
+				// 都发一次 `session/event` ���— 适配层的收敛判据就是它。
+				const scripted = script.events ?? [];
+				const closesTurn = scripted.some((event) => event.type === "turn/end");
+				const toAppend: Array<{ type: string; data?: unknown }> =
+					script.hang === true || closesTurn
+						? scripted
+						: [...scripted, { type: "turn/end", data: { reason: { kind: "completed" } } }];
+				for (const event of toAppend) {
+					const appended = { ...event, seq: state.events.length };
+					state.events.push(appended);
+					for (const listener of childSessionListeners) await listener(child.session, appended);
+				}
+				if (script.hang === true) await new Promise<void>(() => {});
+				if (script.idleThrows !== undefined) throw new Error(script.idleThrows);
+			}
+
+			try {
+				options.setup?.(childCtx, child);
+			} catch (e) {
+				throw script.setupThrows !== undefined ? new Error(script.setupThrows) : e;
+			}
+
+			return {
+				agent: child,
+				dispose: async (): Promise<void> => {
+					state.disposed = true;
+				},
+			};
+		},
+	};
+	/** 每次 `agents.create()` 的原始 options（断言模型 / cwd / origin 用）。 */
+	const childCreateOptions: any[] = [];
+
 	function effect(fn: () => any, label?: string): void {
 		effects.push({ label: label ?? "" });
 		addEffectResult(fn());
@@ -539,6 +804,7 @@ export function createFakeCtx(
 			tools: makeAgentToolsService(agent.id),
 			commands: commandsService,
 			llm,
+			agents,
 			workingDirectory,
 			sessionQuery,
 			logger,
@@ -553,6 +819,7 @@ export function createFakeCtx(
 		const cwd = over.cwd ?? "/fake/workspace";
 		const subagent = over.subagent ?? false;
 		const fork = over.fork ?? false;
+		const events = over.events ?? [];
 		const session = over.session ?? {
 			id,
 			header: {
@@ -563,12 +830,15 @@ export function createFakeCtx(
 						? { parentSession: "session-parent-fake" }
 						: {}),
 			},
+			seq: events.length,
+			snapshotEvents: (from = 0, to = events.length) => events.slice(from, to),
 		};
 		const agent: any = {
 			id,
 			sessionId: over.sessionId ?? id,
 			cwd,
 			subagent,
+			events,
 			session,
 			...over,
 		};
@@ -588,9 +858,17 @@ export function createFakeCtx(
 		for (const { handler } of disposedListeners.slice()) handler({ agent });
 	}
 
+	/** 触发 `agent/turn-stopping`（串行、被 await）：适配层的 extract 触发点。 */
+	async function turnStopping(payload: { agent: FakeAgent; turn?: number }): Promise<void> {
+		for (const { handler } of turnStoppingListeners.slice()) {
+			await handler({ turn: payload.turn ?? 1, signal: new AbortController().signal, ...payload });
+		}
+	}
+
 	const emitter = {
 		agentCreated,
 		agentDisposed,
+		turnStopping,
 		preStep(payload: {
 			agent: FakeAgent;
 			messages: any[];
@@ -608,6 +886,7 @@ export function createFakeCtx(
 		tools: makeGlobalToolsService(),
 		commands: commandsService,
 		llm,
+		agents,
 		workingDirectory,
 		sessionQuery,
 		logger,
@@ -627,5 +906,8 @@ export function createFakeCtx(
 		cwdFor,
 		disposeAll,
 		effects,
+		restrictions,
+		childSessions,
+		childCreateOptions,
 	};
 }
