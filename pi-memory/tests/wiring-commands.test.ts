@@ -77,6 +77,7 @@ describe("index wiring — /memory", () => {
 		expect(notify.mock.calls[0][0]).not.toContain("pre-3.0");
 	});
 
+	// 探测失败不得吃掉状态块：`/memory` 的交付物是状态，提示只是附加。
 	it("/memory still prints the status block when the detector throws", async () => {
 		detectLegacyMemoryDirMock.mockRejectedValueOnce(new Error("git exploded"));
 		const notify = vi.fn();
@@ -132,6 +133,8 @@ describe("index wiring — /memory", () => {
 		expect(lines[6]).toBe(`Lock: held by dream (pid ${process.pid} on h, started 2026-10-02T01:02:03.000Z)`);
 	});
 
+	// 本次移除的回归钉子（spec §5「新增」）：memory.json 里残留的 `enabled: false` 只是被忽略 ——
+	// 会话照常初始化、零通知（决策：不做运行时迁移提示），`/memory` 照常报 7 行健康态。
 	it("ignores a leftover enabled key instead of treating it as disabled", async () => {
 		// 共享 fixture 上临时放一个已移除的键（模拟 memory.json 里的残留）。必须在 finally 里删掉：
 		// 留着它会让后续用例带着脏 fixture 跑（用例顺序依赖）。
@@ -295,6 +298,7 @@ describe("index wiring — /memory", () => {
 		expect(notify).toHaveBeenCalledWith("Memory not initialized.", "info");
 	});
 
+	// Review Focus #5：删锁必须显式确认，而且只删 `.lock`。
 	it("/memory unlock removes only the lock file, after an explicit confirm", async () => {
 		const notify = vi.fn();
 		const confirm = vi.fn().mockResolvedValue(true);
@@ -320,6 +324,8 @@ describe("index wiring — /memory", () => {
 		expect(notify).toHaveBeenCalledWith("Memory lock removed.", "info");
 	});
 
+	// Plan E/next #1：`unlock` 不需要 store，但**解析目录本身**也可能失败（HOME 不可写、
+	// git 探测炸了）。失败必须变成一条 error 通知与干净返回，不能冒泡成 handler 抛错。
 	it("/memory unlock reports an unresolvable memory dir instead of throwing", async () => {
 		breakModelConfig();
 		const notify = vi.fn();
@@ -386,6 +392,9 @@ describe("index wiring — /memory", () => {
 		expect(await readdir(join(dir, ".lock"))).toContain("inner");
 	});
 
+	// ── Plan D（D1）：配置错误启动的会话状态（unlock / 状态行）与跨 session 复位 ──────
+	// Review Focus #5 / spec §19：`unlock` 只需要目录、不需要 store —— 以**配置错误**启动的
+	// 会话也必须能清掉崩溃遗留的 `.lock`（R50：否则唯一的人工恢复入口本 session 不可达）。
 	it("/memory unlock removes the lock in a session that booted misconfigured", async () => {
 		breakModelConfig();
 		const notify = vi.fn();

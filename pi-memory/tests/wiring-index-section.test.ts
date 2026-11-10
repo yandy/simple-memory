@@ -60,6 +60,8 @@ describe("index wiring — memory_index section", () => {
 		expect(result?.systemPrompt).toBeUndefined();
 	});
 
+	// 端到端钉住「session_start 用的是**注入**口径」：一行 swap 就会落在写入口径（200/25600）上，
+	// 那时 60 条索引会整份注入，下面的 50 条断言就会红。
 	it("injects only the newest 50 lines of a long index at session_start", async () => {
 		const entries = Array.from({ length: 60 }, (_, i) => `- [M${i}](m${i}.md) — d${i}`);
 		await writeFile(join(dir, "MEMORY.md"), `# Memory Index\n\n${entries.join("\n")}\n`, "utf8");
@@ -77,6 +79,7 @@ describe("index wiring — memory_index section", () => {
 		expect(section).not.toContain("- [M9](m9.md)");
 	});
 
+	// compaction 是会话内唯一的刷新点：那里也必须用注入口径（同一个窗口核心）。
 	it("re-reads the same inject window at session_compact", async () => {
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -94,6 +97,8 @@ describe("index wiring — memory_index section", () => {
 		expect((section.match(/^- \[/gm) ?? []).length).toBe(50);
 	});
 
+	// Review Focus #1：省略该键 = pi 生成 { memory_index: null } = 索引被静默删除。
+	// 三种「用录制值」的 reason 也必须每轮把键写回去。
 	it("sets the section for every session_start reason", async () => {
 		for (const reason of ["startup", "new", "resume", "fork", "reload", undefined]) {
 			const { pi, handlers } = createFakePi();
@@ -141,6 +146,9 @@ describe("index wiring — memory_index section", () => {
 		}
 	});
 
+	// Finding 1 / R42：0.99.2 宿主把每个 non-preamble section 渲染成
+	// `<memory_index>\n<裸值>\n</memory_index>` 后才写进 transcript，重放拿到的是**带标签**的值。
+	// 端到端保真 = 冻结值等于原始裸串，且宿主再渲染一次逐字节等于录制值（不产生新 patch）。
 	it("freezes the bare recorded index after resume and never produces a new patch", async () => {
 		const raw = "- [SSH](ssh.md) — staging ssh config\n";
 		const recorded = `<memory_index>\n${raw}\n</memory_index>`;
@@ -178,6 +186,7 @@ describe("index wiring — memory_index section", () => {
 		expect(second.systemPromptOptions.sections["memory_index"]).toBe(frozen);
 	});
 
+	// Review Focus #3：重放拿不到录制值 → 回退磁盘，而不是把索引丢掉。
 	it("falls back to the disk index when no recorded value is available", async () => {
 		readRecordedMemoryIndexMock.mockReturnValue(null);
 		const { pi, handlers } = createFakePi();
@@ -217,6 +226,7 @@ describe("index wiring — memory_index section", () => {
 		expect(result?.systemPrompt).toBeUndefined();
 	});
 
+	// D14：compaction 是唯一的会话内刷新点，同时清空已注入集合。
 	it("session_compact re-reads the index from disk and clears injectedFiles", async () => {
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);

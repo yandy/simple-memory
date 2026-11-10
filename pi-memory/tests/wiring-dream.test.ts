@@ -42,6 +42,7 @@ describe("index wiring — dream", () => {
 		dirOverrideRef.current = null;
 	});
 
+	// ── Review 修复轮（R47/R48/R49）：dream 两条链的 ctx 快照 / 定时器 / section 时机 ──
 	it("settles the nudge dream without touching a disposed ctx", async () => {
 		shouldNudgeMock.mockResolvedValue({ nudge: true, message: "💡 dream", sessions: 7, newEntries: 7 });
 		let resolveDream: ((summary: string) => void) | undefined;
@@ -70,6 +71,8 @@ describe("index wiring — dream", () => {
 		expect(session.notify).toHaveBeenCalledWith("consolidated", "info");
 	});
 
+	// Plan E/next #11：nudge 链的失败分支也要盖到 —— rejected 的值不一定是 Error
+	//（pi 的模型层可能抛字符串），`dreamFailureMessage` 必须用 `String(e)` 渲染。
 	it("renders a non-Error nudge dream failure with String(e)", async () => {
 		shouldNudgeMock.mockResolvedValue({ nudge: true, message: "💡 dream", sessions: 7, newEntries: 7 });
 		let rejectDream: ((reason?: unknown) => void) | undefined;
@@ -151,6 +154,8 @@ describe("index wiring — dream", () => {
 		expect(session.notify).toHaveBeenCalledWith("Dream failed: model exploded", "error");
 	});
 
+	// Plan E/next #11：success 分支里的 `writeDreamMeta` 自己抛错时，不能只走成功通知，
+	// 也不能变成无人接管的 rejection（它已被 `track` 登记，但 `.finally` 不会接住）。
 	it("/dream reports a failing writeDreamMeta instead of a success notification", async () => {
 		writeDreamMetaMock.mockRejectedValueOnce(new Error("meta write failed"));
 		const notify = vi.fn();
@@ -227,6 +232,8 @@ describe("index wiring — dream", () => {
 		expect(runTaskMock).not.toHaveBeenCalled();
 	});
 
+	// `runTask` 是 async：缺模型不会在调用点同步抛，而是作为 rejection 走 `/dream` 的两参
+	// `.then` 失败分支（报「Dream failed」），状态行由 `.finally` 兜底清除 —— 处理器本身照常 resolve。
 	it("/dream does not leave the dream status behind when the model disappeared mid-session", async () => {
 		const setStatus = vi.fn();
 		const notify = vi.fn();
@@ -267,6 +274,11 @@ describe("index wiring — dream", () => {
 		expect(typeof runTaskMock.mock.calls[0][2].ports.headless.run).toBe("function");
 	});
 
+	// ── Plan C（spec §14 `/memory` 状态与 `/memory unlock`）─────────────────
+	// D12 的注册范围是硬约束：dream 必须拿到 7 个 action（含 rename / rebuild_index），extract
+	// 必须只拿到 5 个。core 钉「它请求了哪些 action」，pi 钉「toHeadlessToolOptions 会调
+	// buildMemoryTool(spec)」—— 中间这条 `buildMemoryTool: (spec) => createMemoryTool(toolDeps, spec)`
+	// 的闭包以前没人钉：把 spec 参数丢掉，全部套件照样绿，而 dream 会静默失去重构索引的能力。
 	it("the dream port forwards the seven-action spec into createMemoryTool", async () => {
 		// `/dream` 先要一次 confirm；再让 runTask 永不 resolve —— 本用例只观察端口闭包，
 		// 不放成功回调出去（它会 `await SessionManager.list(cwd)`，那会碰真实 ~/.pi）。

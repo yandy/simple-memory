@@ -97,6 +97,9 @@ describe("index wiring — session_start", () => {
 		expect(index).toContain("- [Use real DB in tests](Use-real-DB-in-tests.md) — 不要 mock");
 	});
 
+	// per-session 去重（v3 设计：集合在 session_start 时初始化）：每次 session_start 都必须把
+	// 上一 session 的 injectedFiles 清掉，否则新会话里同一条 entry 会因旧集合而被静默压掉。
+	// 这一条用 healthy → 配置错误 → healthy 三次启动钉住它（去掉 clear 就会第二次观测到 ssh.md）。
 	it("clears the injected-file set on every session_start", async () => {
 		const injectedAtCall: Array<Set<string>> = [];
 		scanEntriesMock.mockResolvedValue([

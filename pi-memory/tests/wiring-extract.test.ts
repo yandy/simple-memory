@@ -95,6 +95,7 @@ describe("index wiring — agent_end / extract", () => {
 		expect(notify).toHaveBeenCalledWith("Extracted 1 memory.", "info");
 	});
 
+	// Review Focus #4：没写东西就不该弹通知；被锁跳过也不该弹。
 	it("agent_end stays quiet when extract wrote nothing or was skipped", async () => {
 		mockConfigValue.extractMemories.enabled = true;
 		const notify = vi.fn();
