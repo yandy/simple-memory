@@ -150,56 +150,49 @@ describe("index wiring — config errors", () => {
 	});
 
 
-	it("reports a configured but unresolvable model", async () => {
-		mockConfigValue.dream.model = "nope/nope";
-		const notify = vi.fn();
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
+	it("reports a configured model that cannot be resolved", async () => {
+		// 三种形状都必须落进同一个配置错误态：未知 id、模型存在但没凭据、有别的可用模型时精确匹配失败。
+		const rows = [
+			{
+				name: "unknown id",
+				dreamModel: "nope/nope" as string | undefined,
+				registry: fakeRegistry(["test/model"]),
+				check: (text: string, row: string) =>
+					expect(text, row).toBe(
+						'pi-memory config error:\n- model "nope/nope" for dream is not resolvable (unknown id or missing credentials)',
+					),
+			},
+			{
+				name: "no credentials (nothing available)",
+				dreamModel: undefined,
+				// getAll 认得 test/model，getAvailable 里没有它 = 模型存在但没凭据
+				registry: fakeRegistry(["test/model"], []),
+				check: (text: string, row: string) =>
+					expect(text, row).toContain('model "test/model" for dream is not resolvable'),
+			},
+			{
+				name: "getAll but not getAvailable while other models are available",
+				dreamModel: undefined,
+				registry: fakeRegistry(["test/model", "other/thing"], ["other/thing"]),
+				check: (text: string, row: string) =>
+					expect(text, row).toContain(
+						'model "test/model" for dream is not resolvable (unknown id or missing credentials)',
+					),
+			},
+		];
 
-		await handlers["session_start"][0]({}, uiCtx(uiWith(notify)));
+		for (const row of rows) {
+			mockConfigValue.dream.model = row.dreamModel;
+			const notify = vi.fn();
+			const { pi, tools, handlers } = createFakePi();
+			memoryFactory(pi as any);
 
-		expect(tools).toHaveLength(0);
-		expect(notify.mock.calls[0][1]).toBe("error");
-		expect(notify.mock.calls[0][0]).toBe(
-			'pi-memory config error:\n- model "nope/nope" for dream is not resolvable (unknown id or missing credentials)',
-		);
-	});
+			await handlers["session_start"][0]({}, uiCtx({ ...uiWith(notify), modelRegistry: row.registry }));
 
-
-	it("reports a configured model that the registry cannot see (no credentials)", async () => {
-		const notify = vi.fn();
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
-
-		// getAll 认得 test/model，getAvailable 里没有它 = 模型存在但没凭据
-		await handlers["session_start"][0](
-			{},
-			uiCtx({ ...uiWith(notify), modelRegistry: fakeRegistry(["test/model"], []) }),
-		);
-
-		expect(tools).toHaveLength(0);
-		expect(notify.mock.calls[0][1]).toBe("error");
-		expect(notify.mock.calls[0][0]).toContain('model "test/model" for dream is not resolvable');
-	});
-
-
-	// 上一条走的是 resolveModel 的「一个可用模型都没有」早退；这一条让 getAvailable 非空，
-	// 真正走到「精确匹配只认 available 集合 → 模糊匹配也匹不上」那条路径（同样是 missing credentials）。
-	it("reports a model that is in getAll but not in getAvailable while other models are available", async () => {
-		const notify = vi.fn();
-		const { pi, tools, handlers } = createFakePi();
-		memoryFactory(pi as any);
-
-		await handlers["session_start"][0](
-			{},
-			uiCtx({ ...uiWith(notify), modelRegistry: fakeRegistry(["test/model", "other/thing"], ["other/thing"]) }),
-		);
-
-		expect(tools).toHaveLength(0);
-		expect(notify.mock.calls[0][1]).toBe("error");
-		expect(notify.mock.calls[0][0]).toContain(
-			'model "test/model" for dream is not resolvable (unknown id or missing credentials)',
-		);
+			expect(tools, row.name).toHaveLength(0);
+			expect(notify.mock.calls[0][1], row.name).toBe("error");
+			row.check(notify.mock.calls[0][0], row.name);
+		}
 	});
 
 
@@ -367,7 +360,6 @@ describe("index wiring — config errors", () => {
 		expect(notify).toHaveBeenCalledTimes(1);
 		expect(notify.mock.calls[0][1]).toBe("info");
 		expect(notify.mock.calls[0][0].split("\n")[0]).toBe(`Dir: ${dir}`);
-		expect(notify.mock.calls[0][0]).toContain(`Dir: ${dir}`);
 		notify.mockClear();
 
 		// ② 用户删掉模型配置后重启：misconfigured，且不得沿用上一 session 的目录

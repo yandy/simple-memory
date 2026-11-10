@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { breakModelConfig, createFakePi, DISK_INDEX, detectLegacyMemoryDirMock, dirOverrideRef, dirRef, fakeRegistry, LEGACY_TOPIC, mockConfigValue, readDreamMetaMock, resetWiringMocks, scanEntriesMock, uiCtx, uiWith } from "./helpers/wiring-harness";
+import { breakModelConfig, createFakePi, restoreModelConfig, DISK_INDEX, detectLegacyMemoryDirMock, dirOverrideRef, dirRef, fakeRegistry, LEGACY_TOPIC, mockConfigValue, readDreamMetaMock, resetWiringMocks, scanEntriesMock, uiCtx, uiWith } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 
 describe("index wiring — /memory", () => {
@@ -64,32 +64,25 @@ describe("index wiring — /memory", () => {
 		expect(detectLegacyMemoryDirMock.mock.calls[0][0].newRoot).toBe(dir);
 	});
 
-	it("/memory prints no hint once the detector reports nothing", async () => {
+	it("/memory prints the 7-line status block with no hint when the detector finds nothing or throws", async () => {
+		const notify = vi.fn();
+		const { pi, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		// 阶段一：探测器报告「没有旧数据」
 		detectLegacyMemoryDirMock.mockResolvedValueOnce(null);
-		const notify = vi.fn();
-		const { pi, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-
 		await commands["memory"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
-
-		expect(notify.mock.calls[0][0].split("\n")).toHaveLength(7);
-		expect(notify.mock.calls[0][0]).not.toContain("pre-3.0");
-	});
-
-	// 探测失败不得吃掉状态块：`/memory` 的交付物是状态，提示只是附加。
-	it("/memory still prints the status block when the detector throws", async () => {
-		detectLegacyMemoryDirMock.mockRejectedValueOnce(new Error("git exploded"));
-		const notify = vi.fn();
-		const { pi, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-
-		await commands["memory"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
-
 		expect(notify).toHaveBeenCalledTimes(1);
 		expect(notify.mock.calls[0][0].split("\n")).toHaveLength(7);
-		expect(notify.mock.calls[0][0]).toMatch(/^Dir: /);
+		expect(notify.mock.calls[0][0]).not.toContain("pre-3.0");
+
+		// 阶段二：探测本身抛错 —— 提示不可用，但状态块（这个命令的交付物）必须照出
+		detectLegacyMemoryDirMock.mockRejectedValueOnce(new Error("git exploded"));
+		await commands["memory"].handler("", uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
+		expect(notify).toHaveBeenCalledTimes(2);
+		expect(notify.mock.calls[1][0].split("\n")).toHaveLength(7);
+		expect(notify.mock.calls[1][0]).toMatch(/^Dir: /);
 	});
 
 	it("/memory prints the whole status block", async () => {
@@ -149,9 +142,10 @@ describe("index wiring — /memory", () => {
 			expect(notify).not.toHaveBeenCalled();
 			expect(tools).toHaveLength(1);
 
+			// 只钉这个用例真正要钉的事（残留的 `enabled` 键不被当成开关）；状态块本身由
+			// `/memory prints the whole status block` 逐行钉住，这里不重复。
 			await commands["memory"].handler("", uiCtx(uiWith(notify)));
 			const lines = notify.mock.calls[0][0].split("\n");
-			expect(lines).toHaveLength(7);
 			expect(lines[0]).toBe(`Dir: ${dir}`);
 		} finally {
 			delete (mockConfigValue as Record<string, any>).enabled;
@@ -300,28 +294,34 @@ describe("index wiring — /memory", () => {
 
 	// Review Focus #5：删锁必须显式确认，而且只删 `.lock`。
 	it("/memory unlock removes only the lock file, after an explicit confirm", async () => {
-		const notify = vi.fn();
-		const confirm = vi.fn().mockResolvedValue(true);
-		const { pi, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await writeFile(
-			join(dir, ".lock"),
-			JSON.stringify({ pid: process.pid, hostname: "h", startedAt: "2026-10-02T01:02:03.000Z", op: "dream" }),
-			"utf8",
-		);
-		await writeFile(join(dir, "keep.md"), "not a lock", "utf8");
+		// 配置错误启动的会话也必须能清锁：`unlock` 只需要目录、不需要 store（spec §19 / R50）。
+		for (const boot of ["healthy", "misconfigured"] as const) {
+			if (boot === "misconfigured") breakModelConfig();
+			else restoreModelConfig();
+			const notify = vi.fn();
+			const confirm = vi.fn().mockResolvedValue(true);
+			const { pi, commands, handlers } = createFakePi();
+			memoryFactory(pi as any);
+			await handlers["session_start"][0]({}, uiCtx());
+			await writeFile(
+				join(dir, ".lock"),
+				JSON.stringify({ pid: process.pid, hostname: "h", startedAt: "2026-10-02T01:02:03.000Z", op: "dream" }),
+				"utf8",
+			);
+			await writeFile(join(dir, "keep.md"), "not a lock", "utf8");
 
-		await commands["memory"].handler("unlock", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
+			await commands["memory"].handler("unlock", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
 
-		// held 的锁：confirm 正文必须点名持有者（op / pid / hostname / startedAt）
-		expect(confirm).toHaveBeenCalledWith(
-			"Memory lock",
-			`Remove the memory lock file? It is held by dream (pid ${process.pid} on h, started 2026-10-02T01:02:03.000Z). Only do this if no memory operation is running.`,
-		);
-		expect(await readdir(dir)).not.toContain(".lock");
-		expect(await readdir(dir)).toContain("keep.md");
-		expect(notify).toHaveBeenCalledWith("Memory lock removed.", "info");
+			// held 的锁：confirm 正文必须点名持有者（op / pid / hostname / startedAt）
+			expect(confirm, boot).toHaveBeenCalledWith(
+				"Memory lock",
+				`Remove the memory lock file? It is held by dream (pid ${process.pid} on h, started 2026-10-02T01:02:03.000Z). Only do this if no memory operation is running.`,
+			);
+			expect(await readdir(dir), boot).not.toContain(".lock");
+			expect(await readdir(dir), boot).toContain("keep.md");
+			expect(notify, boot).toHaveBeenCalledWith("Memory lock removed.", "info");
+		}
+		restoreModelConfig();
 	});
 
 	// Plan E/next #1：`unlock` 不需要 store，但**解析目录本身**也可能失败（HOME 不可写、
@@ -343,21 +343,30 @@ describe("index wiring — /memory", () => {
 	});
 
 	it("/memory unlock leaves the lock alone when the user declines", async () => {
-		const notify = vi.fn();
-		const confirm = vi.fn().mockResolvedValue(false);
-		const { pi, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await writeFile(join(dir, ".lock"), JSON.stringify({ pid: process.pid, hostname: "h", startedAt: "x", op: "dream" }), "utf8");
+		for (const boot of ["healthy", "misconfigured"] as const) {
+			if (boot === "misconfigured") breakModelConfig();
+			else restoreModelConfig();
+			const notify = vi.fn();
+			const confirm = vi.fn().mockResolvedValue(false);
+			const { pi, commands, handlers } = createFakePi();
+			memoryFactory(pi as any);
+			await handlers["session_start"][0]({}, uiCtx());
+			await writeFile(
+				join(dir, ".lock"),
+				JSON.stringify({ pid: process.pid, hostname: "h", startedAt: "x", op: "dream" }),
+				"utf8",
+			);
 
-		await commands["memory"].handler("unlock", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
+			await commands["memory"].handler("unlock", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
 
-		// 取消路径也必须先把持有者摆到用户面前（否则“要不要删”无从判断）
-		expect(confirm).toHaveBeenCalledTimes(1);
-		expect(confirm.mock.calls[0][0]).toBe("Memory lock");
-		expect(confirm.mock.calls[0][1]).toContain(`held by dream (pid ${process.pid} on h, started x)`);
-		expect(await readdir(dir)).toContain(".lock");
-		expect(notify).not.toHaveBeenCalled();
+			// 取消路径也必须先把持有者摆到用户面前（否则“要不要删”无从判断）
+			expect(confirm, boot).toHaveBeenCalledTimes(1);
+			expect(confirm.mock.calls[0][0], boot).toBe("Memory lock");
+			expect(confirm.mock.calls[0][1], boot).toContain(`held by dream (pid ${process.pid} on h, started x)`);
+			expect(await readdir(dir), boot).toContain(".lock");
+			expect(notify, boot).not.toHaveBeenCalled();
+		}
+		restoreModelConfig();
 	});
 
 	it("/memory unlock does not even ask when there is no lock", async () => {
@@ -395,48 +404,4 @@ describe("index wiring — /memory", () => {
 	// ── Plan D（D1）：配置错误启动的会话状态（unlock / 状态行）与跨 session 复位 ──────
 	// Review Focus #5 / spec §19：`unlock` 只需要目录、不需要 store —— 以**配置错误**启动的
 	// 会话也必须能清掉崩溃遗留的 `.lock`（R50：否则唯一的人工恢复入口本 session 不可达）。
-	it("/memory unlock removes the lock in a session that booted misconfigured", async () => {
-		breakModelConfig();
-		const notify = vi.fn();
-		const confirm = vi.fn().mockResolvedValue(true);
-		const { pi, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await writeFile(
-			join(dir, ".lock"),
-			JSON.stringify({ pid: process.pid, hostname: "h", startedAt: "2026-10-02T01:02:03.000Z", op: "dream" }),
-			"utf8",
-		);
-		await writeFile(join(dir, "keep.md"), "not a lock", "utf8");
-
-		await commands["memory"].handler("unlock", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
-
-		expect(confirm).toHaveBeenCalledWith(
-			"Memory lock",
-			`Remove the memory lock file? It is held by dream (pid ${process.pid} on h, started 2026-10-02T01:02:03.000Z). Only do this if no memory operation is running.`,
-		);
-		expect(await readdir(dir)).not.toContain(".lock");
-		expect(await readdir(dir)).toContain("keep.md");
-		expect(notify).toHaveBeenCalledWith("Memory lock removed.", "info");
-	});
-
-	it("/memory unlock still asks first when the session booted misconfigured", async () => {
-		breakModelConfig();
-		const notify = vi.fn();
-		const confirm = vi.fn().mockResolvedValue(false);
-		const { pi, commands, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, uiCtx());
-		await writeFile(
-			join(dir, ".lock"),
-			JSON.stringify({ pid: process.pid, hostname: "h", startedAt: "x", op: "dream" }),
-			"utf8",
-		);
-
-		await commands["memory"].handler("unlock", uiCtx({ hasUI: true, ui: { notify, confirm, setStatus: vi.fn() } }));
-
-		expect(confirm).toHaveBeenCalledTimes(1);
-		expect(await readdir(dir)).toContain(".lock");
-		expect(notify).not.toHaveBeenCalled();
-	});
 });
