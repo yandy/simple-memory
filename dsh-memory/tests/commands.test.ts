@@ -96,8 +96,9 @@ describe("createMemoryCommand definition", () => {
 		expect(cmd.name).toMatch(/^[a-z][a-z0-9_-]*$/);
 		expect(typeof cmd.description).toBe("string");
 		expect(cmd.description.length).toBeGreaterThan(0);
-		expect(typeof cmd.input.hint).toBe("string");
-		expect(cmd.input.hint.length).toBeGreaterThan(0);
+		// `/memory` 收参数（`unlock --force`），所以必须给非空 hint（宿主会拒空 hint）。
+		expect(typeof cmd.input?.hint).toBe("string");
+		expect(cmd.input?.hint.length).toBeGreaterThan(0);
 		expect(typeof cmd.handler).toBe("function");
 	});
 });

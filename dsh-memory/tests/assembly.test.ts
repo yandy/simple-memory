@@ -187,8 +187,13 @@ describe("apply — 全局注册（每进程一次）", () => {
 			"commands",
 			"workingDirectory",
 			"sessionQuery",
-			"logger",
 		]);
+		// 反断言：cordis 在 Context 构造器里赋**普通属性**的那几个内置名字**不是服务**，写进 `inject`
+		// 会让 fiber 永远 pending（真宿主里插件一次都不激活，而假 ctx 测不出来）。`logger` 曾经就在
+		// 这个名单里 —— 那条 bug 让 dsh 的 memory 工具在真宿主上从未存在过。
+		for (const builtin of ["logger", "events", "registry", "reflect", "fiber", "root"]) {
+			expect([...inject]).not.toContain(builtin);
+		}
 		expect(name).toBe("simple-memory");
 	});
 });

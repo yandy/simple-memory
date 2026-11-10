@@ -132,7 +132,9 @@ export function createPreStepListener(
 
 			// 每轮每个 step 都刷新索引快照（廉价路径）：这是长寿命会话最终看到其它进程写入记忆的途径。
 			// 与召回无关（索引 section 是另一条注入通道），所以放在 surfacing 可用性门之前。
-			if (rt) await deps.indexCache.refresh(rt);
+			if (rt) {
+				await deps.indexCache.refresh(rt);
+			}
 
 			// 只在 step === 1 召回：召回服务的是「这一轮的用户意图」，同一轮里模型自己发起的后续 step
 			// 不该再付一次侧查询的延迟与 token。`rt.memoryDir === null` 显式声明不变量

@@ -438,8 +438,47 @@ export function createFakeCtx(
 		};
 	}
 
+	/** dsh-commands 的 `COMMAND_NAME`：不许带斜杠、不许大写。 */
+	const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/;
+
+	/**
+	 * 忠实宿主 `normalizeDefinition`（`dsh-commands/lib/index.js:145-164`）。
+	 *
+	 * 这几条不是装饰：`register()` 抛错 → `apply` 抛错 → cordis 回滚**整个 bundle** 的注册（索引段、
+	 * 命令、工具全部消失）。假宿主曾经只查重名，于是一个 `input: { hint: "" }`（宿主会拒）在本地
+	 * 全绿、装进真宿主后却让整个记忆插件「根本不存在」。
+	 */
+	function validateCommandDefinition(definition: any): void {
+		const name = definition?.name;
+		if (typeof name !== "string" || !COMMAND_NAME.test(name)) {
+			throw new TypeError(`command name "${String(name)}" must match ${String(COMMAND_NAME)}`);
+		}
+		if (typeof definition.description !== "string") {
+			throw new TypeError(`command "${name}" description must be a string`);
+		}
+		if (definition.description.trim().length === 0) {
+			throw new TypeError(`command "${name}" description must not be empty`);
+		}
+		if (typeof definition.handler !== "function") {
+			throw new TypeError(`command "${name}" handler must be a function`);
+		}
+		const rawInput = definition.input;
+		if (rawInput !== undefined) {
+			if (typeof rawInput !== "object" || rawInput === null || !("hint" in rawInput) || typeof rawInput.hint !== "string") {
+				throw new TypeError(`command "${name}" input hint must be a string`);
+			}
+			if (rawInput.hint.trim().length === 0) {
+				throw new TypeError(`command "${name}" input hint must not be empty`);
+			}
+			if ("attachments" in rawInput && rawInput.attachments !== undefined && typeof rawInput.attachments !== "boolean") {
+				throw new TypeError(`command "${name}" input attachments flag must be a boolean`);
+			}
+		}
+	}
+
 	const commandsService = {
 		register(definition: any): () => void {
+			validateCommandDefinition(definition);
 			const rec: RecordedCommand = { ...definition };
 			if (commands.some((c) => c.name === rec.name)) {
 				throw new Error(`command "${rec.name}" is already registered`);
@@ -622,26 +661,37 @@ export function createFakeCtx(
 			childSessions.push(state);
 
 			const childPreStep: ListenerEntry[] = [];
+			/** 子作用域的 `session/event` 监听器：适配层靠 `turn/end` 判断这一轮收口。 */
+			const childSessionListeners: Array<(session: unknown, event: unknown) => unknown> = [];
+			const childErrorListeners: Array<(payload: unknown) => unknown> = [];
 			const childCtx = {
 				tools: makeAgentToolsService(`${sessionId}:child`),
 				on(event: string, handler: ListenerEntry["handler"], optionsArg?: unknown): () => void {
-					if (event !== "agent/pre-step") {
-						throw new Error(`fake ctx: child scope does not emit "${event}"`);
+					if (event === "agent/pre-step") {
+						const prepend =
+							optionsArg === true ||
+							(typeof optionsArg === "object" && (optionsArg as { prepend?: boolean })?.prepend === true);
+						const entry: ListenerEntry = { handler, prepend };
+						if (prepend) childPreStep.unshift(entry);
+						else childPreStep.push(entry);
+						return () => {
+							const i = childPreStep.indexOf(entry);
+							if (i >= 0) childPreStep.splice(i, 1);
+						};
 					}
-					const prepend =
-						optionsArg === true ||
-						(typeof optionsArg === "object" && (optionsArg as { prepend?: boolean })?.prepend === true);
-					const entry: ListenerEntry = { handler, prepend };
-					if (prepend) childPreStep.unshift(entry);
-					else childPreStep.push(entry);
+					const arr = event === "session/event" ? childSessionListeners : event === "agent/error" ? childErrorListeners : null;
+					if (arr === null) throw new Error(`fake ctx: child scope does not emit "${event}"`);
+					const listener = handler as unknown as (a: unknown, b?: unknown) => unknown;
+					arr.push(listener);
 					return () => {
-						const i = childPreStep.indexOf(entry);
-						if (i >= 0) childPreStep.splice(i, 1);
+						const i = arr.indexOf(listener);
+						if (i >= 0) arr.splice(i, 1);
 					};
 				},
 			};
 
 			let pending: Promise<void> | undefined;
+			let settled = false;
 			const child: any = {
 				session: {
 					id: sessionId,
@@ -661,8 +711,14 @@ export function createFakeCtx(
 					state.messages.push(message);
 					pending = runTurn();
 				},
+				/** 宿主 `Agent.status`：适配层的收敛判定会读它（见 `waitForIdle`）。 */
+				get status(): string {
+					return settled ? "idle" : "running";
+				},
 				whenIdle(): Promise<void> {
-					return pending ?? Promise.resolve();
+					return (pending ?? Promise.resolve()).then(() => {
+						settled = true;
+					});
 				},
 				cancel(cause: unknown): void {
 					state.cancelCauses.push(cause);
@@ -682,8 +738,18 @@ export function createFakeCtx(
 					if (decision?.kind === "reject") break;
 					state.stepsRun += 1;
 				}
-				for (const event of script.events ?? []) {
-					state.events.push({ ...event, seq: state.events.length });
+				// 忠实效地：一轮总以 `turn/end` 收口（`hang` 这种病态剧本除外），并且宿主对每个 append
+				// 都发一次 `session/event` ���— 适配层的收敛判据就是它。
+				const scripted = script.events ?? [];
+				const closesTurn = scripted.some((event) => event.type === "turn/end");
+				const toAppend: Array<{ type: string; data?: unknown }> =
+					script.hang === true || closesTurn
+						? scripted
+						: [...scripted, { type: "turn/end", data: { reason: { kind: "completed" } } }];
+				for (const event of toAppend) {
+					const appended = { ...event, seq: state.events.length };
+					state.events.push(appended);
+					for (const listener of childSessionListeners) await listener(child.session, appended);
 				}
 				if (script.hang === true) await new Promise<void>(() => {});
 				if (script.idleThrows !== undefined) throw new Error(script.idleThrows);

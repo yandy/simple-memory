@@ -46,6 +46,12 @@ export const name = "simple-memory";
  * `agents` 是 extract / dream 必需的：它们的子会话必须跑真实的工具循环，而 dsh 里只有 agent 会跑
  * （`ctx.llm.stream()` 不带工具循环）。缺 `agents` 时整个 bundle 不挂，而不是「召回在、dream 静默
  * 不工作」—— 后者是更难查的半挂状态。
+ *
+ * **`logger` 绝不能出现在这里**：`ctx.logger` 是 cordis 在 `Context` 构造器里赋的**普通属性**
+ *（`cordis/lib/index.js:1760`：`this.logger = new LoggerService(self)`），从不注册进服务表。把它写进
+ * `inject` 会让 fiber 永远停在 `pending (waiting for service: logger)` —— 插件在真宿主里**一次都
+ * 不会激活**（索引段、`/memory`、`memory` 工具全都不出现，模型只能退回去写 AGENTS.md），而单元
+ * 测试里假 ctx 直接把它当属性给，永远不会发现。`ctx.logger` 照样能用：属性访问不需要注入。
  */
 export const inject = [
 	"tools",
@@ -55,7 +61,6 @@ export const inject = [
 	"commands",
 	"workingDirectory",
 	"sessionQuery",
-	"logger",
 ] as const;
 
 /** 索引 section 的名字与位次：宿主 `SECTION_ORDERS` 里 4000 未被占用（MCP_SERVERS 3100 … TOOLS_SDK 5000）。 */
@@ -140,6 +145,17 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	 * 宿主 agent 注册表的结构化接缝。extract / dream 的子会话由它创建（`ctx.agents.create`）：
 	 * 这是 dsh 里唯一能拿到「带工具循环的会话」的公开入口（设计稿 §4.1）。
 	 */
+	/**
+	 * `agents` 服务：子会话的唯一创建入口。
+	 *
+	 * **已知限制（真机实测，未解决）**：`AgentRegistry.create()` 用 `this.ctx` 作为子 agent 的
+	 * owner，而 cordis 的 traceable 机制把 `this.ctx` 解析成「访问服务时的调用方作用域」。
+	 * 在 `agent/turn-stopping` / `agent/status` 的派发里创建子会话会抛
+	 * `cannot create effect on inactive context`；同样调用在 `apply` 期间、以及 `agent/created`
+	 * 期间都是成功的。插件作用域绑定、agent 作用域（`agent.ctx.agents`）绑定、宏任务延迟三种写法
+	 * 都复现该错误，所以 owner 的解析点还没找到。README 的「验证状态」里写明了这条。
+	 */
+	/** 插件作用域下的 `agents` 服务（兜底）。子会话优先用 agent 作用域的绑定，见 `agentAgents`。 */
 	const agents: AgentsLike = ctx.agents;
 	/** extract 的对话来源与 `search scope=sessions` 共用一份 dsh 实现。 */
 	const transcript = createDshTranscript(searchSessions);
@@ -155,7 +171,8 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		run(req) {
 			if (req.builtinTools === "none" && req.memoryTool === null) return zeroToolHeadless.run(req);
 			return runNestedSession(req, {
-				agents,
+				// 优先用 agent 作用域的绑定（owner = 这条会话的 agent），兜底才是插件作用域。
+				agents: agentAgents.get(rt.sessionId) ?? agents,
 				// action 子集与两个 skip（逻辑锁 / 快照）都来自 core 的请求：extract 是 5 个 action、
 				// 自己已持逻辑锁；dream 是 7 个 action、持逻辑锁且进入时已拍过整目录快照。
 				buildMemoryTool: (options) =>
@@ -166,6 +183,16 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	});
 	/** sessionId → 本会话已注入过召回的 entry 文件名。surfacing 读写它，装配层负责在会话结束时销账。 */
 	const injected = new Map<string, Set<string>>();
+	/**
+	 * sessionId → **agent 作用域**下的 `agents` 服务绑定。
+	 *
+	 * 子会话必须通过它创建：cordis 的 traceable 机制会把 `create()` 的 owner 解析成「访问服务时的
+	 * 调用方作用域」。用插件作用域的 `ctx.agents` 在 `agent/turn-stopping` 里创建，owner 就是
+	 * **正在收口的那一轮**（fiber 已失活）→ 抛 `cannot create effect on inactive context`（真机实测：
+	 * 同样调用在 apply 期间、在 agent 作用域下都成功）。用 `agent.ctx` 的绑定，owner 是这条会话的
+	 * agent（活着），子会话也因此随 agent 一起被回收。
+	 */
+	const agentAgents = new Map<string, AgentsLike>();
 	/** sessionId → 工具注册的清理项。 */
 	const cleanups = new Map<string, SessionCleanup>();
 
@@ -231,7 +258,9 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// prepare 永不抛错：失败也给一个 store=null + error 的 runtime，让 /memory 与工具报错说出原因。
 		const rt = await registry.prepare(like, resolved, surfacing, signal);
 		await indexCache.refresh(rt);
-
+		// 记住这条会话 agent 作用域下的 `agents` 服务（子会话的 owner 用它）。
+		const scopedAgents = (like as unknown as { ctx?: { agents?: AgentsLike } }).ctx?.agents;
+		if (scopedAgents !== undefined) agentAgents.set(sessionId, scopedAgents);
 		const tool = createMemoryTool(rt, {
 			searchSessions,
 			// 写入成功后刷新索引快照。core 的 onWrite 是同步回调（handler.ts:183 不 await 它），
@@ -277,6 +306,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		cleanups.delete(sessionId);
 		registry.forget(sessionId);
 		indexCache.forget(sessionId);
+		agentAgents.delete(sessionId);
 		injected.delete(sessionId);
 	});
 
@@ -308,6 +338,9 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
 	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
 	//    `enabled` / 子 agent / 无运行时这三道门禁都在 extract.ts 里（触发点决策属于适配层）。
+	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
+	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
+	//    `enabled` / 子 agent / 无运行时这三道门禁都在 extract.ts 里（触发点决策属于适配层）。
 	ctx.on(
 		"agent/turn-stopping",
 		createTurnStoppingListener({
@@ -329,6 +362,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			indexCache.forget(sessionId);
 		}
 		cleanups.clear();
+		agentAgents.clear();
 		injected.clear();
 	};
 }

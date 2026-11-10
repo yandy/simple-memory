@@ -74,9 +74,11 @@ export interface SessionLogLike {
 	snapshotEvents(fromSeq?: number, toSeqExclusive?: number): readonly SessionEventLike[];
 }
 
-/** 子会话 agent 的最小形状：驱动（`followup` / `whenIdle` / `cancel`）+ 读日志。 */
+/** 子会话 agent 的最小形状：驱动（`followup` / `whenIdle` / `cancel`）+ 读日志 + 状态。 */
 export interface ChildAgentLike {
 	readonly session: SessionLogLike;
+	/** 宿主 `Agent.status`：`idle` / `running`。收敛判定要用它，见 `waitForIdle`。 */
+	readonly status: string;
 	followup(message: unknown): void;
 	whenIdle(): Promise<void>;
 	cancel(cause: unknown): void;
@@ -94,7 +96,12 @@ export interface AgentScopeLike {
 		restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): unknown;
 		definitions(): readonly { name: string }[];
 	};
-	on(event: string, handler: (payload: unknown, next?: () => Promise<unknown>) => unknown): unknown;
+	/**
+	 * `ctx.on()`：两种形状都要支持 —— `agent/pre-step` 是 waterfall（`(payload, next)`），
+	 * `session/event` / `agent/error` 是 emit（`(session, event)` / `(payload)`）。handler 收
+	 * `unknown[]`，收窄在各自的注册处做。
+	 */
+	on(event: string, handler: (...args: unknown[]) => unknown): unknown;
 }
 
 export interface AgentHandleLike {
@@ -246,7 +253,9 @@ function allowedGlobalTools(scope: AgentScopeLike, builtinTools: "none" | "file-
  */
 export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSessionDeps): Promise<HeadlessOutcome> {
 	const ref = parseModelRef(req.model);
-	if (ref === null) return { status: "not-run", cause: "unavailable" };
+	if (ref === null) {
+		return { status: "not-run", cause: "unavailable" };
+	}
 	// 请求还没发出就取消了：`not-run`，而且一个会话都不该建。
 	if (req.signal?.aborted) return { status: "not-run", cause: "aborted" };
 
@@ -277,6 +286,10 @@ export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSess
 
 	const maxTurns = req.maxTurns;
 	let maxTurnsExceeded = false;
+	/** 子会话这一轮收口（或明确失败）时 resolve；监听器在 `setup` 里注册。 */
+	const settled = deferred();
+	/** `agent/error` 带出的失败原因（没有则 `null`）。 */
+	let hostError: string | null = null;
 	let steps = 0;
 	/** `followup` 之后 = 请求真的发出去了（决定超时算 `not-run` 还是 `incomplete`）。 */
 	let dispatched = false;
@@ -320,7 +333,8 @@ export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSess
 			//    时把后续 step **拒掉**：宿主文档里被拒的 step 直接收口这一轮（turn 关闭，没有 step
 			//    开始）。counting 放在 `next()` 之后：被内层拒掉的 step 不计入。
 			if (maxTurns !== undefined) {
-				scope.on("agent/pre-step", async (_payload, next) => {
+				scope.on("agent/pre-step", async (...args: unknown[]) => {
+					const next = args[1] as (() => Promise<unknown>) | undefined;
 					const decision = next === undefined ? { kind: "reject" } : await next();
 					steps += 1;
 					if (steps > maxTurns) {
@@ -330,6 +344,23 @@ export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSess
 					return decision;
 				});
 			}
+
+			// 收敛判据是**事件**，不是 `whenIdle()`：宿主的 `whenIdle()` 在「这一轮还没被驱动登记为
+			// 活动」时会立刻 resolve（实测 status 也可能是 `idle`），所以任何基于 quiescence 的循环都
+			// 会提前退出 → 我们 dispose 掉刚排队的这一轮。真机日志就是证据：`turn/start` → inbox splice
+			// 撤掉消息 → `turn/end (aborted, disposed)`，0 个 `request/header`。子会话只有一轮（一次
+			// followup），等它的 `turn/end` 是精确的；`agent/error` 也要收，否则模型层直接失败时我们会
+			// 一直等下去（那是最糟的形态：看起来像挂死）。
+			scope.on("session/event", (...args: unknown[]) => {
+				const event = args[1] as SessionEventLike | undefined;
+				if (event?.type === "turn/end") settled.resolve();
+			});
+			scope.on("agent/error", (...args: unknown[]) => {
+				// 失败原因要带出来：`agent/error` 是「这一轮失败了」的唯一信号（没有对应的事件日志形态）。
+				const payload = args[0] as { error?: unknown } | undefined;
+				hostError = errorMessage(payload?.error);
+				settled.resolve();
+			});
 		},
 	};
 
@@ -359,6 +390,9 @@ export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSess
 	try {
 		child.followup(userMessage(req.task));
 		dispatched = true;
+		await raceWithAbort(settled.promise, runSignal);
+		// 这一轮已经收口，再等一次 quiescence 让宿主的 post-turn 工作落定；它提前 resolve 也无所谓
+		// （不会再有下一轮了），所以这里不需要循环。
 		await raceWithAbort(child.whenIdle(), runSignal);
 	} catch (e) {
 		runError = e;
@@ -405,6 +439,7 @@ export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSess
 		return { status: "not-run", cause: "host-refused", detail: errorMessage(runError) };
 	}
 	if (summary === null) return { status: "no-output" };
+	if (hostError !== null) return { status: "not-run", cause: "host-refused", detail: hostError };
 	if (summary.errorDetail !== null) {
 		return { status: "not-run", cause: "host-refused", detail: summary.errorDetail };
 	}
@@ -412,6 +447,15 @@ export async function runNestedSession(req: HeadlessRunRequest, deps: NestedSess
 	if (summary.aborted) return { status: "incomplete", cause: "aborted" };
 	if (summary.text.trim() === "") return { status: "no-output" };
 	return { status: "completed", text: summary.text };
+}
+
+/** 一个可外部 resolve 的 promise（本模块只需要 `resolve`，不需要值）。 */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve: () => void = () => {};
+	const promise = new Promise<void>((res) => {
+		resolve = () => res();
+	});
+	return { promise, resolve };
 }
 
 /**

@@ -51,14 +51,23 @@ export function createTurnStoppingListener(deps: ExtractListenerDeps): (payload:
 			const agent = { session: payload.agent.session };
 			// 子会话（我们自己的 extract / dream 子会话、以及宿主的 subagent）不跑抽取：它们没有
 			// 记忆层运行时，也不该按自己的对话去写记忆。
-			if (!isRootAgent(agent)) return;
+			if (!isRootAgent(agent)) {
+				return;
+			}
 
 			const sessionId = payload.agent.session.id;
 			const rt = deps.registry.get(sessionId);
 			// 没运行时 = 这条会话没挂记忆层（配置坏了 / 子 agent / 未 prepare）：不跑，也不报。
-			if (rt === undefined || rt.store === null || rt.memoryDir === null) return;
+			if (rt === undefined) return;
+			// 收窄后立刻落成 const：延迟到宏任务执行时，TS 不再保留属性上的 null 收窄。
+			const store = rt.store;
+			const memoryDir = rt.memoryDir;
+			const cfg = rt.config;
+			if (store === null || memoryDir === null) return;
 			// 触发点决策：没开启就不该调 `runTask`（连带的模型/锁都不该碰）。
-			if (rt.config.extractMemories?.enabled !== true) return;
+			if (cfg.extractMemories?.enabled !== true) {
+				return;
+			}
 
 			// **同步**取一份事件快照：`turn-stopping` 之后宿主还会追加 `turn/end`，而我们要的是
 			// 「这一轮已经发生的对话」。同步快照也让我们在异步链里不再回头读宿主对象。
@@ -89,9 +98,9 @@ export function createTurnStoppingListener(deps: ExtractListenerDeps): (payload:
 					},
 				},
 				{
-					cfg: rt.config,
-					cwd: rt.memoryDir,
-					store: rt.store,
+					cfg,
+					cwd: memoryDir,
+					store,
 					ports: { headless: deps.headlessFor(rt), transcript: deps.transcript },
 				},
 			);

@@ -18,6 +18,14 @@ interface Script {
 	steps?: number;
 	/** `whenIdle` 永不收敛（模拟卡住的模型调用，只有超时能打断它）。 */
 	hang?: boolean;
+	/** 只发 `agent/error`、不发 `turn/end`（模型层直接失败的形态）。 */
+	errorEvent?: boolean;
+	/**
+	 * 忠实真宿主的一个怪癖：驱动还没把这一轮登记为「活动」时，`whenIdle()` **立刻 resolve**，
+	 * 而此时 `status` 仍是 `running`。只 await 一次 `whenIdle()` 就会在 turn 真正跑起来之前
+	 * dispose（真机上表现为子会话只有 `turn/start` → `turn/end(aborted, disposed)`，0 个请求）。
+	 */
+	earlyIdle?: boolean;
 	idleThrows?: string;
 	events?: Array<{ type: string; data?: unknown }>;
 	/** 部署里注册了哪些全局工具（`restrict` 的已知名字集合）。 */
@@ -67,7 +75,11 @@ function makeAgents(script: Script = {}) {
 			if (script.createThrows !== undefined) throw new Error(script.createThrows);
 
 			const preStep: Array<(payload: any, next?: () => Promise<any>) => unknown> = [];
+			const sessionListeners: Array<(session: unknown, event: unknown) => unknown> = [];
+			const errorListeners: Array<(payload: unknown) => unknown> = [];
 			let pending: Promise<void> | undefined;
+			let idleWaiters = 0;
+			const runState = { settled: false };
 
 			const child: any = {
 				session: {
@@ -81,10 +93,25 @@ function makeAgents(script: Script = {}) {
 				},
 				followup(message: unknown): void {
 					messages.push(message);
-					pending = runTurn();
+					// 忠实真宿主：`followup` 只把消息入队，驱动在**下一个宏任务**才启动这一轮
+					// （微任务启动不足以复现「whenIdle 先 resolve」那个时序 —— 那正是漏掉这条 bug 的原因）。
+					pending = new Promise<void>((resolve, reject) => {
+						setTimeout(() => {
+							// 拒绝必须传出去：`whenIdle()` 的失败是适配层「这一轮没跑成」的唯一信号。
+							void runTurn().then(resolve, reject);
+						}, 0);
+					});
+				},
+				get status(): string {
+					return runState.settled ? "idle" : "running";
 				},
 				whenIdle(): Promise<void> {
-					return pending ?? Promise.resolve();
+					// `earlyIdle`：第一次调用直接 resolve（status 仍 running），之后才等真正的收敛。
+					idleWaiters += 1;
+					if (script.earlyIdle === true && idleWaiters === 1) return Promise.resolve();
+					return (pending ?? Promise.resolve()).then(() => {
+						runState.settled = true;
+					});
 				},
 				cancel(cause: unknown): void {
 					cancels.push(cause);
@@ -102,7 +129,23 @@ function makeAgents(script: Script = {}) {
 					if (decision?.kind === "reject") break;
 					state.stepsRun += 1;
 				}
-				for (const event of script.events ?? []) events.push({ ...event, seq: events.length });
+				// 忠实效地：一轮对话**总会**以 `turn/end` 收口（除了「卡住」这种病态剧本）。
+				const scripted = script.events ?? [];
+				const closesTurn = scripted.some((event) => event.type === "turn/end");
+				const toAppend =
+					script.hang === true
+						? scripted
+						: closesTurn || script.errorEvent === true
+							? scripted
+							: [...scripted, { type: "turn/end", data: { reason: { kind: "completed" } } }];
+				for (const event of toAppend) {
+					const appended = { ...event, seq: events.length };
+					events.push(appended);
+					for (const listener of sessionListeners) await listener(child.session, appended);
+				}
+				if (script.errorEvent === true) {
+					for (const listener of errorListeners) await listener({ agent: child, turn: 1, step: 1, error: new Error("x") });
+				}
 				if (script.hang === true) await new Promise<void>(() => {});
 				if (script.idleThrows !== undefined) throw new Error(script.idleThrows);
 			}
@@ -128,10 +171,18 @@ function makeAgents(script: Script = {}) {
 						return globalTools.map((name) => ({ name }));
 					},
 				},
-				on(event: string, handler: (payload: any, next?: () => Promise<any>) => unknown): () => void {
-					if (event !== "agent/pre-step") throw new Error(`unexpected event "${event}"`);
-					preStep.push(handler);
-					return () => {};
+				on(event: string, handler: (...args: any[]) => unknown): () => void {
+					if (event === "agent/pre-step") {
+						preStep.push(handler);
+						return () => {};
+					}
+					// 适配层的收敛判据是 `turn/end`（以及 `agent/error`）这两个事件。
+					if (event === "session/event" || event === "agent/error") {
+						const arr = event === "session/event" ? sessionListeners : errorListeners;
+						arr.push(handler);
+						return () => {};
+					}
+					throw new Error(`unexpected event "${event}"`);
 				},
 			};
 
@@ -405,5 +456,33 @@ describe("runNestedSession — 超时与取消", () => {
 		};
 		const outcome = await runNestedSession(makeRequest({ timeoutMs: 20 }), makeDeps(agents));
 		expect(outcome).toEqual({ status: "not-run", cause: "timeout" });
+	});
+});
+
+describe("runNestedSession — 收敛判定（真机回归）", () => {
+	it("waits for the real turn even when the host resolves whenIdle() early", async () => {
+		// 真机上的现象：子会话日志里只有 `turn/start` → `turn/end(aborted, disposed)`、0 个请求、
+		// 什么也没写。原因是我们只 await 了一次 `whenIdle()`，而驱动还没把这一轮登记为活动时它会
+		// 立刻 resolve，于是 dispose 把刚开的一轮打断。这里让假宿主复现那个时序。
+		const { agents, state } = makeAgents({ earlyIdle: true, events: [assistantText("extracted")] });
+
+		const outcome = await runNestedSession(makeRequest(), makeDeps(agents));
+
+		// 只 await 一次的实现会返回 no-output（读到的是空日志）—— 这条就是钉那个 bug。
+		expect(outcome).toEqual({ status: "completed", text: "extracted" });
+		expect(state.disposed).toBe(1);
+	});
+});
+
+describe("runNestedSession — 只有 agent/error、没有 turn/end", () => {
+	it("carries the host error out as not-run/host-refused instead of waiting for a turn that never ends", async () => {
+		// 模型层在发出请求之前就失败（provider 挂了 / 路由不可用）时，宿主发的是 `agent/error`，
+		// 不会有 `turn/end`。只等 `turn/end` 会一直等到 timeoutMs（extract 120s）—— 那是最糟的
+		// 形态：看起来像挂死。所以 `agent/error` 也当收口，并把原因带出去。
+		const { agents } = makeAgents({ errorEvent: true });
+
+		const outcome = await runNestedSession(makeRequest({ timeoutMs: 5 }), makeDeps(agents));
+
+		expect(outcome).toEqual({ status: "not-run", cause: "host-refused", detail: "x" });
 	});
 });

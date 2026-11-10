@@ -38,14 +38,17 @@ export interface CommandDeps {
 
 /**
  * 宿主 `ctx.commands.register` 要求的最小定义形状。结构化、零宿主 import：
- * 宿主的 `normalizeDefinition` 会校验 `name`（`/^[a-z][a-z0-9_-]*$/`，不带斜杠）、
- * 非空 `description`、函数型 `handler` 与非空 `input.hint` —— 这些都不是装饰。
+ * 宿主的 `normalizeDefinition`（`dsh-commands/lib/index.js:145-164`）会校验 `name`
+ *（`/^[a-z][a-z0-9_-]*$/`，不带斜杠）、非空 `description`、函数型 `handler`；`input` 是**可选**的，
+ * 一旦给了就必须带**非空** `hint`（`hint: ""` 会直接抛错）。这些都不是装饰：`register()` 抛错会让
+ * `apply` 抛错，cordis 于是回滚整个 bundle 的注册（“记忆插件根本没生效”就是这么来的）。
  * 真宿主还会补 `commandId` / `attachments`，这里只声明我们要用的字段。
  */
 export interface CommandDefinitionLike {
 	name: string;
 	description: string;
-	input: { hint: string };
+	/** 可选：不收参数的命令（如 `/dream`）干脆不传 —— 传了就必须非空 hint。 */
+	input?: { hint: string };
 	handler(inv: {
 		agent: { session: { id: string } };
 		rawInput: string;
@@ -266,7 +269,10 @@ export function createDreamCommand(deps: DreamCommandDeps): CommandDefinitionLik
 	return {
 		name: "dream",
 		description: "Consolidate all memory files via a headless agent (starts immediately, runs in the background)",
-		input: { hint: "" },
+		// **不传 `input`**：`/dream` 不收参数，而宿主的 `normalizeDefinition` 要求 `input.hint` **非空**
+		//（`dsh-commands/lib/index.js:157-158`）。写一个 `hint: ""` 会让 `register()` 抛错，而 `apply`
+		// 抛错 = cordis 回滚这个 bundle 的**全部**注册（索引段、`/memory`、`memory` 工具一起消失，
+		// 用户看到的是「记忆插件根本没生效」）。一方插件 `/compact` 同样是不传 `input`。
 		async handler(inv) {
 			const rt = deps.registry.get(inv.agent.session.id);
 			if (rt === undefined) {

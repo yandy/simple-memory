@@ -166,3 +166,16 @@ describe("/dream — 发起之后", () => {
 		expect(logged).toContain("MODEL_UNAVAILABLE: no such model");
 	});
 });
+
+describe("/dream — 命令元数据", () => {
+	it("omits `input` entirely, because the host rejects an empty hint", () => {
+		// 这是一条**真机回归**：曾经写成 `input: { hint: "" }`，宿主的 `normalizeDefinition` 直接抛错，
+		// 于是 `apply` 抛错 → cordis 回滚整个 bundle（索引段、/memory、memory 工具全消失，模型只能
+		// 去写 AGENTS.md）。`/dream` 不收参数，就不该给 `input`。
+		const command = createDreamCommand(makeDeps(undefined).deps);
+		expect(command.name).toBe("dream");
+		expect(command.input).toBeUndefined();
+		expect(command.description.length).toBeGreaterThan(0);
+		expect(typeof command.handler).toBe("function");
+	});
+});
