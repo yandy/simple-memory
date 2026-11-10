@@ -99,7 +99,8 @@ cfg.memoryDir = expandTilde(cfg.memoryDir, ctx._platform ?? process.platform)
 
 | 现在在哪 | 怎么处理 |
 |---|---|
-| `memory-core/tests/config.test.ts` 的 `describe("loadConfigFrom")`（默认值、缺文件、坏 JSON、文件顺序、嵌套合并、残留 `enabled` 键、`~` 展开、平台规则…） | **整段搬**进 `pi-memory/tests/config-paths.test.ts`，改成 `describe("loadConfig")`；入参从「文件列表」换成 pi 的注入缝（`_globalDir` / `_configDirName` / `_platform`），**期望值一字不改** |
+| `memory-core/tests/config.test.ts` 的 `describe("loadConfigFrom")`（默认值、缺文件、坏 JSON、文件顺序、嵌套合并、残留 `enabled` 键、`~` 展开、平台规则…） | **整段搬**进 `pi-memory/tests/config-paths.test.ts`，改成 `describe("loadConfig")`；入参从「文件列表」换成 pi 的注入缝（`_globalDir` / `_configDirName` / `_platform`），**期望值不变** |
+| 同上块里的 `expect(cfg.dream.nudgeAfterSessions)…` / `nudgeAfterHours` 两条 | **删除**：这两个键已搬去 pi 的宿主扩展位（主稿 §7.1），不再是 `MemoryConfig` 的字段。它们的默认值 5 / 24 改在 `pi-memory/tests/nudge.test.ts` 钉 |
 | `memory-core/tests/config.test.ts` 的 `describe("公开出口")` | 补一条反断言：`"loadConfigFrom" in api === false`（删除必须能被 CI 看见） |
 | `dsh-memory/tests/row-config.test.ts` 的「matches core loadConfigFrom byte-for-byte」 | 改成「与 `mergeConfig` + `expandTilde` 的手工链逐字相等」，不再写临时文件；它仍然钉住「行 config 没有额外合并语义」 |
 | `pi-memory/tests/config-paths.test.ts` 文件头注释（「合并语义…都在 core」） | 改成：合并语义在 core 的 `mergeConfig`，**读文件**在 pi 这一侧 |
@@ -109,8 +110,12 @@ cfg.memoryDir = expandTilde(cfg.memoryDir, ctx._platform ?? process.platform)
 `scripts/pack-smoke.mjs` 与 `scripts/registry-smoke-runtime.mjs` 都在装好的 tarball 里调了
 `loadConfigFrom([])` 来证明「默认数据根跟随 `XDG_DATA_HOME`」。改成直接断言
 `DEFAULT_CONFIG.memoryDir === join(XDG_DATA_HOME, "simple-memory")` —— 等价覆盖（`memoryDir` 的默认值就是
-`defaultMemoryRoot()`，在模块加载时求值），且**两个版本都成立**：`registry-smoke-runtime.mjs` 会被装进
-用户目录对着 registry 上的任意版本跑（现在是 1.0.1，1.2.0 发布之后是 1.2.0），所以它只能用两版都有的符号。
+`defaultMemoryRoot()`，在模块加载时求值）。
+
+为什么必须用两版都有的符号：`pack-smoke.mjs` 跑的是**本次发布的 memory-core tarball**，而
+`registry-smoke-runtime.mjs` 跑的是「适配层 tarball + registry 上满足适配层 range 的 core」——
+本轮之后那个 range 是 `^2.0.0`，在 2.0.0 发布前根本找不到版本（见主稿 §10.1）。所以这两个脚本只能用
+跨版本稳定的符号（`DEFAULT_CONFIG` / `defaultMemoryRoot` / `MemoryStore`），不能用本轮新加的（`runTask` 等）。
 
 ### 7.5 文档
 
@@ -147,7 +152,9 @@ npm run typecheck && npm run lint && npm test
 npm run build -w memory-core && npm run build -w dsh-memory
 grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js" | wc -l    # 0
 MEMORY_CORE_FROM_DIST=1 npm test -w pi-memory && MEMORY_CORE_FROM_DIST=1 npm test -w dsh-memory
-npm run smoke:registry
 ```
 
 外加：`memory-core` 的 `dist/index.d.ts` 里不再出现 `loadConfigFrom`（发布形态也要干净）。
+
+**`npm run smoke:registry` 不在本清单里**：它要求 core 2.0.0 已在 registry 上，而本 PR 合并时还没有。
+处理方式见主稿 §10.1（合并 → 发 2.0.0 → rerun 转绿 → 再发 pi-memory 4.0.0）。
