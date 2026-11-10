@@ -1,0 +1,273 @@
+/**
+ * index wiring — memory_index section
+ *
+ * harness 必须排在本文件其他 import 之前：它注册了 `vi.mock`，顺序错了 mock 不生效。
+ */
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createFakePi, DISK_INDEX, dirOverrideRef, dirRef, legacyEvent, mockConfigValue, readRecordedMemoryIndexMock, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, uiCtx } from "./helpers/wiring-harness";
+import memoryFactory from "../index";
+import { INDEX_TRUNCATION_MARKER } from "@yandy0725/memory-core";
+
+describe("index wiring — memory_index section", () => {
+	let dir: string;
+
+	beforeEach(async () => {
+		dir = await mkdtemp(join(tmpdir(), "mem-wiring-"));
+		dirRef.current = dir;
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, "MEMORY.md"), DISK_INDEX, "utf8");
+
+		scanEntriesMock.mockReset();
+		resetWiringMocks();
+
+		// 模型 fixture：默认走 defaults.model；各用例按需覆盖 mockConfigValue 的 model 段
+		mockConfigValue.defaults = { model: "test/model", sessionPersistence: { enabled: false } };
+		mockConfigValue.dream.model = undefined;
+		mockConfigValue.extractMemories.model = undefined;
+		mockConfigValue.autoSurfacing.model = undefined;
+	});
+
+	afterEach(async () => {
+		await rm(dir, { recursive: true, force: true });
+		delete (mockConfigValue.autoSurfacing as any).sessionPersistence;
+		mockConfigValue.autoSurfacing.maxFiles = 5;
+		mockConfigValue.autoSurfacing.thinkLevel = "off";
+		mockConfigValue.extractMemories.enabled = false;
+		mockConfigValue.lock = { timeoutMs: 5000, snapshotKeep: 5 };
+		dirOverrideRef.current = null;
+	});
+
+	it("writes the memory_index section on every turn and freezes it byte-for-byte", async () => {
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		const first = sectionsEvent();
+		await handlers["before_agent_start"][0](first, uiCtx());
+		expect(first.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
+
+		// 会话中途磁盘上的索引被改了（另一个 worktree 写入）：注入值必须逐字节不变
+		await writeFile(join(dir, "MEMORY.md"), "- [SSH](ssh.md) — changed\n", "utf8");
+		const second = sectionsEvent();
+		const result = await handlers["before_agent_start"][0](second, uiCtx());
+
+		expect(second.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
+		expect(second.systemPromptOptions.sections["memory_index"]).not.toContain("changed");
+		// 走 sections 路径时不再返回 systemPrompt（避免全量替换从 position 0 打断缓存）
+		expect(result?.systemPrompt).toBeUndefined();
+	});
+
+	it("injects only the newest 50 lines of a long index at session_start", async () => {
+		const entries = Array.from({ length: 60 }, (_, i) => `- [M${i}](m${i}.md) — d${i}`);
+		await writeFile(join(dir, "MEMORY.md"), `# Memory Index\n\n${entries.join("\n")}\n`, "utf8");
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		const event = sectionsEvent();
+		await handlers["before_agent_start"][0](event, uiCtx());
+		const section = event.systemPromptOptions.sections["memory_index"] as string;
+
+		expect(section.split("\n")[0]).toBe(INDEX_TRUNCATION_MARKER);
+		expect((section.match(/^- \[/gm) ?? []).length).toBe(50);
+		expect(section).toContain("- [M10](m10.md)");
+		expect(section).not.toContain("- [M9](m9.md)");
+	});
+
+	it("re-reads the same inject window at session_compact", async () => {
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		const entries = Array.from({ length: 60 }, (_, i) => `- [M${i}](m${i}.md) — d${i}`);
+		await writeFile(join(dir, "MEMORY.md"), `# Memory Index\n\n${entries.join("\n")}\n`, "utf8");
+		await handlers["session_compact"][0]({ type: "session_compact", reason: "manual" }, uiCtx());
+
+		const event = sectionsEvent();
+		await handlers["before_agent_start"][0](event, uiCtx());
+		const section = event.systemPromptOptions.sections["memory_index"] as string;
+
+		expect(section.split("\n")[0]).toBe(INDEX_TRUNCATION_MARKER);
+		expect((section.match(/^- \[/gm) ?? []).length).toBe(50);
+	});
+
+	it("sets the section for every session_start reason", async () => {
+		for (const reason of ["startup", "new", "resume", "fork", "reload", undefined]) {
+			const { pi, handlers } = createFakePi();
+			memoryFactory(pi as any);
+			await handlers["session_start"][0](reason ? { reason } : {}, uiCtx());
+
+			const first = sectionsEvent();
+			await handlers["before_agent_start"][0](first, uiCtx());
+			const second = sectionsEvent();
+			await handlers["before_agent_start"][0](second, uiCtx());
+
+			expect(Object.keys(first.systemPromptOptions.sections), reason).toEqual(["memory_index"]);
+			expect(Object.keys(second.systemPromptOptions.sections), reason).toEqual(["memory_index"]);
+			expect(second.systemPromptOptions.sections["memory_index"], reason).toBe(DISK_INDEX);
+		}
+	});
+
+	it("uses the recorded index for resume/fork/reload and never reads the disk", async () => {
+		for (const reason of ["resume", "fork", "reload"]) {
+			await writeFile(join(dir, "MEMORY.md"), "- [DISK](disk.md) — from disk\n", "utf8");
+			readRecordedMemoryIndexMock.mockReturnValue("- [SSH](ssh.md) — recorded\n");
+			const sessionManager = { getEntries: () => [], getLeafId: () => null };
+			const { pi, handlers } = createFakePi();
+			memoryFactory(pi as any);
+
+			await handlers["session_start"][0]({ reason }, uiCtx({ sessionManager }));
+			const event = sectionsEvent();
+			await handlers["before_agent_start"][0](event, uiCtx({ sessionManager }));
+
+			expect(readRecordedMemoryIndexMock, reason).toHaveBeenCalledWith(sessionManager);
+			expect(event.systemPromptOptions.sections["memory_index"], reason).toBe("- [SSH](ssh.md) — recorded\n");
+			expect(event.systemPromptOptions.sections["memory_index"], reason).not.toContain("DISK");
+			readRecordedMemoryIndexMock.mockReturnValue(null);
+		}
+	});
+
+	it("reads the disk for startup/new instead of replaying the transcript", async () => {
+		for (const reason of ["startup", "new", undefined]) {
+			const { pi, handlers } = createFakePi();
+			memoryFactory(pi as any);
+
+			await handlers["session_start"][0](reason ? { reason } : {}, uiCtx());
+
+			expect(readRecordedMemoryIndexMock, String(reason)).not.toHaveBeenCalled();
+		}
+	});
+
+	it("freezes the bare recorded index after resume and never produces a new patch", async () => {
+		const raw = "- [SSH](ssh.md) — staging ssh config\n";
+		const recorded = `<memory_index>\n${raw}\n</memory_index>`;
+		const sessionManager = {
+			getEntries: () => [
+				{ type: "message", message: { role: "system", content: "", sections: { memory_index: recorded } } },
+			],
+			getLeafId: () => "leaf-1",
+		};
+
+		// 本文件把 index-source 整个 mock 了；这里用真实实现（注入 converter 替代 0.80.2 缺失的
+		// SDK 导出），走完「重放 → 脱壳 → 冻结 → 回写」全程。
+		const actual = await vi.importActual<typeof import("../src/index-source")>("../src/index-source");
+		readRecordedMemoryIndexMock.mockImplementation((sm: unknown) =>
+			actual.readRecordedMemoryIndex(sm, {
+				sessionEntryToContextMessages: (e: unknown) => [(e as { message: unknown }).message],
+			}),
+		);
+
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({ reason: "resume" }, uiCtx({ sessionManager }));
+
+		const ctx = uiCtx({ sessionManager });
+		const first = sectionsEvent();
+		await handlers["before_agent_start"][0](first, ctx);
+		const frozen = first.systemPromptOptions.sections["memory_index"];
+
+		expect(frozen).toBe(raw);
+		// 宿主渲染 = 录制值：头部字节恒等，resume 第一轮没有 patch（D13/D14）
+		expect(`<memory_index>\n${frozen}\n</memory_index>`).toBe(recorded);
+
+		const second = sectionsEvent();
+		await handlers["before_agent_start"][0](second, ctx);
+		expect(second.systemPromptOptions.sections["memory_index"]).toBe(frozen);
+	});
+
+	it("falls back to the disk index when no recorded value is available", async () => {
+		readRecordedMemoryIndexMock.mockReturnValue(null);
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+
+		await handlers["session_start"][0]({ reason: "resume" }, uiCtx());
+		const event = sectionsEvent();
+		await handlers["before_agent_start"][0](event, uiCtx());
+
+		expect(readRecordedMemoryIndexMock).toHaveBeenCalledTimes(1);
+		expect(event.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
+	});
+
+	it("falls back to { systemPrompt } when the host SDK exposes no sections", async () => {
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		const event = legacyEvent();
+		const result = await handlers["before_agent_start"][0](event, uiCtx());
+
+		expect(result?.systemPrompt).toBe(`BASE_PROMPT\n\n${DISK_INDEX}`);
+		expect((event.systemPromptOptions as any).sections).toBeUndefined();
+	});
+
+	it("injects an empty section value instead of dropping the key", async () => {
+		await writeFile(join(dir, "MEMORY.md"), "", "utf8");
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		const event = sectionsEvent();
+		const result = await handlers["before_agent_start"][0](event, uiCtx());
+
+		expect(Object.keys(event.systemPromptOptions.sections)).toEqual(["memory_index"]);
+		expect(event.systemPromptOptions.sections["memory_index"]).toBe("");
+		expect(result?.systemPrompt).toBeUndefined();
+	});
+
+	it("session_compact re-reads the index from disk and clears injectedFiles", async () => {
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		scanEntriesMock.mockResolvedValue([
+			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
+		]);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: "<relevant_memories>\n## SSH\nx\n</relevant_memories>" };
+		});
+
+		const first = sectionsEvent();
+		await handlers["before_agent_start"][0](first, uiCtx());
+		expect(injectedAtCall[0]).toEqual(new Set());
+
+		await writeFile(join(dir, "MEMORY.md"), "# Memory Index\n\n- [New](new.md) — after compact\n", "utf8");
+		await handlers["session_compact"][0]({ type: "session_compact", reason: "manual" }, uiCtx());
+
+		const second = sectionsEvent();
+		await handlers["before_agent_start"][0](second, uiCtx());
+
+		expect(second.systemPromptOptions.sections["memory_index"]).toBe(
+			"# Memory Index\n\n- [New](new.md) — after compact\n",
+		);
+		expect(injectedAtCall[1]).toEqual(new Set());
+	});
+
+	it("refreshes the index on session_compact only — no other event may", async () => {
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, uiCtx());
+
+		const first = sectionsEvent();
+		await handlers["before_agent_start"][0](first, uiCtx());
+
+		await writeFile(join(dir, "MEMORY.md"), "- [Changed](c.md) — changed\n", "utf8");
+		await handlers["agent_end"][0]({ messages: [] }, uiCtx());
+		await handlers["session_shutdown"][0]({ type: "session_shutdown", reason: "quit" }, uiCtx());
+		const second = sectionsEvent();
+		await handlers["before_agent_start"][0](second, uiCtx());
+
+		expect(second.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
+		expect(Object.keys(handlers).sort()).toEqual([
+			"agent_end",
+			"before_agent_start",
+			"session_compact",
+			"session_shutdown",
+			"session_start",
+		]);
+	});
+});
