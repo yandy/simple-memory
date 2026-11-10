@@ -132,10 +132,11 @@ cfg.memoryDir = expandTilde(cfg.memoryDir, ctx._platform ?? process.platform)
 
 ## 8. 已接受的破坏（用户明确同意）
 
-已发布的 `@yandy0725/pi-memory@3.0.0` 声明 `@yandy0725/memory-core@^1.0.0`，`^1.0.0` 会浮到 `1.2.0`。
-**任何人重新安装 `pi-memory@3.0.0` 都会在 import 时因缺少 `loadConfigFrom` 导出而崩。**
-用户已确认接受，因此不发 2.0.0、不留薄壳。缓解只有一条：先发 `memory-core 1.2.0`，紧接着发
-`pi-memory 3.1.0`（它依赖 `^1.2.0`），让新安装拿到能工作的组合。
+已发布的 `@yandy0725/pi-memory@3.0.0` 声明 `@yandy0725/memory-core@^1.0.0`。`^1.0.0` 的语义是
+`>=1.0.0 <2.0.0`，而配置 IO 下放实际随 `2.0.0` 一起发布（见主稿 §10），因此 `2.0.0` **不在**该范围里：
+全新安装 `pi-memory@3.0.0` 仍解析到 core `1.0.1`，不会因缺少 `loadConfigFrom` 导出而在 import 时崩。
+真正的迁移对象是**直接以浮动范围依赖 `memory-core` 的任何人**；`pi-memory@3.0.0` 只是不再收到修复。
+用户已确认接受，因此只发一次 `2.0.0` + `4.0.0`、不留薄壳。
 
 ## 9. 留给建造者的
 

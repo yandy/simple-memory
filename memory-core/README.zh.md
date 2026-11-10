@@ -143,6 +143,28 @@ export interface HostTranscriptPort {
 }
 ```
 
+`HeadlessOutcome` 是 `run` 必须返回的结果，它是一个四分支 union：
+
+```ts
+type HeadlessOutcome =
+	| { status: "completed"; text: string }
+	| { status: "no-output" }
+	| { status: "incomplete"; cause: "max-tokens" | "turn-limit" | "aborted" }
+	| { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
+```
+
+**判别规则：请求发出之前就结束 → `not-run`；发出之后没拿到完整答案 → `incomplete`。**
+（`no-output` 是「跑了但没有任何文本」；空回复是 `{ status: "completed", text: "" }`，不是 `no-output`。）
+
+各任务的后果：
+
+- **extract**：`not-run` → `{ skipped: true }`；`incomplete` → 跑过一部分（`{ skipped: false }`）；
+  `no-output` → `{ skipped: false, result: "" }`。
+- **dream**：任何非 `completed` 结果都会抛错（fail-closed）。
+- **surfacing**：返回空结果（`{ files: [], content: "" }`）。
+
+注意：这是新的 `HeadlessAgentPort` 必须返回的形状 —— `runTask` 建在它之上，不会退回到纯字符串。
+
 `runTask(TASKS.autoSurfacing, input, ctx)`、`runTask(TASKS.extractMemories, input, ctx)`、
 `runTask(TASKS.dream, input, ctx)` 都通过 `ctx.ports` 显式收端口 —— 没有模块级单例。
 
@@ -185,7 +207,8 @@ pi 就这么读它的两个 `memory.json`，dsh 也这么合并它的 cordis 行
 
 **三个模型任务现在是一等对象。** `autoSurfacing`、`extractMemories`、`dream` 是声明在 `TASKS` 里的
 任务描述符，唯一的入口是 `runTask(task, input, ctx)`：它自己读 config、造 prompt、施加该任务的
-锁/快照计划、再跑端口。旧的三个 `run*` 函数删掉了。`HeadlessAgentPort.run` 现在返回
+锁/快照计划、再跑端口。旧的三个 `run*` 函数删掉了，一起删掉的还有它们的选项类型 `RunSideQueryOpts`、`RunExtractOpts`、
+`RunDreamOpts`，以及 `ExtractPorts` 接口。`HeadlessAgentPort.run` 现在返回
 `HeadlessOutcome`（`completed` / `no-output` / `incomplete` / `not-run`）而不是 `string | null`，
 端口因此能区分「跑了但没写出东西」与「根本没跑」。每个适配层用 `IMPLEMENTED_TASKS` 声明自己实现了
 哪些任务，`/memory` 的模块行由 core 的 `moduleStatusRows(cfg, tasks)` 派生 —— core 给行数据，措辞与

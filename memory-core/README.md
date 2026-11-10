@@ -147,6 +147,30 @@ export interface HostTranscriptPort {
 }
 ```
 
+`HeadlessOutcome` is the result your `run` must return. It is a four-arm union:
+
+```ts
+type HeadlessOutcome =
+	| { status: "completed"; text: string }
+	| { status: "no-output" }
+	| { status: "incomplete"; cause: "max-tokens" | "turn-limit" | "aborted" }
+	| { status: "not-run"; cause: "host-refused" | "unavailable" | "timeout" | "aborted"; detail?: string };
+```
+
+**Discriminate by when the run ended: finished before the request was issued → `not-run`; issued
+without a complete answer → `incomplete`.** (`no-output` is the "ran, produced no text" case; an
+empty completed reply is `{ status: "completed", text: "" }`, not `no-output`.)
+
+The tasks translate each arm as follows:
+
+- **extract**: `not-run` → `{ skipped: true }`; `incomplete` → ran-with-partial (`{ skipped: false }`);
+  `no-output` → `{ skipped: false, result: "" }`.
+- **dream**: throws on every non-`completed` outcome (it is fail-closed).
+- **surfacing**: returns an empty result (`{ files: [], content: "" }`).
+
+This is the shape a new `HeadlessAgentPort` must return — `runTask` is built on top of it and does
+not fall back to a plain string.
+
 `runTask(TASKS.autoSurfacing, input, ctx)`, `runTask(TASKS.extractMemories, input, ctx)` and
 `runTask(TASKS.dream, input, ctx)` take the ports explicitly through `ctx.ports` — there is no
 module-level singleton.
@@ -197,7 +221,8 @@ live, and whether a project is trusted, is host knowledge and stays in the adapt
 **The three model tasks are now first-class.** `autoSurfacing`, `extractMemories` and `dream` are task
 descriptors declared once in `TASKS`; the single entry point is `runTask(task, input, ctx)`, which reads
 the config, builds the prompt, applies the task's lock/snapshot plan and runs the port. The three legacy
-`run*` functions are gone. `HeadlessAgentPort.run` now returns a `HeadlessOutcome` (`completed` /
+`run*` functions are gone, along with their option types `RunSideQueryOpts`, `RunExtractOpts`,
+`RunDreamOpts`, and the `ExtractPorts` interface. `HeadlessAgentPort.run` now returns a `HeadlessOutcome` (`completed` /
 `no-output` / `incomplete` / `not-run`) instead of `string | null`, so a port can tell "ran but produced
 nothing" apart from "never ran". Each adapter declares the tasks it implements in `IMPLEMENTED_TASKS`,
 and `/memory`'s module line is derived from core's `moduleStatusRows(cfg, tasks)` — core supplies the
