@@ -1,5 +1,5 @@
 import type { EntryManifest } from "../injection.js";
-import { buildSideQueryTask, renderSurfacedBlock } from "../injection.js";
+import { buildSideQueryTask, renderSurfacedEntries } from "../injection.js";
 import type { MemoryTask } from "./task.js";
 
 export interface SurfacingInput {
@@ -12,7 +12,7 @@ export interface SurfacingInput {
 }
 
 export interface SurfacingResult {
-	/** 本轮选中且渲染成功的文件；渲染不出内容时恒为 `[]`（不标记已注入）。 */
+	/** 本轮真正渲染成功的文件；渲染不出内容时恒为 `[]`（不标记已注入）。 */
 	files: string[];
 	content: string;
 }
@@ -51,15 +51,15 @@ export const autoSurfacing: MemoryTask<SurfacingInput, SurfacingResult> = {
 		return buildSideQueryTask(remaining, input.userPrompt, cfg.autoSurfacing.maxFiles);
 	},
 	async parse(cfg, deps, input, text) {
-		const files = parseSelectedFiles(text, candidates(input), cfg.autoSurfacing.maxFiles);
-		const content = await renderSurfacedBlock(
+		const selected = parseSelectedFiles(text, candidates(input), cfg.autoSurfacing.maxFiles);
+		// 只返回真正渲染出来的文件：预算被 maxInjectionBytes 截断、或 readEntry 读不到时，
+		// 未渲染的文件不能进 `files`，否则适配层会把它们标记成已注入、整个 session 不再浮现。
+		return renderSurfacedEntries(
 			deps.store,
-			files,
+			selected,
 			cfg.autoSurfacing.maxEntryBytes,
 			cfg.autoSurfacing.maxInjectionBytes,
 		);
-		// 渲染不出来的文件不该被适配层标记为已注入：内容为空时文件列表一并清空。
-		return content === "" ? { files: [], content: "" } : { files, content };
 	},
 	notCompleted() {
 		return { files: [], content: "" };

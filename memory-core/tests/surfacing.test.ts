@@ -217,4 +217,30 @@ describe("TASKS.autoSurfacing via runTask", () => {
 		);
 		expect(result.files).toEqual(["a.md", "b.md"]);
 	});
+
+	// maxInjectionBytes 是渲染侧的预算：选中列表里有文件因预算被砍掉时，`files` 只该含真正
+	// 渲染进 `content` 的文件。否则适配层会把没进模型的记忆也标记为已注入，整个 session 不再浮现。
+	it("reports only the files it actually rendered when the injection budget cuts the list", async () => {
+		await store.addEntry({ name: "a", body: "x".repeat(3000) });
+		await store.addEntry({ name: "b", body: "y".repeat(3000) });
+		headlessRun.mockResolvedValueOnce({
+			status: "completed",
+			text: '{"selected_files":["a.md","b.md"]}',
+		});
+
+		const result = await runTask(
+			TASKS.autoSurfacing,
+			{ userPrompt: "q", injectedFiles: new Set<string>(), manifest: [manifest("a.md"), manifest("b.md")] },
+			ctx({
+				cfg: mergeConfig(DEFAULT_CONFIG, {
+					defaults: { model: "deepseek/deepseek-v4-flash" },
+					autoSurfacing: { maxInjectionBytes: 4000 },
+				}),
+			}),
+		);
+
+		expect(result.files).toEqual(["a.md"]);
+		expect(result.content).toContain("## a");
+		expect(result.content).not.toContain("## b");
+	});
 });
