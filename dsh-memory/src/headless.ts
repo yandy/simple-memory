@@ -11,8 +11,9 @@ import { parseModelRef } from "./model.js";
  * extract / dream 的 `builtinTools: "file-io"` 与 `memoryTool !== null` 尚未实现，那类请求一律返回
  * `{ status: "not-run", cause: "host-refused" }`（= 没跑），**不抛错**。
  *
- * 结果词汇按 core 的判别规则映射：请求**发出前**结束 → `not-run`；发出后没拿到完整文本 →
- * `incomplete`。本适配层自己产生的 `incomplete` 只有一种：宿主发了终止 `aborted` chunk。
+ * 结果词汇按 core 的判别规则映射：请求**发出前**结束 → `not-run`；**发出后**没拿到完整答案 →
+ * `incomplete`。本适配层自己产生的 `incomplete` 都来自「已发出后被中断」：循环里的 abort 检查、
+ * 宿主发的终止 `aborted` chunk，以及调用方取消导致的抛错。
  */
 
 /** 宿主 `ctx.llm` 里我们用到的那一小片，结构化描述、零宿主 import。 */
@@ -84,16 +85,13 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 			if (timeoutController !== undefined) signals.push(timeoutController.signal);
 			const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 
-			// 已发出但被中断（还没拿到完整文本）时的收口：定时器响过 = `timeout`，否则是委托方取消 /
-			// 宿主中断。两者都是 `not-run`：这次调用没拿到可用的答案，调用方不该把它当「跑过」。
+			// 已发出但被中断（还没拿到完整文本）时的收口，遵循 core 的判别规则：
+			// **发出后**没拿到完整答案 = `incomplete`（`aborted`）；定时器响过 = 请求没拿到结果 = `not-run`（`timeout`）。
+			// 这里绝不返回 `host-refused`：请求已经发出去了，宿主没有拒绝它。
 			const interruptedOutcome = (): HeadlessOutcome =>
 				timeoutController?.signal.aborted === true
 					? { status: "not-run", cause: "timeout" }
-					: {
-							status: "not-run",
-							cause: "host-refused",
-							detail: "the call was aborted before the answer completed",
-						};
+					: { status: "incomplete", cause: "aborted" };
 
 			const streamOptions = {
 				provider: ref.provider,
@@ -168,11 +166,12 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 					// 这是最容易被人「好心」补上的地方。tool-call-delta / usage 也一律忽略。
 				}
 			} catch (e) {
-				// middleware / nested-call / cleanup / consumer 失败仍会抛：同样视为「本轮没跑成」。
+				// middleware / nested-call / cleanup / consumer 失败仍会抛。
 				// 定时器响过时宿主很可能只是把 abort 变成异常抛出 —— 那也是超时，不是宿主拒绝。
-				return timeoutController?.signal.aborted === true
-					? { status: "not-run", cause: "timeout" }
-					: { status: "not-run", cause: "host-refused", detail: errorMessage(e) };
+				if (timeoutController?.signal.aborted === true) return { status: "not-run", cause: "timeout" };
+				// 调用方取消导致的抛错是「已发出后被中断」，不是宿主拒绝 —— 同样按 core 的判别规则走。
+				if (req.signal?.aborted === true) return { status: "incomplete", cause: "aborted" };
+				return { status: "not-run", cause: "host-refused", detail: errorMessage(e) };
 			} finally {
 				if (timer !== undefined) clearTimeout(timer);
 			}

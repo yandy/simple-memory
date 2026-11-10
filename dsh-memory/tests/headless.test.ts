@@ -347,6 +347,20 @@ describe("createDshHeadless — 两条失败通道", () => {
 		});
 	});
 
+	it("maps a stream that throws after the caller aborted to incomplete/aborted, not host-refused", async () => {
+		const controller = new AbortController();
+		const llm: LlmLike = {
+			async *stream() {
+				yield { type: "text-delta", text: "partial" };
+				controller.abort();
+				// 宿主把 abort 变成异常抛出而不是终止 chunk：这是「已发出后被中断」，不是宿主拒绝。
+				throw new DOMException("aborted", "AbortError");
+			},
+		};
+		const port = createDshHeadless(llm);
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "incomplete", cause: "aborted" });
+	});
+
 	it("drops the partial text when an error finish follows a text chunk", async () => {
 		const llm: LlmLike = {
 			stream: chunkStream(
@@ -373,7 +387,7 @@ describe("createDshHeadless — signal", () => {
 		expect(stream).not.toHaveBeenCalled();
 	});
 
-	it("maps a mid-stream abort to not-run/host-refused (not the partial text)", async () => {
+	it("maps an in-loop mid-stream abort to incomplete/aborted (issued, not host-refused)", async () => {
 		const controller = new AbortController();
 		const llm: LlmLike = {
 			async *stream() {
@@ -384,11 +398,7 @@ describe("createDshHeadless — signal", () => {
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({
-			status: "not-run",
-			cause: "host-refused",
-			detail: expect.any(String),
-		});
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "incomplete", cause: "aborted" });
 	});
 
 	it("gives up on the next chunk when the signal aborts but the stream ignores it", async () => {
@@ -403,11 +413,8 @@ describe("createDshHeadless — signal", () => {
 			},
 		};
 		const port = createDshHeadless(llm);
-		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({
-			status: "not-run",
-			cause: "host-refused",
-			detail: expect.any(String),
-		});
+		// 定时器没响，只有调用方取消：已发出的调用被中断，是 `incomplete`。
+		expect(await port.run(baseReq({ signal: controller.signal }))).toEqual({ status: "incomplete", cause: "aborted" });
 	});
 });
 
@@ -461,7 +468,7 @@ describe("createDshHeadless — timeout", () => {
 		const port = createDshHeadless(llm);
 		const pending = port.run(baseReq({ signal: controller.signal, timeoutMs: 50 }));
 		controller.abort();
-		expect(await pending).toEqual({ status: "not-run", cause: "host-refused", detail: expect.any(String) });
+		expect(await pending).toEqual({ status: "incomplete", cause: "aborted" });
 		expect(seenSignal?.aborted).toBe(true);
 	});
 
