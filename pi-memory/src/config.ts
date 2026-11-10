@@ -7,7 +7,7 @@ import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, mergeConfig, type Memor
 /**
  * pi 侧的配置层负责两件事：把「配置文件在哪」这条宿主知识组装成文件列表，然后**自己读**它们。
  *
- * 默认值、deep-merge 语义、`~` 展开、模型校验（`modelConfigErrors` / `requiredModel` / `taskModel`）
+ * 默认值、deep-merge 语义、`~` 展开、模型校验（`modelConfigErrors` / `requiredModels`）
  * 全部在 `@yandy0725/memory-core`，这里原样重导出，使 `index.ts` 与其余 pi 模块的 import 面不变。
  * core 不认识任何宿主的配置文件路径（也不读文件）：读不读、读哪几个，由适配层决定。
  */
@@ -16,9 +16,7 @@ export {
 	defaultMemoryRoot,
 	expandTilde,
 	modelConfigErrors,
-	requiredModel,
 	requiredModels,
-	taskModel,
 } from "@yandy0725/memory-core";
 export type {
 	AutoSurfacingConfig,

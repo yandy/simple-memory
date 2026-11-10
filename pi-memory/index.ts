@@ -76,6 +76,8 @@ function countInjectedBlocks(content: string): number {
 	return Math.max(0, content.split("\n## ").length - 1);
 }
 
+export const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
+
 /**
  * `/memory` 的模块激活状态一行：`dream=on(model) extractMemories=off autoSurfacing=on(model)`。
  *
@@ -89,8 +91,6 @@ function countInjectedBlocks(content: string): number {
  * 导出供测试直接覆盖：正常会话里「模型解析不出」那条路径走不到（`session_start` 会先拦成
  * misconfigured），只能直接调纯函数。
  */
-export const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
-
 export function moduleStatusLine(cfg: MemoryConfig): string {
 	return moduleStatusRows(cfg, IMPLEMENTED_TASKS)
 		.map((row) => `${row.id}=${row.enabled ? `on(${row.model ?? "no model"})` : "off"}`)

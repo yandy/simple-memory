@@ -232,4 +232,16 @@ describe("公开出口", () => {
 		const api = await import("../src/index.js");
 		expect("loadConfigFrom" in api).toBe(false);
 	});
+
+	it("no longer exposes the three run* entry points", async () => {
+		const api = await import("../src/index.js");
+		for (const name of ["runSideQuery", "runExtract", "runDream"]) expect(name in api).toBe(false);
+	});
+
+	it("exposes the 2.0.0 task model", async () => {
+		const api = await import("../src/index.js");
+		expect(typeof api.runTask).toBe("function");
+		expect(Object.keys(api.TASKS).sort()).toEqual(["autoSurfacing", "dream", "extractMemories"]);
+		expect(typeof api.moduleStatusRows).toBe("function");
+	});
 });

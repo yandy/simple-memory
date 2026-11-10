@@ -1584,7 +1584,7 @@ describe("index wiring (integration)", () => {
 		expect(extractCall?.[1]?.actions).toHaveLength(5);
 		expect(typeof extractCall?.[1]?.onWrite).toBe("function");
 		// extract 没有整轮快照，所以**不得**带 skipSnapshot：每次写入都要留下自己的回滚点
-		expect(extractCall?.[1]?.skipSnapshot).toBeUndefined();
+		expect(extractCall?.[1]?.skipSnapshot).toBeFalsy();
 	});
 
 	it("/memory appends the 2.x migration hint when the detector finds old data", async () => {

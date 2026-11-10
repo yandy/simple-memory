@@ -437,6 +437,12 @@ describe("runTask(TASKS.extractMemories)", () => {
 				model: "deepseek/deepseek-v4-flash",
 			}),
 		);
+		// 请求的其余字段由 plan 派生：把 `skipLogicalLock` 改成 `lock === "logical+snapshot"`
+		// 会让 extract 的每次 memory 写入都去抢它已持有的锁（每次 5s 超时）。
+		expect(headlessRun).toHaveBeenCalledWith(expect.objectContaining({
+			builtinTools: "none", maxTurns: 5, timeoutMs: 120_000,
+			memoryTool: expect.objectContaining({ actions: MAIN_AGENT_ACTIONS, skipLogicalLock: true, skipSnapshot: false }),
+		}));
 	});
 
 	it("forwards onWrite into the memory tool spec so the adapter can count writes", async () => {

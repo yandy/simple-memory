@@ -57,6 +57,7 @@ const DANGLING_REFERENCE_PATTERNS: Array<{ re: RegExp; why: string }> = [
 	{ re: /\bRuling\b/, why: "pi-packages 内部 spec 的裁决编号" },
 	{ re: /\bPlan [A-E]\b/, why: "pi-packages 内部实施计划的代号" },
 	{ re: /\bFinding [A-Z]/, why: "pi-packages 内部审阅的编号" },
+	{ re: /\bTask \d+\b/, why: "内部实施计划的任务编号" },
 	{ re: /终审/, why: "pi-packages 内部审阅的轮次" },
 	{ re: /\bledger\b/i, why: "pi-packages 内部执行台账" },
 	// 前后两个断言排除掉标识符与路径：`memory-store` / `memoryDir` / `./store/memory-store.js` /

@@ -164,7 +164,7 @@ export async function renderStatus(
 		rt.surfacing.available
 			? `autoSurfacing=on(${taskModel(rt.config, "autoSurfacing") ?? "no model"})`
 			: `autoSurfacing=off(${rt.surfacing.reason ?? "disabled"})`,
-		...rows.filter((row) => row.id !== "autoSurfacing").map((row) => `${row.id}=${NOT_IMPLEMENTED}`),
+		...rows.filter((row) => !row.implemented).map((row) => `${row.id}=${NOT_IMPLEMENTED}`),
 	].join(", ");
 
 	const lines = [

@@ -397,4 +397,23 @@ describe("runTask(TASKS.dream)", () => {
 			}),
 		).rejects.toThrow(/dream round/);
 	});
+
+	// `deepMerge` 把用户写的 `"dream": null` 原样带进来：启动校验通过后，runTask 仍不得在
+	// `cfg[task.id].thinkLevel` / `.sessionPersistence` 上抛 TypeError，而应把子树当作未配置。
+	it("treats a null dream subtree as unset instead of throwing a TypeError", async () => {
+		const out = await runTask(
+			TASKS.dream,
+			{},
+			{
+				cfg: mergeConfig(DEFAULT_CONFIG, {
+					defaults: { model: "provider/base", sessionPersistence: { enabled: true } },
+					dream: null,
+				}),
+				cwd: dir,
+				store,
+				ports: { headless: { run: async () => ({ status: "completed", text: "merged" }) } },
+			},
+		);
+		expect(out).toBe("merged");
+	});
 });

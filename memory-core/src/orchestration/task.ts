@@ -76,7 +76,7 @@ export interface MemoryTask<I, R> {
 	parse(cfg: MemoryConfig, deps: TaskDeps, input: I, text: string): R | Promise<R>;
 	/** core 没跑、或端口没跑成时怎么呈现（三个任务词汇不同的唯一合法处）。 */
 	notCompleted(cfg: MemoryConfig, deps: TaskDeps, input: I, why: Incomplete): R;
-	/** 只有 extractMemories 实现：把 `input.onWrite` 透给子会话的工具（Task 5 用）。 */
+	/** 只有 extractMemories 实现：把 `input.onWrite` 透给子会话的工具。 */
 	memoryToolHooks?(input: I): { onWrite?: MemoryToolOnWrite } | undefined;
 }
 
@@ -119,7 +119,7 @@ export function buildRequest(
 
 /** 会话持久化的继承规则：per-task ?? `defaults`。config 消费点收在 core，适配层不再各写一份。 */
 function resolveSessionPersistence(cfg: MemoryConfig, task: ModelTask) {
-	return cfg[task].sessionPersistence ?? cfg.defaults?.sessionPersistence;
+	return cfg[task]?.sessionPersistence ?? cfg.defaults?.sessionPersistence;
 }
 
 /** 「宿主/库抛出来的任意值」→ 一句可读文本。core 不能 import 适配层的 errors.ts（中立性约束），
@@ -168,7 +168,7 @@ export async function runTask<I, R>(task: MemoryTask<I, R>, input: I, ctx: TaskC
 	const deps: TaskDeps = { store: ctx.store, transcript: ctx.ports.transcript };
 
 	const model = requiredModel(cfg, task.id);
-	const effort = cfg[task.id].thinkLevel;
+	const effort = cfg[task.id]?.thinkLevel;
 	const sessionPersistence = resolveSessionPersistence(cfg, task.id);
 
 	const prompt = task.buildPrompt(cfg, deps, input);
@@ -219,12 +219,12 @@ export async function runTask<I, R>(task: MemoryTask<I, R>, input: I, ctx: TaskC
 			return ctx.store.withLogicalLock(async () => {
 				// 启动自检：忘了包 withLogicalLock 会静默失去整轮互斥。
 				if (!ctx.store.logicalLockActive()) {
-					throw new Error("dream must run under the memory logical lock");
+					throw new Error(`${task.id} must run under the memory logical lock`);
 				}
 
 				// 进入时对整目录拍一次快照；这一轮里各原语的逐文件快照被 skipSnapshot 跳过。
 				const files = await snapshotFiles(ctx.cwd, ctx.store.cfg.platform);
-				await createSnapshot(join(ctx.cwd, BACKUP_DIR), "dream", files, ctx.cwd, {
+				await createSnapshot(join(ctx.cwd, BACKUP_DIR), task.id, files, ctx.cwd, {
 					keep: ctx.store.cfg.lock.snapshotKeep,
 					platform: ctx.store.cfg.platform,
 				});

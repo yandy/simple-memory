@@ -3,7 +3,7 @@ import { buildDreamTask } from "./prompts.js";
 import type { MemoryTask } from "./task.js";
 
 /** `incomplete` / `not-run` 的短诊断：`cause`，`not-run` 带上 `detail`。 */
-function describe(why: { cause: string; detail?: string }): string {
+function describeCause(why: { cause: string; detail?: string }): string {
 	return why.detail ? `${why.cause} (${why.detail})` : why.cause;
 }
 
@@ -33,7 +33,7 @@ export const dream: MemoryTask<Record<string, never>, string> = {
 				throw new Error("the host ran the dream round but produced no summary");
 			case "incomplete":
 			case "not-run":
-				throw new Error(`the dream round did not complete (${describe(why)})`);
+				throw new Error(`the dream round did not complete (${describeCause(why)})`);
 		}
 	},
 };
