@@ -75,7 +75,7 @@ export interface HeadlessAgentPort {
 	 * 跑一轮受限工具的 headless 会话。
 	 *
 	 * 结果必须是 `HeadlessOutcome`：调用方要靠 `status` 区分「跑了但没写出东西」与「根本没跑」
-	 * （`runExtract` 靠它决定要不要报 `{ skipped: true }`）。传输级异常仍可抛。
+	 * （extract 描述符靠它决定要不要报 `{ skipped: true }`）。传输级异常仍可抛。
 	 */
 	run(req: HeadlessRunRequest): Promise<HeadlessOutcome>;
 }

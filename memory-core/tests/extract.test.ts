@@ -3,15 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	DEFAULT_CONFIG,
 	MAIN_AGENT_ACTIONS,
 	MemoryStore,
 	TASKS,
 	type ExtractMessage,
-	type RunExtractOpts,
+	type MemoryAction,
+	type SessionPersistenceConfig,
 	type StoreConfig,
+	type TaskContext,
 	buildExtractTask,
+	mergeConfig,
 	renderConversation,
-	runExtract,
+	runTask,
 } from "../src/index.js";
 
 /** 假的 `HeadlessAgentPort`。 */
@@ -22,7 +26,45 @@ const headlessRun = vi.fn();
  */
 const toExtractMessages = (raw: unknown[]): ExtractMessage[] => raw as ExtractMessage[];
 const ports = { headless: { run: headlessRun }, transcript: { toExtractMessages, searchSessions: async () => "" } };
-const extract = (o: RunExtractOpts) => runExtract(o, ports);
+
+interface ExtractOverrides {
+	effort?: string;
+	memoryDir?: string;
+	store?: MemoryStore;
+	messages?: unknown[];
+	maxContextTokens?: number;
+	maxToolResultChars?: number;
+	maxAssistantChars?: number;
+	model?: string;
+	sessionPersistence?: SessionPersistenceConfig;
+	agentsMdBlocks?: string[];
+	onWrite?: (info: { action: MemoryAction; name?: string }) => void;
+}
+
+const extract = (o: Partial<ExtractOverrides> = {}) =>
+	runTask(
+		TASKS.extractMemories,
+		{
+			messages: o.messages ?? [{ role: "user", text: "hello" }],
+			agentsMdBlocks: o.agentsMdBlocks ?? [],
+			onWrite: o.onWrite,
+		},
+		{
+			cfg: mergeConfig(DEFAULT_CONFIG, {
+				defaults: { model: o.model ?? "deepseek/deepseek-v4-flash", sessionPersistence: o.sessionPersistence },
+				extractMemories: {
+					thinkLevel: o.effort ?? "high",
+					maxContextTokens: o.maxContextTokens ?? 2000,
+					maxToolResultChars: o.maxToolResultChars ?? 500,
+					maxAssistantChars: o.maxAssistantChars ?? 2000,
+					sessionPersistence: o.sessionPersistence,
+				},
+			}),
+			cwd: o.memoryDir ?? dir,
+			store: o.store ?? store,
+			ports,
+		},
+	);
 
 const LIMITS = { maxToolResultChars: 500, maxAssistantChars: 2000, maxContextTokens: 100_000 };
 
@@ -43,7 +85,7 @@ function busyStore(): MemoryStore {
 	} as unknown as MemoryStore;
 }
 
-function opts(over: Partial<RunExtractOpts> = {}): RunExtractOpts {
+function opts(over: Partial<ExtractOverrides> = {}): Partial<ExtractOverrides> {
 	return {
 		effort: "high",
 		memoryDir: dir,
@@ -351,7 +393,7 @@ describe("buildExtractTask", () => {
 	});
 });
 
-describe("runExtract", () => {
+describe("runTask(TASKS.extractMemories)", () => {
 	// extract **不等待**逻辑锁 —— 拿不到即跳过本轮。
 	it("returns skipped without calling the headless agent when the logical lock is busy", async () => {
 		const out = await extract(opts({ store: busyStore() }));
@@ -368,7 +410,14 @@ describe("runExtract", () => {
 			headless: { run: headlessRun },
 			transcript: { toExtractMessages: () => [], searchSessions: async () => "" },
 		};
-		expect(await runExtract(opts({ messages: [null, 42, {}] }), empty)).toEqual({ skipped: true });
+		const cfg = mergeConfig(DEFAULT_CONFIG, { defaults: { model: "deepseek/deepseek-v4-flash" } });
+		expect(
+			await runTask(
+				TASKS.extractMemories,
+				{ messages: [null, 42, {}], agentsMdBlocks: [] },
+				{ cfg, cwd: dir, store, ports: empty },
+			),
+		).toEqual({ skipped: true });
 		expect(headlessRun).not.toHaveBeenCalled();
 	});
 

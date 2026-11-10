@@ -3,19 +3,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	DEFAULT_CONFIG,
 	DREAM_ACTIONS,
 	MemoryStore,
-	type RunDreamOpts,
+	TASKS,
+	type SessionPersistenceConfig,
 	type StoreConfig,
+	type TaskContext,
 	buildDreamTask,
-	runDream,
+	mergeConfig,
+	runTask,
 } from "../src/index.js";
 import { createReservedNameFixture, removeReservedNameFixture } from "./helpers/reserved-name.js";
 
 /** 假的 `HeadlessAgentPort`：dream 只关心「宿主跑了这一轮、回了什么」。 */
 const headlessRun = vi.fn();
 const ports = { headless: { run: headlessRun } };
-const dream = (o: RunDreamOpts) => runDream(o, ports);
+const dream = (o: TaskContext) => runTask(TASKS.dream, {}, o);
 
 let dir: string;
 let store: MemoryStore;
@@ -28,14 +32,25 @@ const CFG = (memoryDir: string, over: Partial<StoreConfig> = {}): StoreConfig =>
 	...over,
 });
 
-function opts(over: Partial<RunDreamOpts> = {}): RunDreamOpts {
+interface DreamOverrides {
+	effort?: string;
+	memoryDir?: string;
+	store?: MemoryStore;
+	maxLines?: number;
+	model?: string;
+	sessionPersistence?: SessionPersistenceConfig;
+}
+
+function opts(over: Partial<DreamOverrides> = {}): TaskContext {
 	return {
-		effort: "high",
-		memoryDir: dir,
-		store,
-		maxLines: 200,
-		model: "deepseek/deepseek-v4-flash",
-		...over,
+		cfg: mergeConfig(DEFAULT_CONFIG, {
+			defaults: { model: over.model ?? "deepseek/deepseek-v4-flash", sessionPersistence: over.sessionPersistence },
+			memIndexMaxLines: over.maxLines ?? 200,
+			dream: { thinkLevel: over.effort ?? "high", sessionPersistence: over.sessionPersistence },
+		}),
+		cwd: over.memoryDir ?? dir,
+		store: over.store ?? store,
+		ports,
 	};
 }
 
@@ -124,7 +139,7 @@ describe("buildDreamTask", () => {
 	});
 });
 
-describe("runDream", () => {
+describe("runTask(TASKS.dream)", () => {
 	it("holds the process-wide logical lock for the whole run", async () => {
 		// 短超时：没有 skipLogicalLock 的调用会被挡住，5s 的默认超时会让这个用例跑 5 秒。
 		const shortStore = new MemoryStore(CFG(dir, { lock: { timeoutMs: 40, snapshotKeep: 5 } }));

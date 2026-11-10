@@ -1,8 +1,6 @@
-import type { SessionPersistenceConfig } from "../config.js";
 import type { EntryManifest } from "../injection.js";
 import { buildSideQueryTask, renderSurfacedBlock } from "../injection.js";
-import type { HeadlessAgentPort } from "./ports.js";
-import { buildRequest, type MemoryTask } from "./task.js";
+import type { MemoryTask } from "./task.js";
 
 export interface SurfacingInput {
 	/** 本轮的候选清单（`scanEntries` 的产出）。 */
@@ -68,59 +66,3 @@ export const autoSurfacing: MemoryTask<SurfacingInput, SurfacingResult> = {
 	},
 };
 
-export interface RunSideQueryOpts {
-	/** 本轮的候选清单（`scanEntries` 的产出）。 */
-	manifest: EntryManifest[];
-	/** 用户这一轮的输入（调用方负责先截到预算内）。 */
-	userPrompt: string;
-	/** 本 session 已经注入过的文件，不再重复选。 */
-	injectedFiles: Set<string>;
-	maxFiles: number;
-	/** 宿主的思考/推理档位，core 原样透传。 */
-	effort?: string;
-	model: string;
-	/** 子会话 cwd；传 memoryDir。 */
-	cwd: string;
-	/**
-	 * 宿主那一轮的取消信号，原样透传给端口的 `HeadlessRunRequest.signal`。
-	 * 适配层通常在「宿主会 await 的钩子」里调用本函数（例如每轮开始前），此时不传 signal 意味着
-	 * 用户取消后，调用方仍要等满 `timeoutMs` 才拿得到一个没人要的结果。
-	 */
-	signal?: AbortSignal;
-	sessionPersistence?: SessionPersistenceConfig;
-}
-
-/**
- * 【过渡】跑一轮轻量侧查询，选出与用户输入相关的 entry 文件名。
- *
- * Task 7 删除本入口：适配层将直接调 `runTask(TASKS.autoSurfacing, input, ctx)` 并拿到
- * `{ files, content }`。保留期间保持旧签名与旧行为，适配层无需改动。
- *
- * 超时/失败一律返回 `[]`，**没有回退**：auto-surfacing 是纯增益，选不出来就不注入，
- * 绝不因为侧查询挂了而打断用户这一轮。
- */
-export async function runSideQuery(
-	opts: RunSideQueryOpts,
-	ports: { headless: HeadlessAgentPort },
-): Promise<string[]> {
-	const remaining = opts.manifest.filter((entry) => !opts.injectedFiles.has(entry.file));
-	if (remaining.length === 0) return [];
-	const task = buildSideQueryTask(remaining, opts.userPrompt, opts.maxFiles);
-	try {
-		// 请求由 `buildRequest` 统一构造：plan 的取值（maxTurns / timeout / builtinTools / memoryTool）
-		// 与这里给的宿主参数合流，不再在 core 里写第二份。
-		const result = await ports.headless.run(
-			buildRequest(autoSurfacing, task, {
-				cwd: opts.cwd,
-				model: opts.model,
-				effort: opts.effort,
-				sessionPersistence: opts.sessionPersistence,
-				signal: opts.signal,
-			}),
-		);
-		if (result.status !== "completed") return [];
-		return parseSelectedFiles(result.text, remaining, opts.maxFiles);
-	} catch {
-		return [];
-	}
-}

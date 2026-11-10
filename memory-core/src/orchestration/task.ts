@@ -49,7 +49,7 @@ export interface TaskContext {
 export interface RequestHost {
 	/** 子会话 cwd；三个任务恒为 memoryDir。 */
 	cwd: string;
-	/** 宿主自己的模型标识，已由调用方解析（`requiredModel`，或旧 `RunSideQueryOpts.model`）。 */
+	/** 宿主自己的模型标识，已由 `runTask` 从 `cfg` 解析（`requiredModel`）。 */
 	model: string;
 	/** 宿主自己的思考/推理档位，core 原样透传。 */
 	effort?: string;
@@ -81,11 +81,10 @@ export interface MemoryTask<I, R> {
 }
 
 /**
- * 构造端口请求：plan 的取值与调用方的宿主参数在这里合流，`runTask` 与过渡期的 `runSideQuery` 共用。
+ * 构造端口请求：plan 的取值与 `runTask` 从 `cfg` 解析出的宿主参数在这里合流。
  *
- * 只收构造请求真正需要的入参，`cfg` 与 `TaskContext` 都不进来：过渡期的 `runSideQuery` 没有 `cfg`，
- * 它的 model / effort / sessionPersistence 是调用方给的显式参数（见 `RunSideQueryOpts`）。解析留在
- * 调用方（`runTask` 从 `cfg` 读、`runSideQuery` 用入参），请求形状因此只在这里写一遍。
+ * 只收构造请求真正需要的入参，`cfg` 与 `TaskContext` 都不进来：解析留在 `runTask`
+ * （model / effort / sessionPersistence 都从 `cfg` 读），请求形状因此只在这里写一遍。
  */
 export function buildRequest(
 	task: MemoryTask<unknown, unknown>,

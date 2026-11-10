@@ -4,22 +4,20 @@ import {
 	LOCK_FILE,
 	type LockInfo,
 	MemoryStore,
+	TASKS,
 	buildIndexSection,
 	indexCapacity,
 	indexInjectionCapacity,
 	parseEntryIndex,
 	readLockStatus,
-	renderSurfacedBlock,
 	resolveMemoryDir,
-	runDream,
-	runExtract,
-	runSideQuery,
+	runTask,
 	scanEntries,
 	withFsRetry,
 } from "@yandy0725/memory-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { legacyMemoryRoot, loadConfig, modelConfigErrors, requiredModel, taskModel, type LoadedConfig, type MemoryConfig, type SessionPersistenceConfig } from "./src/config";
+import { legacyMemoryRoot, loadConfig, modelConfigErrors, taskModel, type LoadedConfig, type MemoryConfig } from "./src/config";
 import { readRecordedMemoryIndex } from "./src/index-source";
 import { detectLegacyMemoryDir } from "./src/legacy-hint";
 import { applyIndexSection, buildInjection } from "./src/inject-pi";
@@ -149,12 +147,6 @@ async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<
 		}
 		ui.notify(`Failed to remove memory lock: ${(e as Error).message}`, "error");
 	}
-}
-
-function resolveDefault(cfg: MemoryConfig, task: "dream" | "autoSurfacing" | "extractMemories", key: "sessionPersistence"): SessionPersistenceConfig | undefined {
-	const perTask = cfg[task][key];
-	if (perTask !== undefined) return perTask;
-	return cfg.defaults?.[key];
 }
 
 export default function (pi: ExtensionAPI) {
@@ -325,23 +317,13 @@ export default function (pi: ExtensionAPI) {
 				if (ok && activeStore) {
 					// Fire-and-forget: does not block session_start. The headless
 					// dream agent runs independently; completion notifies the user.
-					const dreamModel = requiredModel(config, "dream");
-					const dreamThinkLevel = config.dream.thinkLevel;
 					const dir = nudgeDir;
+					// `runTask` 在第一次 await 之前就同步解析模型（缺模型直接在这里抛），
+					// 所以状态行只会在模型可解析时才会被设置。
+					const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } });
 					ui.setStatus("dream", "Consolidating memory...");
 					// dream 的 7 个 action 只注入它自己的 headless 子会话；整轮持锁与进入时的
-					// 全目录快照都在 runDream 里，所以内部原语两个 skip 都开（由 core 表达）。
-					const dreamRun = runDream(
-						{
-							model: dreamModel,
-							effort: dreamThinkLevel,
-							memoryDir: dir,
-							store: activeStore,
-							maxLines: config.memIndexMaxLines,
-							sessionPersistence: resolveDefault(config, "dream", "sessionPersistence"),
-						},
-						{ headless: headlessFor(ctx) },
-					);
+					// 全目录快照都在 runTask(TASKS.dream) 里，所以内部原语两个 skip 都开（由 core 表达）。
 					track(dreamRun);
 					// 两参 `.then`（而不是 `.then().catch()`）：成功分支自己写 meta，两个分支都不再读 ctx；
 					// writeDreamMeta 的失败也必须在分支内兜住，否则它会变成无人接管的 rejection。
@@ -391,33 +373,18 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.hasUI) ctx.ui.setStatus("surfacing", "Searching relevant memories…");
 				const manifest = await scanEntries(activeStore);
 				if (manifest.length > 0) {
-					const selected = await runSideQuery(
-						{
-							manifest,
-							userPrompt: event.prompt.slice(0, 4000),
-							injectedFiles,
-							maxFiles: autoSurfacing.maxFiles,
-							effort: autoSurfacing.thinkLevel,
-							model: requiredModel(config, "autoSurfacing"),
-							cwd: memoryDir,
-							sessionPersistence: resolveDefault(config, "autoSurfacing", "sessionPersistence"),
-						},
-						{ headless: headlessFor(ctx) },
+					const { files, content } = await runTask(
+						TASKS.autoSurfacing,
+						{ userPrompt: event.prompt.slice(0, 4000), injectedFiles, manifest },
+						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless: headlessFor(ctx) } },
 					);
-					if (selected.length > 0) {
-						const content = await renderSurfacedBlock(
-							activeStore,
-							selected,
-							autoSurfacing.maxEntryBytes,
-							autoSurfacing.maxInjectionBytes,
-						);
-						if (content) {
-							for (const f of selected) injectedFiles.add(f);
-							injectedMessage = { customType: "memory-auto-surfacing", content, display: false };
-							// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知。
-							if (ctx.hasUI) {
-								ctx.ui.notify(`Recalled: ${countInjectedBlocks(content)} entries`, "info");
-							}
+					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
+					if (content !== "") {
+						for (const f of files) injectedFiles.add(f);
+						injectedMessage = { customType: "memory-auto-surfacing", content, display: false };
+						// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知。
+						if (ctx.hasUI) {
+							ctx.ui.notify(`Recalled: ${countInjectedBlocks(content)} entries`, "info");
 						}
 					}
 				}
@@ -475,9 +442,6 @@ export default function (pi: ExtensionAPI) {
 		const extractConfig = config.extractMemories;
 		if (!extractConfig?.enabled) return;
 		if (!event.messages || event.messages.length === 0) return;
-		// 守卫之后立刻取值：requiredModel 抛错必须发生在这里（agent_end 直接失败），而不是在
-		// runExtract({...}) 的字面量求值中途 —— 那时 track / .then 的收尾链已经无从挂上。
-		const extractModel = requiredModel(config, "extractMemories");
 		// 本轮经 extract 的工具真实写入了几条（工具的 onWrite 回调计数，spec §14）。
 		let written = 0;
 		// pi 的 `ExtensionContext` 是代理：`hasUI` / `ui` 的 getter 会先 `runner.assertActive()`，
@@ -487,26 +451,20 @@ export default function (pi: ExtensionAPI) {
 		const ui = ctx.hasUI ? ctx.ui : undefined;
 		// extract 的工具集与主 agent 相同（5 个 action），且**只**注入它自己的 headless 子会话；
 		// 不开 skipSnapshot：extract 没有整轮快照，它的每次写入都该留下自己的回滚点。
-		// 这两件事都由 core 的 runExtract 表达，pi 只提供 onWrite 计数与两个端口。
-		const extractRun = runExtract(
+		// 这两件事都由 core 的 runTask(TASKS.extractMemories) 表达，pi 只提供 onWrite 计数与两个端口。
+		// 模型解析在 runTask 的第一次 await 之前同步发生（缺模型在这里抛，早于 track 收尾链的挂接）。
+		const extractRun = runTask(
+			TASKS.extractMemories,
 			{
-				agentsMdBlocks: extractAgentsMdBlocks(lastSystemPrompt),
-				model: extractModel,
-				effort: extractConfig.thinkLevel,
-				memoryDir: dir,
-				store: activeStore,
 				// **不再**把消息压成 `{role, content}` 字符串（那是提取失真的根因）：原样交给
 				// core，由 pi 的 HostTranscriptPort 保留角色 / tool_call / tool_result。
 				messages: event.messages,
-				maxContextTokens: extractConfig.maxContextTokens,
-				maxToolResultChars: extractConfig.maxToolResultChars,
-				maxAssistantChars: extractConfig.maxAssistantChars,
-				sessionPersistence: resolveDefault(config, "extractMemories", "sessionPersistence"),
+				agentsMdBlocks: extractAgentsMdBlocks(lastSystemPrompt),
 				onWrite: () => {
 					written += 1;
 				},
 			},
-			{ headless: headlessFor(ctx), transcript: piTranscript },
+			{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx), transcript: piTranscript } },
 		);
 		track(extractRun);
 		// 用两参 `.then`（而不是 `.then().catch()`）：成功通知自己抛错只会进它自己的分支，
@@ -634,20 +592,10 @@ export default function (pi: ExtensionAPI) {
 			const ok = await ctx.ui.confirm("Dream", "Consolidate all memory files? This rewrites them in-place.");
 			if (!ok) return;
 			const dir = memoryDir;
-			// 先取模型再改状态：requiredModel 抛错时不能把 "dream" 状态留在那儿（这条链没有 .finally）。
-			const dreamModel = requiredModel(config, "dream");
+			// `runTask` 在第一次 await 之前同步解析模型（缺模型在这里抛）：先建 run 再改状态，
+			// 避免模型丢失时把 "dream" 状态留在 UI 上（这条链只有 confirm 之后的 .finally）。
+			const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } });
 			ui?.setStatus("dream", "Consolidating memory...");
-			const dreamRun = runDream(
-				{
-					model: dreamModel,
-					effort: config.dream.thinkLevel,
-					memoryDir,
-					store: activeStore,
-					maxLines: config.memIndexMaxLines,
-					sessionPersistence: resolveDefault(config, "dream", "sessionPersistence"),
-				},
-				{ headless: headlessFor(ctx) },
-			);
 			track(dreamRun);
 			void dreamRun
 				.then(

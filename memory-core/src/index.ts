@@ -102,8 +102,6 @@ export type { EntryManifest } from "./injection.js";
 // ── orchestration/ LLM 编排 ───────────────────────────────────────────────────
 // 适配层实现 `HeadlessAgentPort` 与 `HostTranscriptPort` 两个端口，就能拿到与 pi 完全相同的
 // dream / extract / 侧查询行为（prompt 文本、锁与快照边界、截断预算、错误语义）。
-export { runDream } from "./orchestration/dream.js";
-export type { RunDreamOpts } from "./orchestration/dream.js";
 export { runTask } from "./orchestration/task.js";
 export { TASKS } from "./orchestration/tasks.js";
 export type {
@@ -114,12 +112,10 @@ export type {
 	TaskDeps,
 	TaskPlan,
 } from "./orchestration/task.js";
-export { runExtract } from "./orchestration/extract.js";
-export type { ExtractInput, ExtractPorts, ExtractResult, RunExtractOpts } from "./orchestration/extract.js";
+export type { ExtractInput, ExtractResult } from "./orchestration/extract.js";
 export { renderConversation } from "./orchestration/conversation.js";
 export type { ConversationLimits } from "./orchestration/conversation.js";
-export { runSideQuery } from "./orchestration/surfacing.js";
-export type { RunSideQueryOpts, SurfacingInput, SurfacingResult } from "./orchestration/surfacing.js";
+export type { SurfacingInput, SurfacingResult } from "./orchestration/surfacing.js";
 export { buildDreamTask, buildExtractTask } from "./orchestration/prompts.js";
 export type {
 	ExtractMessage,

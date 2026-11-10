@@ -109,8 +109,8 @@ describe("createPreStepListener", () => {
 	it("skips recall on step > 1 but still refreshes the index cache", async () => {
 		const memoryDir = join(dir, "mem");
 		const store = makeStore(memoryDir);
-		// 必须真的写一条 entry：core 的 `runSideQuery` 在候选清单为空时短路（memory-core/src/
-		// orchestration/surfacing.ts:53 `if (candidates.length === 0) return []`），根本不会调用侧查询
+		// 必须真的写一条 entry：core 的 autoSurfacing 在候选清单为空时短路（memory-core/src/
+		// orchestration/surfacing.ts 的 `candidates` 过滤），根本不会调用侧查询
 		// 端口 —— 那时 `expect(headlessRun).not.toHaveBeenCalled()` 恒真，钉不住 step 门禁本身。
 		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
 		const rt = makeRuntime(memoryDir, store);
@@ -304,8 +304,8 @@ describe("createPreStepListener", () => {
 		const memoryDir = join(dir, "mem");
 		const store = makeStore(memoryDir);
 		const rt = makeRuntime(memoryDir, store);
-		// 触发 scanEntries 失败。注意：真正的 headless 失败会被 core 的 runSideQuery 吞成 []
-		// （memory-core/src/orchestration/surfacing.ts 的 try/catch），根本到不了监听器的 catch；
+		// 触发 scanEntries 失败。注意：真正的 headless 失败会被 core 的 autoSurfacing 吞成 []
+		// （memory-core/src/orchestration/surfacing.ts 的 errorPolicy "swallow"），根本到不了监听器的 catch；
 		// 监听器自己的 catch 分支只在 manifest 扫描 / 渲染 / 意外形状等前置失败时可达。
 		rt.store = { listEntries: () => Promise.reject(new Error("disk gone")) } as unknown as MemoryStore;
 		const warn = vi.fn();
@@ -415,7 +415,7 @@ describe("createPreStepListener", () => {
 
 		expect(decision.kind).toBe("enter");
 		expect(headlessRun).toHaveBeenCalledTimes(1);
-		// 身份相等（不是「存在 signal 字段」）：证明 runSideQuery 透传的是本轮 payload 的同一个 signal。
+		// 身份相等（不是「存在 signal 字段」）：证明 runTask 透传的是本轮 payload 的同一个 signal。
 		expect(headlessRun.mock.calls[0][0].signal).toBe(controller.signal);
 		// cwd 就是 memoryDir（不是 `?? ""` 静默出的空串）。
 		expect(headlessRun.mock.calls[0][0].cwd).toBe(memoryDir);
@@ -428,7 +428,7 @@ describe("createPreStepListener", () => {
 		const rt = makeRuntime(memoryDir, store);
 		const injected = new Map<string, Set<string>>();
 		let resolveRun: (value: HeadlessOutcome) => void = () => {};
-		// 一个「resolve 权在我们手上」的端口：resolve 前监听器一直挂在 runSideQuery 的 await 上。
+		// 一个「resolve 权在我们手上」的端口：resolve 前监听器一直挂在 runTask 的 await 上。
 		const headlessRun = vi.fn(
 			() =>
 				new Promise<HeadlessOutcome>((resolve) => {

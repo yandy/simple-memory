@@ -4,7 +4,7 @@ import type { ExtractMessage } from "./ports.js";
  * 对话渲染：把中立的 `ExtractMessage` 序列压成 extract prompt 里的那一段文本，
  * 并在超出预算时做「首尾优先、中段裁减」。
  *
- * 与 `prompts.ts` 分开是为了不打环：prompt 文本依赖渲染结果，而 `runExtract` 依赖 prompt 文本。
+ * 与 `prompts.ts` 分开是为了不打环：prompt 文本依赖渲染结果，而 extract 描述符依赖 prompt 文本。
  */
 
 export interface ConversationLimits {
