@@ -76,6 +76,12 @@ describe.skipIf(process.platform !== "win32")("withFsRetry against a real Window
 		throw new Error("the exclusive holder never became ready");
 	}
 
+	// 这两个用例都要先 spawn 一个 PowerShell 持锁进程、再等它就绪，最后才是重试本身。
+	// vitest 的 5s 默认值刚好压在 runner 的噪声边缘（实测 5024ms 超时过一次），而且失败的
+	// 样子是「Test timed out in 5000ms」—— 看上去像产品 bug，实际只是预算太紧。给它一个
+	// 宽到不可能被吃掉的预算；真挂死时它仍然会失败，只是晚 30s。
+	const WIN32_TIMEOUT_MS = 30_000;
+
 	it("crosses a short exclusive hold", async () => {
 		// ready 是在取得独占**之后**写的，所以紧跟其后的第一次尝试必然撞上冲突；跨过 300ms 的
 		// 持锁原本只需默认预算（900ms）的前几次重试。这里仍显式放宽到 ~2.7s：runner 上杀软/
@@ -88,7 +94,7 @@ describe.skipIf(process.platform !== "win32")("withFsRetry against a real Window
 			withFsRetry(() => writeFile(target, "written", "utf8"), { retries: 12 }),
 		).resolves.toBeUndefined();
 		expect(await readFile(target, "utf8")).toBe("written");
-	});
+	}, WIN32_TIMEOUT_MS);
 
 	it("fails closed after the budget when the hold outlasts it", async () => {
 		startExclusiveHold(8000); // 远超重试预算
@@ -97,5 +103,5 @@ describe.skipIf(process.platform !== "win32")("withFsRetry against a real Window
 		const err = await withFsRetry(() => writeFile(target, "written", "utf8")).catch((e: unknown) => e);
 		expect((err as NodeJS.ErrnoException).code).toMatch(/^(EPERM|EACCES|EBUSY)$/);
 		expect(Date.now() - started).toBeLessThan(2000); // 重试预算 ≈900ms，远低于这个上限
-	});
+	}, WIN32_TIMEOUT_MS);
 });
