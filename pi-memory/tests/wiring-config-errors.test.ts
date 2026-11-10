@@ -32,11 +32,10 @@ describe("index wiring — config errors", () => {
 	// 证明「memoryDir 与 store 至少有一个被清了」（`/memory` 的守卫是 `||`），所以这里再用
 	// `/memory unlock` 钉一次 memoryDir 本身：它拿到的必须是**本 cwd** 的目录，而不是上一
 	// session 的 dirA（否则会去删错项目的锁，真事故）。
+	// ── Plan D（D1）：配置错误启动的会话状态（unlock / 状态行）与跨 session 复位 ──────
 	it("/memory after a misconfigured restart never reports or unlocks the previous session's dir", async () => {
-		// 配置错误的重启必须把上一 session 的 memoryDir 清掉 —— 光靠状态块只能证明「memoryDir 与
-		// store 至少有一个被清了」（`/memory` 的守卫是 `||`），所以这里再用 `/memory unlock` 钉一次
-		// memoryDir 本身：它拿到的必须是**本 cwd** 的目录，而不是上一 session 的目录（否则会去删
-		// 错项目的锁，真事故）。C 之后「不同 cwd → 不同目录」由真实 memoryDir + cwd 派生得出。
+		// C 之后「不同 cwd → 不同目录」由真实 memoryDir + cwd 派生得出，这个用例因此比原来更实：
+		// unlock 拿到的必须是**本 cwd** 的目录，否则会去删错项目的锁（真事故）。
 		const cwdB = await mkdtemp(join(tmpdir(), "mem-wiring-b-"));
 		const dirB = expectedDir(s.memoryDirRoot, cwdB);
 		await mkdir(dirB, { recursive: true });
@@ -80,6 +79,8 @@ describe("index wiring — config errors", () => {
 		}
 	});
 
+	// Plan E/next #2(b)：`/dream` 的守卫是 `!config || !memoryDir || !activeStore`。store 残留
+	// 会真的对上一 session 的目录起一轮 dream（而不只是打错一行状态）。
 	it("/dream refuses right after a misconfigured restart instead of dreaming the old dir", async () => {
 		// `/dream` 的守卫是 `!config || !memoryDir || !activeStore`：store 残留会真的对上一
 		// session 的目录起一轮 dream（而不只是打错一行状态）。
@@ -107,6 +108,7 @@ describe("index wiring — config errors", () => {
 		}
 	});
 
+	// ── 模型校验（设计 §2）─────────────────────────────────────────────
 	it("reports missing models and does not initialise anything", async () => {
 		await s.writeConfig({ defaults: { sessionPersistence: { enabled: false } }, autoSurfacing: { enabled: true } });
 		const notify = vi.fn();
@@ -156,6 +158,9 @@ describe("index wiring — config errors", () => {
 					expect(text, row).toContain('model "test/model" for dream is not resolvable'),
 			},
 			{
+				// 上一条走的是 resolveModel 的「一个可用模型都没有」早退；这一条让 getAvailable 非空，
+				// 真正走到「精确匹配只认 available 集合 → 模糊匹配也匹不上」那条路径（同样是 missing
+				// credentials）。两行不是重复，别把它们合并掉。
 				name: "getAll but not getAvailable while other models are available",
 				dreamModel: undefined,
 				registry: fakeRegistry(["test/model", "other/thing"], ["other/thing"]),

@@ -295,8 +295,8 @@ export function fakeRegistry(ids: string[], availableIds: string[] = ids) {
 /**
  * 一个最小可用的 `ExtensionContext` 形状。
  *
- * `cwd` 默认空串：真实用例一律经 `setupSession().uiCtx()` 拿到带正确 cwd 的版本；这里只是让
- * 纯形状构造（`disposableCtx` 之类）也能用。
+ * `cwd` 默认空串只是为了能构造一个「形状对」的 ctx；**会走到 handler 的用例必须给真实 cwd**
+ * （`s.cwd`）—— `session_start` 会把它当 `currentCwd`，`/dream` 会拿它去 `SessionManager.list(cwd)`。
  */
 export function uiCtx(over: Record<string, unknown> = {}) {
 	return {
@@ -356,11 +356,22 @@ export function uiWith(notify = vi.fn()) {
  * session dispose（/new、switch、fork、reload、退出宽限超时）之后调用即抛错。
  * 这里造一个同形状的 fake：`dispose()` 之后读取这两个字段直接抛错。
  */
-export function disposableCtx() {
+/**
+ * pi 的 `ExtensionContext` 是代理：`hasUI` / `ui` 的 getter 会先 `runner.assertActive()`，
+ * session dispose（/new、switch、fork、reload、退出宽限超时）之后调用即抛错。
+ * 这里造一个同形状的 fake：`dispose()` 之后读取这两个字段直接抛错。
+ */
+// ── Review 修复轮（R44）：session dispose 之后 ctx 不可再访问 ─────────────
+/**
+ * pi 的 `ExtensionContext` 是代理：`hasUI` / `ui` 的 getter 会先 `runner.assertActive()`，
+ * session dispose（/new、switch、fork、reload、退出宽限超时）之后调用即抛错。
+ * 这里造一个同形状的 fake：`dispose()` 之后读取这两个字段直接抛错。
+ */
+export function disposableCtx(cwd = "") {
 	let active = true;
 	const notify = vi.fn();
 	const ui = { notify, confirm: vi.fn(), setStatus: vi.fn() };
-	const ctx: any = uiCtx();
+	const ctx: any = uiCtx({ cwd });
 	Object.defineProperty(ctx, "hasUI", {
 		get: () => {
 			if (!active) throw new Error("Extension instance is no longer active");

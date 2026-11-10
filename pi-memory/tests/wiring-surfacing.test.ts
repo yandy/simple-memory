@@ -76,7 +76,7 @@ describe("index wiring — auto-surfacing", () => {
 				}),
 		);
 
-		const session = disposableCtx();
+		const session = disposableCtx(s.cwd);
 		const event = sectionsEvent("ssh?");
 		// auto-surfacing 的 finally 在 await 之后读 ctx.hasUI：session 在途中 dispose 会让 handler
 		// 从那里抛出。section 必须在**任何 await 之前**就已写好，否则宿主收到 { memory_index: null }

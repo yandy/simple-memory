@@ -22,6 +22,7 @@ describe("index wiring — agent_end / extract", () => {
 		await s.cleanup();
 	});
 
+	// ── Plan C（spec §14 通知）────────────────────────────────────────────
 	it.each([
 		{ writes: 1, message: "Extracted 1 memory." },
 		{ writes: 2, message: "Extracted 2 memories." },
@@ -56,6 +57,7 @@ describe("index wiring — agent_end / extract", () => {
 		expect(notify).toHaveBeenCalledWith(message, "info");
 	});
 
+	// Review Focus #4：没写东西就不该弹通知；被锁跳过也不该弹。
 	it("agent_end stays quiet when extract wrote nothing or was skipped", async () => {
 		await s.writeConfig({ extractMemories: { enabled: true } });
 		const notify = vi.fn();
@@ -147,7 +149,7 @@ describe("index wiring — agent_end / extract", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		const session = disposableCtx();
+		const session = disposableCtx(s.cwd);
 		const caught = await captureUnhandledRejections(async () => {
 			await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, session.ctx);
 			const onWrite = runTaskMock.mock.calls[0][1].onWrite;
@@ -177,7 +179,7 @@ describe("index wiring — agent_end / extract", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		const session = disposableCtx();
+		const session = disposableCtx(s.cwd);
 		const caught = await captureUnhandledRejections(async () => {
 			await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, session.ctx);
 			session.dispose();

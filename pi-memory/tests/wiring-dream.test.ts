@@ -37,7 +37,10 @@ describe("index wiring — dream", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		const session = disposableCtx();
+		const session = disposableCtx(s.cwd);
+		// 代理 ctx 必须带着**真实**的 cwd：`session_start` 会把它当 `currentCwd` 传给工具，
+		// `/dream` 会拿它去 `SessionManager.list(cwd)`。空串会让会话跑在一个不存在的路径上。
+		expect(session.ctx.cwd).toBe(s.cwd);
 		session.ctx.ui.confirm.mockResolvedValue(true);
 		const caught = await captureUnhandledRejections(async () => {
 			await handlers["session_start"][0]({}, session.ctx);
@@ -89,7 +92,7 @@ describe("index wiring — dream", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		const session = disposableCtx();
+		const session = disposableCtx(s.cwd);
 		session.ctx.ui.confirm.mockResolvedValue(true);
 		// 完成回调里的 `SessionManager.list(cwd)` 会去 getAgentDir() 下建会话目录：
 		const caught = await captureUnhandledRejections(async () => {
@@ -117,7 +120,7 @@ describe("index wiring — dream", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		const session = disposableCtx();
+		const session = disposableCtx(s.cwd);
 		session.ctx.ui.confirm.mockResolvedValue(true);
 		const caught = await captureUnhandledRejections(async () => {
 			await commands["dream"].handler("", session.ctx);
@@ -160,9 +163,9 @@ describe("index wiring — dream", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		// 成功回调里的 `SessionManager.list(cwd)` 会去 getAgentDir() 下建会话目录：
-		// 完成回调在 notify 之前 `await SessionManager.list(cwd)`，那是真实磁盘 I/O：把它固定拖慢到
-		// 一个 setTimeout(0) tick 之上，这条断言就必须等条件成立，不能靠"猜一个 tick"。
+		// 完成回调在 notify 之前会 `await SessionManager.list(cwd)`（真实磁盘 I/O）：把这个调用固定
+		// 拖慢到一个 setTimeout(0) tick 之上，断言就必须等条件成立，不能靠"猜一个 tick"。
+		// agent 目录已由 `setupSession` 隔离到临时目录，所以这里只需要压住耗时。
 		const listSpy = vi.spyOn(SessionManager, "list").mockImplementation(async () => {
 			await new Promise((resolve) => setTimeout(resolve, 30));
 			return [];
@@ -179,15 +182,14 @@ describe("index wiring — dream", () => {
 			// 「7 个 action + memory 工具」由 core 的 TASKS.dream 决定；pi 只提供 headless 端口。
 			expect(typeof taskCtx.ports.headless.run).toBe("function");
 
-			// 成功回调（SessionManager.list → writeDreamMeta → notifyDream）必须在 unstub 前排空，
-			// 否则会漏到真实 ~/.pi；notify 断言证明回调确实在本用例内跑完。
+			// 成功回调（SessionManager.list → writeDreamMeta → notifyDream）必须在用例内跑完：
+			// notify 断言证明它确实跑到了，而不是漏进下一个用例。
 			await waitFor(() => notify.mock.calls.length > 0, "dream completion notify");
 			expect(notify).toHaveBeenCalledWith("consolidated", "info");
-		
-				listSpy.mockRestore();
-		
 		} finally {
-			vi.unstubAllEnvs();
+			// 必须在这里恢复：`SessionManager` 是共享的 SDK 类，断言/超时抛错时把 30ms 的假实现
+			// 留给后面的用例，会把「一个明确的失败」变成「一串莫名其妙的失败」。
+			listSpy.mockRestore();
 		}
 	});
 
