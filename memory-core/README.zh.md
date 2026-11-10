@@ -175,8 +175,11 @@ export interface HostTranscriptPort {
 
 ## 2.0.0 有什么变化
 
-**配置文件 IO 下放给适配层。** core 不再读文件，旧的文件读取入口也删掉了。它仍保留配置的**语义**：
-`DEFAULT_CONFIG`、`mergeConfig`、`defaultMemoryRoot` 与 `expandTilde`。适配层自己读自己的配置文件，把解析结果交给 `mergeConfig` ——
+**配置文件 IO 下放给适配层。** core 不再读文件：**`loadConfigFrom` 已在 2.0.0 移除**，它收的那个
+`LoadConfigFromOptions` 选项类型也一并删掉。如果你的代码报「`loadConfigFrom` is not exported」
+（`does not provide an export named 'loadConfigFrom'`），原因就是这个删除，而且没有兼容壳可退。
+它仍保留配置的**语义**：`DEFAULT_CONFIG`、`mergeConfig`、`defaultMemoryRoot` 与 `expandTilde`。
+适配层自己读自己的配置文件，再把解析出的对象交给 `mergeConfig` ——
 pi 就这么读它的两个 `memory.json`，dsh 也这么合并它的 cordis 行 `config:` 对象。文件在哪、项目
 是否受信任，是宿主知识，留在适配层。
 

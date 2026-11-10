@@ -185,12 +185,14 @@ can call nothing yet still "succeeds".
 
 ## What changed in 2.0.0
 
-**Config file IO moved to the adapters.** Core no longer reads files, and the file-loading helper it
-used to export is gone. It still owns the config *semantics*: `DEFAULT_CONFIG`,
-`mergeConfig`, `defaultMemoryRoot` and `expandTilde`. An adapter reads its own config file(s) and hands
-the parsed object to `mergeConfig` — pi reads its two `memory.json` files that way, and dsh merges its
-cordis row `config:` object the same way. Where files live, and whether a project is trusted, is host
-knowledge and stays in the adapter.
+**Config file IO moved to the adapters.** Core no longer reads files. **`loadConfigFrom` was removed in
+2.0.0**, and `LoadConfigFromOptions`, the options type it took, went with it — if your build now fails
+with "`loadConfigFrom` is not exported" ("does not provide an export named 'loadConfigFrom'"), that
+removal is the explanation, and there is no compatibility shell to fall back on. Core still owns the
+config *semantics*: `DEFAULT_CONFIG`, `mergeConfig`, `defaultMemoryRoot` and `expandTilde`. An adapter
+reads its own config file(s) and then calls `mergeConfig` on the parsed object — pi reads its two
+`memory.json` files that way, and dsh merges its cordis row `config:` object the same way. Where files
+live, and whether a project is trusted, is host knowledge and stays in the adapter.
 
 **The three model tasks are now first-class.** `autoSurfacing`, `extractMemories` and `dream` are task
 descriptors declared once in `TASKS`; the single entry point is `runTask(task, input, ctx)`, which reads
