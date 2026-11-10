@@ -2,7 +2,7 @@ import type { SessionPersistenceConfig } from "../config.js";
 import type { EntryManifest } from "../injection.js";
 import { buildSideQueryTask, renderSurfacedBlock } from "../injection.js";
 import type { HeadlessAgentPort } from "./ports.js";
-import type { MemoryTask } from "./task.js";
+import { TASKS, buildRequest, type MemoryTask } from "./task.js";
 
 export interface SurfacingInput {
 	/** 本轮的候选清单（`scanEntries` 的产出）。 */
@@ -107,19 +107,17 @@ export async function runSideQuery(
 	if (remaining.length === 0) return [];
 	const task = buildSideQueryTask(remaining, opts.userPrompt, opts.maxFiles);
 	try {
-		const result = await ports.headless.run({
-			task,
-			cwd: opts.cwd,
-			model: opts.model,
-			effort: opts.effort,
-			maxTurns: 1,
-			timeoutMs: 30_000,
-			signal: opts.signal,
-			// 零工具就是意图：侧查询只需要回一个 JSON，给它任何工具都是白烧 token。
-			builtinTools: "none",
-			memoryTool: null,
-			sessionPersistence: opts.sessionPersistence,
-		});
+		// 请求由 `buildRequest` 统一构造：plan 的取值（maxTurns / timeout / builtinTools / memoryTool）
+		// 与这里给的宿主参数合流，不再在 core 里写第二份。
+		const result = await ports.headless.run(
+			buildRequest(TASKS.autoSurfacing, task, {
+				cwd: opts.cwd,
+				model: opts.model,
+				effort: opts.effort,
+				sessionPersistence: opts.sessionPersistence,
+				signal: opts.signal,
+			}),
+		);
 		if (result.status !== "completed") return [];
 		return parseSelectedFiles(result.text, remaining, opts.maxFiles);
 	} catch {

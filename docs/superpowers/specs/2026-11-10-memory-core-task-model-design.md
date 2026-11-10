@@ -145,6 +145,12 @@ export interface TaskDeps {
   transcript?: HostTranscriptPort;
 }
 
+/** `notCompleted` 收的 `why`：core 自己的判定，或端口给的非 completed 结果（`IncompleteOutcome` 见 §6.2）。 */
+export type Incomplete =
+  | { status: "no-input" }
+  | { status: "lock-busy" }
+  | IncompleteOutcome;
+
 export interface MemoryTask<I, R> {
   readonly id: ModelTask;
   readonly plan: TaskPlan;
@@ -152,13 +158,23 @@ export interface MemoryTask<I, R> {
   buildPrompt(cfg: MemoryConfig, deps: TaskDeps, input: I): string | null;
   /** 回复 → 结果。必须防御式：dsh 的 stream 通道拿不到强制结构化输出（§4.4）。 */
   parse(cfg: MemoryConfig, deps: TaskDeps, input: I, text: string): R | Promise<R>;
-  /** 端口没跑完/没跑成时怎么呈现（三个任务词汇不同的唯一合法处）。 */
-  incomplete(cfg: MemoryConfig, deps: TaskDeps, input: I, outcome: IncompleteOutcome): R;
+  /**
+   * core 没跑、或端口没跑成时怎么呈现（三个任务词汇不同的唯一合法处）。
+   * `why` 把 core 自己的判定（`no-input` / `lock-busy`）与端口给的非 completed 结果收进同一个钩子，
+   * core 的「不跑」不必伪装成宿主的语言。
+   */
+  notCompleted(cfg: MemoryConfig, deps: TaskDeps, input: I, why: Incomplete): R;
+  /** 只有 extractMemories 实现：把 `input.onWrite` 透给子会话的工具（Task 5 用）。 */
+  memoryToolHooks?(input: I): { onWrite?: (info: { action: MemoryAction; name?: string }) => void } | undefined;
 }
 
-/** 任务注册表：三个任务的唯一声明处。 */
-export const TASKS: Record<ModelTask, MemoryTask<any, any>>;
+/** 任务注册表：描述符的唯一声明处；Task 6 在 dream 落地后扩成 `Record<ModelTask, MemoryTask<any, any>>`。 */
+export const TASKS = { autoSurfacing } as const;
 ```
+
+`TASKS` 在本轮（Task 4）只声明已实现的 `autoSurfacing`，用 `as const` 固定这一个键；Task 6 落 dream 时再
+显式放宽成 `Record<ModelTask, MemoryTask<any, any>>`。中间任务**不得**为缺失的描述符造假对象：`TASKS.dream`
+此刻不存在，比存在一个会抛错的占位对象诚实。
 
 编排骨架（core 常量，从三个 `run*` 逐字搬来）：
 
@@ -209,16 +225,9 @@ export type IncompleteOutcome = Exclude<HeadlessOutcome, { status: "completed" }
 （pi 读这条时：`agent-runner` 的超时仍在抛错（`agent-runner.ts:170-180`，测试钉住 `rejects.toThrow`），
 本轮不改，所以 **pi 实际只产生 `completed`**；`incomplete` / `no-output` 是给 dsh 的词汇，pi 侧的补齐见 §11。）
 
-**core 自己的「不跑」不进端口词汇**：`runTask` 直接返回任务的 `R`，core 自己的判定与端口给的非
-`completed` 结果都由描述符的**同一个 `notCompleted` 钩子**收口，避免把 core 的判定伪装成宿主的语言。
-
-```ts
-/** `notCompleted` 收的 `why`：core 自己的判定，或端口给的非 completed 结果。 */
-export type Incomplete =
-  | { status: "no-input" }
-  | { status: "lock-busy" }
-  | IncompleteOutcome;
-```
+**core 自己的「不跑」不进端口词汇**：`runTask` 直接返回任务的 `R`（没有单独的 `TaskRunResult` 之类的
+core 专用返回类型），core 自己的判定与端口给的非 `completed` 结果都由描述符的**同一个 `notCompleted` 钩子**
+收口（`Incomplete` 联合的声明见 §6.1），避免把 core 的判定伪装成宿主的语言。
 
 三个任务在 `notCompleted` 里把它映射成自己的词汇（**唯一允许「三套词汇」的地方**）：
 
@@ -349,7 +358,7 @@ core 自己的三个编排测试（`tests/orchestration/{surfacing,extract,dream
 |---|---|
 | `memory-core/src/orchestration/{surfacing,extract,dream}.ts` | 退化为 `TASKS` 里的三个描述符；三个 `run*` 与 `Run*Opts` 删除（§6.4） |
 | `memory-core/src/orchestration/ports.ts` | `HeadlessAgentPort.run` 返回 `HeadlessOutcome`；其余不动 |
-| `memory-core/src/orchestration/task.ts`（新） | `runTask` / `TaskPlan` / `TaskDeps` / `TaskContext` / `TaskRunResult` / `TASKS` |
+| `memory-core/src/orchestration/task.ts`（新） | `runTask` / `TaskPlan` / `TaskDeps` / `TaskContext` / `Incomplete` / `buildRequest` / `TASKS` |
 | `memory-core/src/config.ts` | 去掉 `nudge*`；其余不动 |
 | `memory-core/src/index.ts` | 导出面增删（新增 `runTask` / `TASKS` / `moduleStatusRows` / `HeadlessOutcome` 等；删三个 `run*` 与 Opts） |
 | `memory-core/tests/orchestration/{surfacing,extract,dream}.test.ts` | 改为跑 `runTask` + 描述符；端口桩返回 `HeadlessOutcome`；`toHaveBeenCalledWith` 的请求断言改按新构造；dream 的错误文案变成带 cause 的版本 |

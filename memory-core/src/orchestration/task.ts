@@ -1,4 +1,9 @@
-import { requiredModel, type MemoryConfig, type ModelTask } from "../config.js";
+import {
+	requiredModel,
+	type MemoryConfig,
+	type ModelTask,
+	type SessionPersistenceConfig,
+} from "../config.js";
 import type { MemoryStore } from "../store/memory-store.js";
 import type { MemoryAction } from "../tool/actions.js";
 import type {
@@ -36,6 +41,22 @@ export interface TaskContext {
 	signal?: AbortSignal;
 }
 
+/** `buildRequest` 的宿主侧参数：`cfg` 的值与 plan 一起在这里合流成端口请求。 */
+export interface RequestHost {
+	/** 子会话 cwd；三个任务恒为 memoryDir。 */
+	cwd: string;
+	/** 宿主自己的模型标识，已由调用方解析（`requiredModel`，或旧 `RunSideQueryOpts.model`）。 */
+	model: string;
+	/** 宿主自己的思考/推理档位，core 原样透传。 */
+	effort?: string;
+	/** 宿主的会话持久化开关，core 原样透传。 */
+	sessionPersistence?: SessionPersistenceConfig;
+	signal?: AbortSignal;
+}
+
+/** `memory` 工具的写入回调；只有实现了 `memoryToolHooks` 的描述符会产出它。 */
+export type MemoryToolOnWrite = (info: { action: MemoryAction; name?: string }) => void;
+
 /** `notCompleted` 收的 `why`：core 自己的判定，或端口给的非 completed 结果。 */
 export type Incomplete =
 	| { status: "no-input" }
@@ -52,7 +73,7 @@ export interface MemoryTask<I, R> {
 	/** core 没跑、或端口没跑成时怎么呈现（三个任务词汇不同的唯一合法处）。 */
 	notCompleted(cfg: MemoryConfig, deps: TaskDeps, input: I, why: Incomplete): R;
 	/** 只有 extractMemories 实现：把 `input.onWrite` 透给子会话的工具（Task 5 用）。 */
-	memoryToolHooks?(input: I): { onWrite?: (info: { action: MemoryAction; name?: string }) => void } | undefined;
+	memoryToolHooks?(input: I): { onWrite?: MemoryToolOnWrite } | undefined;
 }
 
 /**
@@ -62,6 +83,44 @@ export interface MemoryTask<I, R> {
  * `Record<ModelTask, MemoryTask<any, any>>`，中间任务不得为缺失条目造假对象。
  */
 export const TASKS = { autoSurfacing } as const;
+
+/**
+ * 构造端口请求：plan 的取值与调用方的宿主参数在这里合流，`runTask` 与过渡期的 `runSideQuery` 共用。
+ *
+ * 只收构造请求真正需要的入参，`cfg` 与 `TaskContext` 都不进来：过渡期的 `runSideQuery` 没有 `cfg`，
+ * 它的 model / effort / sessionPersistence 是调用方给的显式参数（见 `RunSideQueryOpts`）。解析留在
+ * 调用方（`runTask` 从 `cfg` 读、`runSideQuery` 用入参），请求形状因此只在这里写一遍。
+ */
+export function buildRequest(
+	task: MemoryTask<unknown, unknown>,
+	prompt: string,
+	host: RequestHost,
+	onWrite?: MemoryToolOnWrite,
+): HeadlessRunRequest {
+	const plan = task.plan;
+	return {
+		task: prompt,
+		cwd: host.cwd,
+		model: host.model,
+		effort: host.effort,
+		maxTurns: plan.maxTurns,
+		timeoutMs: plan.timeoutMs,
+		signal: host.signal,
+		// 三个任务的 builtinTools 恒为 "none"：侧查询只要一个 JSON，dream / extract 只走 memory 工具。
+		builtinTools: "none",
+		memoryTool:
+			plan.memoryTool === null
+				? null
+				: {
+						actions: plan.memoryTool,
+						skipLogicalLock: plan.lock !== "none",
+						skipSnapshot: plan.lock === "logical+snapshot",
+						onWrite,
+					},
+		// 继承规则（per-task ?? defaults）由调用方在传参前解析完，这里只做透传。
+		sessionPersistence: host.sessionPersistence,
+	};
+}
 
 /** 会话持久化的继承规则：per-task ?? `defaults`。config 消费点收在 core，适配层不再各写一份。 */
 function resolveSessionPersistence(cfg: MemoryConfig, task: ModelTask) {
@@ -107,28 +166,12 @@ export async function runTask<I, R>(task: MemoryTask<I, R>, input: I, ctx: TaskC
 	if (prompt === null) return task.notCompleted(cfg, deps, input, { status: "no-input" });
 
 	const run = async (): Promise<R> => {
-		const memoryTool =
-			task.plan.memoryTool === null
-				? null
-				: {
-						actions: task.plan.memoryTool,
-						skipLogicalLock: task.plan.lock !== "none",
-						skipSnapshot: task.plan.lock === "logical+snapshot",
-						onWrite: task.memoryToolHooks?.(input)?.onWrite,
-					};
-
-		const request: HeadlessRunRequest = {
-			task: prompt,
-			cwd: ctx.cwd,
-			model,
-			effort,
-			maxTurns: task.plan.maxTurns,
-			timeoutMs: task.plan.timeoutMs,
-			signal: ctx.signal,
-			builtinTools: "none",
-			memoryTool,
-			sessionPersistence,
-		};
+		const request = buildRequest(
+			task,
+			prompt,
+			{ cwd: ctx.cwd, model, effort, sessionPersistence, signal: ctx.signal },
+			task.memoryToolHooks?.(input)?.onWrite,
+		);
 
 		try {
 			const outcome = await ctx.ports.headless.run(request);
