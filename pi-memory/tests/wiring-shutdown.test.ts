@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakePi, DISK_INDEX, dirOverrideRef, dirRef, mockConfigValue, resetWiringMocks, runTaskMock, scanEntriesMock, uiCtx } from "./helpers/wiring-harness";
+import { createFakePi, DISK_INDEX, setupSession, dirOverrideRef, dirRef, mockConfigValue, resetWiringMocks, runTaskMock, scanEntriesMock, uiCtx } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 
 describe("index wiring — session_shutdown", () => {
@@ -37,6 +37,20 @@ describe("index wiring — session_shutdown", () => {
 		mockConfigValue.extractMemories.enabled = false;
 		mockConfigValue.lock = { timeoutMs: 5000, snapshotKeep: 5 };
 		dirOverrideRef.current = null;
+	});
+
+	it("setupSession writes a memory.json that the real loadConfig reads", async () => {
+		// 这条钉住 C 阶段的核心机制：配置来自磁盘上真实的 memory.json（经 PI_CODING_AGENT_DIR），
+		// 不是另一个手写对象。它同时是 harness 的分派开关自检（setupSession 之后 loadConfig 走真实实现）。
+		const s = await setupSession();
+		try {
+			const { loadConfig } = await import("../src/config");
+			const loaded = await loadConfig({ cwd: s.cwd, isProjectTrusted: () => true });
+			expect(loaded.config.memoryDir).toBe(s.memoryDirRoot);
+			expect(loaded.config.defaults?.model).toBe("test/model");
+		} finally {
+			await s.cleanup();
+		}
 	});
 
 	it("session_shutdown waits for an in-flight extract", async () => {

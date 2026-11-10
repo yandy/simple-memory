@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { vi } from "vitest";
 import type { MemoryConfig } from "../../src/config";
 import { PI_HOST_DEFAULTS } from "../../src/config";
@@ -46,6 +49,14 @@ const config = vi.hoisted(() => ({
 	// Plan D（D1）：跨 session 复位的用例需要「不同 cwd → 不同 memoryDir」。为 null 时沿用
 	// dirRef.current，既有用例的行为一字不变。
 	dirOverrideRef: { current: null as null | ((cwd: string) => string) },
+	/**
+	 * C 阶段的**临时分派开关**：`true` = 尚未迁移的文件继续用 `mockConfigValue` 这套手写 fixture；
+	 * `setupSession()` 置 `false`，此后 `loadConfig` / `resolveMemoryDir` 走真实实现。
+	 * 每迁完一个文件它就不再需要那个分支，Task 20 整个删掉。
+	 */
+	legacyConfigActive: { value: true },
+	/** 工厂里不能 import node:path（hoisted 工厂先于模块体执行）：用它算「cwd 的末段」。 */
+	basename: (p: string) => String(p).split(/[\\/]/).filter(Boolean).pop() ?? "",
 }));
 
 const mocks = vi.hoisted(() => ({
@@ -68,10 +79,16 @@ vi.mock("../../src/config", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../src/config")>();
 	return {
 		...actual,
-		loadConfig: mocks.loadConfigMock.mockImplementation(async () => ({
-			config: { ...config.mockConfigValue, memoryDir: config.dirRef.current },
-			host: PI_HOST_DEFAULTS,
-		})),
+		loadConfig: mocks.loadConfigMock.mockImplementation(async (ctx: unknown) => {
+			if (config.legacyConfigActive.value) {
+				return {
+					config: { ...config.mockConfigValue, memoryDir: config.dirRef.current },
+					host: PI_HOST_DEFAULTS,
+				};
+			}
+			// 已迁移的文件：真实读 PI_CODING_AGENT_DIR 下的 memory.json
+			return actual.loadConfig(ctx as Parameters<typeof actual.loadConfig>[0]);
+		}),
 	};
 });
 
@@ -86,10 +103,13 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@yandy0725/memory-core")>();
 	return {
 		...actual,
-		resolveMemoryDir: mocks.resolveMemoryDirMock.mockImplementation(
-			async (_config: unknown, cwd: string) =>
-				config.dirOverrideRef.current ? config.dirOverrideRef.current(cwd) : config.dirRef.current,
-		),
+		resolveMemoryDir: mocks.resolveMemoryDirMock.mockImplementation(async (cfg: unknown, cwd: string) => {
+			if (config.legacyConfigActive.value) {
+				return config.dirOverrideRef.current ? config.dirOverrideRef.current(cwd) : config.dirRef.current;
+			}
+			// 真实 config 的 memoryDir + cwd 末段：不 spawn git，也不依赖任何可变引用
+			return join((cfg as { memoryDir: string }).memoryDir, config.basename(cwd));
+		}),
 		scanEntries: mocks.scanEntriesMock,
 		runTask: mocks.runTaskMock,
 	};
@@ -189,6 +209,90 @@ export function resetWiringMocks(): void {
 	readDreamMetaMock.mockResolvedValue({ lastDreamAt: null });
 	writeDreamMetaMock.mockReset();
 	writeDreamMetaMock.mockResolvedValue(undefined);
+}
+
+/** 「cwd → 目录末段」的唯一实现：`setupSession` 与 `resolveMemoryDir` 的 stub 必须用同一条规则。 */
+export function expectedDir(memoryDirRoot: string, cwd: string): string {
+	return join(memoryDirRoot, String(cwd).split(/[\\/]/).filter(Boolean).pop() ?? "");
+}
+
+/** 把一个文件切回「手写 fixture 模式」（只给 C 阶段自检用例在 finally 里复原）。 */
+export function useLegacyConfig(): void {
+	config.legacyConfigActive.value = true;
+}
+
+export interface SessionSetup {
+	/** 本会话的记忆目录 = `expectedDir(memoryDirRoot, cwd)` */
+	dir: string;
+	memoryDirRoot: string;
+	/** `PI_CODING_AGENT_DIR` 指向它；`getAgentDir()` 与 `SessionManager` 都被隔离在这里 */
+	agentDir: string;
+	cwd: string;
+	/** 重写 `memory.json`（top-level 键整体替换）；传 `{}` 回到默认。 */
+	writeConfig(patch?: Record<string, unknown>): Promise<void>;
+	uiCtx(over?: Record<string, unknown>): any;
+	cleanup(): Promise<void>;
+}
+
+export interface SetupSessionOptions {
+	/** `null` = 不写 `defaults.model`（模拟「用户把模型配置删了」的配置错误态）。 */
+	model?: string | null;
+	extract?: boolean;
+	surfacing?: boolean;
+	/** 默认 true：把 `DISK_INDEX` 写进 `MEMORY.md`。 */
+	withDiskIndex?: boolean;
+}
+
+/**
+ * 建一个「真实配置」的会话运行环境：临时 cwd + 临时 agentDir + 一份真的 `memory.json`。
+ *
+ * 调用它即表示这个文件已迁移到 C 阶段：`legacyConfigActive` 被置 `false`，于是 `loadConfig`
+ * 走真实实现、`resolveMemoryDir` 从真实 config 的 `memoryDir` 推导目录，不再需要任何手写对象
+ * 或可变引用桥接。
+ */
+export async function setupSession(opts: SetupSessionOptions = {}): Promise<SessionSetup> {
+	const cwd = await mkdtemp(join(tmpdir(), "mem-wiring-"));
+	const agentDir = join(cwd, "agent");
+	const memoryDirRoot = join(cwd, "memory");
+	const dir = expectedDir(memoryDirRoot, cwd);
+	await mkdir(agentDir, { recursive: true });
+	await mkdir(dir, { recursive: true });
+	if (opts.withDiskIndex !== false) await writeFile(join(dir, "MEMORY.md"), DISK_INDEX, "utf8");
+
+	let current: Record<string, unknown> = {};
+	const writeConfig = async (patch: Record<string, unknown> = {}): Promise<void> => {
+		current = { ...current, ...patch };
+		const defaults = (current.defaults as Record<string, unknown> | undefined) ?? {};
+		const body: Record<string, unknown> = {
+			memoryDir: memoryDirRoot,
+			...current,
+			defaults: { sessionPersistence: { enabled: false }, ...defaults },
+		};
+		await writeFile(join(agentDir, "memory.json"), JSON.stringify(body, null, "\t"), "utf8");
+	};
+
+	const initial: Record<string, unknown> = {};
+	if (opts.model !== null) initial.defaults = { model: opts.model ?? "test/model" };
+	if (opts.extract) initial.extractMemories = { enabled: true };
+	if (opts.surfacing === false) initial.autoSurfacing = { enabled: false };
+	await writeConfig(initial);
+
+	vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+	config.legacyConfigActive.value = false;
+
+	return {
+		dir,
+		memoryDirRoot,
+		agentDir,
+		cwd,
+		writeConfig,
+		uiCtx: (over: Record<string, unknown> = {}) => uiCtx({ cwd, ...over }),
+		cleanup: async () => {
+			vi.unstubAllEnvs();
+			config.legacyConfigActive.value = true;
+			await rm(cwd, { recursive: true, force: true });
+		},
+	};
 }
 
 export function createFakePi() {
