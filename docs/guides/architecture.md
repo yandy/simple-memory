@@ -63,6 +63,19 @@ spec 与迁移说明。
 解析路径的完整约定与静态闸门（`npm run check:memory-core-deps`）见
 [dependencies.md](./dependencies.md) 的「开发走仓内源码，运行走 registry」一节。
 
+## LICENSE 只有根目录一份
+
+仓库根的 `LICENSE` (MIT) 覆盖所有包。`memory-core/`、`pi-memory/`、`dsh-memory/` 目录里**没有**提交的
+LICENSE 副本，`package.json` 的 `license` 字段只声明 SPDX 标识。
+
+发布出去的 tarball 仍然带完整许可证文本：各包在 `prepack` 里用 `scripts/sync-license.mjs` 把根
+LICENSE 复制进包目录，`postpack` 再删掉；生成物被 `.gitignore` 忽略。原因是 `npm pack` **不跟随**
+指向包目录外的符号链接（`ln -s ../LICENSE` 打出来的 tarball 里连条目都没有），而 MIT 要求随附
+版权与许可声明，所以文本必须在打包那一刻真实落盘。
+
+不要把副本提交回来：执行点是 `npm run check:license`（`scripts/assert-license-source.mjs`），
+`pack-smoke` 另外用 `scripts/assert-pack-manifest.mjs` 断言两个包的 tarball 里都有 `LICENSE`。
+
 ## CI job 各自的用途
 
 `.github/workflows/test.yml`：
@@ -70,10 +83,10 @@ spec 与迁移说明。
 | job | 覆盖什么 |
 |-----|----------|
 | `lockfile-sync` | `package-lock.json` 与各 `package.json` 未漂移 |
-| `test` | 逻辑（ubuntu + windows），含 `check:host-deps` / `check:memory-core-deps` / `typecheck` / `lint` / `test` |
+| `test` | 逻辑（ubuntu + windows），含 `check:license` / `check:host-deps` / `check:memory-core-deps` / `typecheck` / `lint` / `test` |
 | `test-dist` | 发布形态的解析路径（见上节） |
 | `registry-smoke` | 适配层 tarball 从 registry 装上 memory-core 后能跑（见上节） |
-| `pack-smoke` | tarball 里带齐了 `dist/`、types 与 `pi-memory` 的 TS 入口；在干净目录装包后能跑 |
+| `pack-smoke` | tarball 里带齐了 `dist/`、types、`LICENSE` 与 `pi-memory` 的 TS 入口；在干净目录装包后能跑 |
 
 `pack-smoke` 跑 Node 20.16.0（`memory-core` 的 `engines` 下限）与 24 两档，只验证运行时形状，
 不跑 vitest —— 开发工具链的 Node 下限高于 `engines`。

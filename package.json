@@ -1,6 +1,7 @@
 {
 	"name": "simple-memory",
 	"private": true,
+	"license": "MIT",
 	"workspaces": ["dsh-memory", "memory-core", "pi-memory"],
 	"scripts": {
 		"test": "npm run test --workspaces --if-present",
@@ -8,6 +9,7 @@
 		"lint": "npm run lint --workspaces --if-present",
 		"format": "npm run format --workspaces --if-present",
 		"check:host-deps": "node scripts/check-host-deps.mjs",
+		"check:license": "node scripts/assert-license-source.mjs",
 		"check:memory-core-deps": "node scripts/check-memory-core-deps.mjs",
 		"smoke:registry": "node scripts/registry-smoke.mjs"
 	},
