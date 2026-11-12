@@ -12,7 +12,12 @@ if (!file || !pkg) {
 	throw new Error("usage: node scripts/assert-pack-manifest.mjs <npm-pack-json> <memory-core|pi-memory>");
 }
 
-const [manifest] = JSON.parse(readFileSync(file, "utf8"));
+const [manifest] = (() => {
+	// `npm pack --json` 的形状随 npm 版本变：单个包是数组（`[manifest]`），带 `-w` 时也可能是以包名为键的
+	// 对象（同 scripts/registry-smoke.mjs 的 unpackOne）。
+	const parsed = JSON.parse(readFileSync(file, "utf8"));
+	return Array.isArray(parsed) ? parsed : Object.values(parsed);
+})();
 if (!manifest?.files) throw new Error(`${file}: not an npm pack --json payload`);
 
 const files = manifest.files.map((entry) => entry.path);
@@ -24,7 +29,9 @@ const CONTRACTS = {
 		forbiddenPrefixes: ["tests/", "docs/"],
 	},
 	"pi-memory": {
-		required: ["index.ts", "README.md", "package.json"],
+		// LICENSE 也在这里：它在 prepack 时由 scripts/sync-license.mjs 从仓库根生成，不是提交的文件，
+		// 所以只有打一次 tarball 才能发现「脚本没跑 / 生成到别处」。
+		required: ["index.ts", "README.md", "package.json", "LICENSE"],
 		forbiddenPrefixes: ["tests/", "docs/"],
 		/** `pi.extensions` 指向 index.ts，src/ 里是它的实现；两者少一个都装不起来。 */
 		atLeastOne: ["src/"],

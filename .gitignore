@@ -5,3 +5,9 @@ dist/
 **/docs/superpowers/plans/
 *.log
 .DS_Store
+
+# 各包的 LICENSE 由 scripts/sync-license.mjs 在 prepack 时从根 LICENSE 生成，postpack 删除。
+# 唯一真相是根目录的 LICENSE，别提交副本（执行点：scripts/assert-license-source.mjs）。
+/memory-core/LICENSE
+/pi-memory/LICENSE
+/dsh-memory/LICENSE

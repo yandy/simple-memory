@@ -28,6 +28,8 @@
 	"scripts": {
 		"build": "tsc -p tsconfig.build.json",
 		"prepublishOnly": "npm run build",
+		"prepack": "node ../scripts/sync-license.mjs",
+		"postpack": "node ../scripts/sync-license.mjs --remove",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"typecheck": "tsc --noEmit",

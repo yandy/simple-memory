@@ -70,6 +70,9 @@ curl -s https://registry.npmjs.org/@yandy0725%2Fmemory-core | node -e 'let s="";
 
 ## 注意事项
 
+- LICENSE 不需要手工准备：`prepack` 会从仓库根复制进包目录（`postpack` 删掉），见
+  [architecture.md](./architecture.md) 的「LICENSE 只有根目录一份」。`npm publish --ignore-scripts`
+  会跳过它 —— 那样发出去的包没有许可证文本。
 - `npm version --workspace` 在 monorepo 里不会自动 commit/tag（已用 `--no-git-tag-version`），需手动提交。
 - 必须同时 add `package.json` 与 `package-lock.json`。
 - `gh release create` 会自动创建对应名称的 tag，无需手动 `git tag`。
