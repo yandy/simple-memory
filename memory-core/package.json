@@ -1,6 +1,6 @@
 {
 	"name": "@yandy0725/memory-core",
-	"version": "2.0.0",
+	"version": "2.0.1",
 	"description": "Harness-agnostic file-system memory layer: one memory = one Markdown file, a MEMORY.md index, two-level locking, snapshots, and the LLM orchestration around them.",
 	"license": "MIT",
 	"repository": {
