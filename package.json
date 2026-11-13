@@ -2,7 +2,11 @@
 	"name": "simple-memory",
 	"private": true,
 	"license": "MIT",
-	"workspaces": ["dsh-memory", "memory-core", "pi-memory"],
+	"workspaces": [
+		"dsh-memory",
+		"memory-core",
+		"pi-memory"
+	],
 	"scripts": {
 		"test": "npm run test --workspaces --if-present",
 		"typecheck": "npm run typecheck --workspaces --if-present",
