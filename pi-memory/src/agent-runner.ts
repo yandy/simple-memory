@@ -79,10 +79,7 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 
 	// 3. Create session (in-memory or persisted based on config)
 	const sessionManager = opts.sessionPersistence?.enabled
-		? SessionManager.create(
-				opts.cwd,
-				opts.sessionPersistence.sessionDir ?? join(opts.cwd, "sessions"),
-			)
+		? SessionManager.create(opts.cwd, opts.sessionPersistence.sessionDir ?? join(opts.cwd, "sessions"))
 		: SessionManager.inMemory(opts.cwd);
 
 	const created = await createAgentSession({

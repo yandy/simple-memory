@@ -215,7 +215,8 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 					// 说清下一步，而不是只报一个状态。
 					return {
 						kind: "error",
-						text: "Cannot unlock: no memory runtime for this session. Run /memory in the session that owns the memory directory; if the plugin never activated here, look for a \"simple-memory\" warning in the host log and fix the row config.",
+						text:
+							'Cannot unlock: no memory runtime for this session. Run /memory in the session that owns the memory directory; if the plugin never activated here, look for a "simple-memory" warning in the host log and fix the row config.',
 					};
 				}
 				// 错误态不是死路：先拿 `rt.cwd` 重解一次目录（只有重解也失败才报错）。
@@ -223,7 +224,8 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 				if (memoryDir === null) {
 					return {
 						kind: "error",
-						text: "Cannot unlock: the memory directory is not resolved for this session and could not be re-resolved from its working directory. Fix the plugin row config (or start the session in a real project directory), then run /memory to confirm the Dir: line before retrying /memory unlock --force.",
+						text:
+							"Cannot unlock: the memory directory is not resolved for this session and could not be re-resolved from its working directory. Fix the plugin row config (or start the session in a real project directory), then run /memory to confirm the Dir: line before retrying /memory unlock --force.",
 					};
 				}
 				return await unlockMemory(memoryDir, force);
@@ -278,7 +280,8 @@ export function createDreamCommand(deps: DreamCommandDeps): CommandDefinitionLik
 			if (rt === undefined) {
 				return {
 					kind: "error",
-					text: "Cannot dream: no memory runtime for this session. Run /memory in the session that owns the memory directory; if the plugin never activated here, look for a \"simple-memory\" warning in the host log and fix the row config.",
+					text:
+						'Cannot dream: no memory runtime for this session. Run /memory in the session that owns the memory directory; if the plugin never activated here, look for a "simple-memory" warning in the host log and fix the row config.',
 				};
 			}
 			if (rt.error !== null) {
@@ -292,7 +295,7 @@ export function createDreamCommand(deps: DreamCommandDeps): CommandDefinitionLik
 			if (model === undefined) {
 				return {
 					kind: "error",
-					text: 'Cannot dream: no model configured — set dream.model (or defaults.model) in the plugin row config.',
+					text: "Cannot dream: no model configured — set dream.model (or defaults.model) in the plugin row config.",
 				};
 			}
 			if (parseModelRef(model) === null) {
@@ -304,12 +307,16 @@ export function createDreamCommand(deps: DreamCommandDeps): CommandDefinitionLik
 
 			// `runTask` 是 async：缺模型这类错误不会在调用点同步抛，而是变成这条链的 rejection，
 			// 由下面的失败分支写日志。整轮持锁与进入时的全目录快照都在 core 里。
-			const run = runTask(TASKS.dream, {}, {
-				cfg: rt.config,
-				cwd: rt.memoryDir,
-				store: rt.store,
-				ports: { headless: deps.headlessFor(rt) },
-			});
+			const run = runTask(
+				TASKS.dream,
+				{},
+				{
+					cfg: rt.config,
+					cwd: rt.memoryDir,
+					store: rt.store,
+					ports: { headless: deps.headlessFor(rt) },
+				},
+			);
 			void run.then(
 				(summary) => deps.info("simple-memory: dream finished:\n%s", summary),
 				(e: unknown) => deps.warn("simple-memory: dream failed: %s", errorMessage(e)),

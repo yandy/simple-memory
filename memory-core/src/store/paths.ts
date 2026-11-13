@@ -134,7 +134,10 @@ export function normalizeRemoteUrl(url: string, platform: NodeJS.Platform = proc
 		} catch {
 			return null;
 		}
-		const scheme = parsed.protocol.slice(0, -1).toLowerCase().replace(/^git\+/, "");
+		const scheme = parsed.protocol
+			.slice(0, -1)
+			.toLowerCase()
+			.replace(/^git\+/, "");
 		if (!GIT_PROTOCOLS.has(scheme)) return null;
 		// Non-special schemes (ssh, git) keep an opaque, un-normalized host.
 		host = normalizeHost(parsed.hostname);
@@ -155,7 +158,10 @@ export function normalizeRemoteUrl(url: string, platform: NodeJS.Platform = proc
 	}
 
 	if (!host) return null;
-	path = path.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+	path = path
+		.replace(/^\/+/, "")
+		.replace(/\/+$/, "")
+		.replace(/\.git$/i, "");
 	if (!path) return null;
 	return `${host}/${path}`;
 }
@@ -202,7 +208,10 @@ async function gitRemoteUrls(cwd: string): Promise<RemoteEntry[]> {
  *
  * `platform` 决定盘符远程的归类（win32 上当本地路径，见 `normalizeRemoteUrl`）；其余平台行为不变。
  */
-export async function projectIdentity(cwd: string, platform: NodeJS.Platform = process.platform): Promise<ProjectIdentity> {
+export async function projectIdentity(
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): Promise<ProjectIdentity> {
 	const toplevel = await gitToplevel(cwd);
 	if (!toplevel) return { kind: "local", key: resolve(cwd) };
 	for (const { url } of await gitRemoteUrls(cwd)) {

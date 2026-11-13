@@ -137,9 +137,7 @@ export function createMemoryActionHandler(
 				text =
 					entries.length === 0
 						? "No memories yet."
-						: entries
-								.map((e) => `- ${e.name} (${e.type}, modified ${e.modified}) — ${e.description} [${e.file}]`)
-								.join("\n");
+						: entries.map((e) => `- ${e.name} (${e.type}, modified ${e.modified}) — ${e.description} [${e.file}]`).join("\n");
 				details = { count: entries.length };
 				break;
 			}

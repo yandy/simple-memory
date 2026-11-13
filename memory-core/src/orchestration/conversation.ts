@@ -63,8 +63,7 @@ function clipMiddle(text: string, maxChars: number, alreadyOmitted = 0, markerAt
 	if (label !== "") {
 		body =
 			markerAt >= 0 && text.startsWith(label, markerAt)
-				? text.slice(0, markerAt) +
-					text.slice(markerAt + label.length + (text[markerAt + label.length] === "\n" ? 1 : 0))
+				? text.slice(0, markerAt) + text.slice(markerAt + label.length + (text[markerAt + label.length] === "\n" ? 1 : 0))
 				: removeLastOccurrence(text, label);
 	}
 	// 给标记文本预留位置（按一个六位数省略量估算），避免「裁减之后反而更长」。

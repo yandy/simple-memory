@@ -41,9 +41,7 @@ export class MemoryLockedError extends Error {
 		/** 记录指向一个已死的本机进程，或本身无法解释 —— 没有任何人会释放它，只能人工清除。 */
 		readonly abandoned: boolean,
 	) {
-		const described = holder
-			? `${holder.op} (pid ${holder.pid}, started ${holder.startedAt})`
-			: "an unreadable record";
+		const described = holder ? `${holder.op} (pid ${holder.pid}, started ${holder.startedAt})` : "an unreadable record";
 		super(
 			abandoned
 				? `Memory lock at ${lockPath} is abandoned by ${described} — delete the file to clear it`
@@ -134,9 +132,7 @@ export async function readLockStatus(
 	return state.kind === "empty" ? { kind: "unreadable" } : state;
 }
 
-type AcquireOutcome =
-	| { acquired: true }
-	| { acquired: false; holder: LockInfo | null; abandoned: boolean };
+type AcquireOutcome = { acquired: true } | { acquired: false; holder: LockInfo | null; abandoned: boolean };
 
 /**
  * 尝试一次获取。路径为空时不当作失败 —— 那是「刚好被释放」，直接再试一次 `open(wx)`（CAS 会自然地

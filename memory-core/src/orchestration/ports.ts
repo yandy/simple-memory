@@ -98,11 +98,7 @@ export interface ExtractMessage {
 /** 宿主的会话历史：既供 `search scope=sessions`，也供 extract 的对话渲染。 */
 export interface HostTranscriptPort {
 	/** 搜历史会话，返回已格式化好的文本（宿主决定格式与截断）。 */
-	searchSessions(
-		cwd: string,
-		query: string,
-		cfg: { maxSessions: number; maxMatches: number },
-	): Promise<string>;
+	searchSessions(cwd: string, query: string, cfg: { maxSessions: number; maxMatches: number }): Promise<string>;
 	/**
 	 * 把宿主的原始消息序列转成中立的 `ExtractMessage`。
 	 * 形状不认识的消息按「尽量保留文本」处理；**未知 role 绝不当作 user**（user 文本不截断，

@@ -111,8 +111,14 @@ export function createDshHeadless(llm: LlmLike): HeadlessAgentPort {
 			// - 任何 block-end 都置权威块并冻结该 index；text 块覆盖之前累积的 delta，同发时不重复计数。
 			// - 最后只取「解析后 type 为 text」的桶：宿主把 reasoning-delta 累积成独立的 {type:"reasoning"}
 			//   块（assemble 按 blockType 产块，:1020-1035），reasoning 文本绝不能进答案。
-			const partials = new Map<unknown, { text: string; block: { type: string; text: string } | null; blockType: string | null }>();
-			const ensure = (index: unknown, blockType?: string): { text: string; block: { type: string; text: string } | null; blockType: string | null } => {
+			const partials = new Map<
+				unknown,
+				{ text: string; block: { type: string; text: string } | null; blockType: string | null }
+			>();
+			const ensure = (
+				index: unknown,
+				blockType?: string,
+			): { text: string; block: { type: string; text: string } | null; blockType: string | null } => {
 				let partial = partials.get(index);
 				if (partial === undefined) {
 					partial = { text: "", block: null, blockType: blockType ?? null };
