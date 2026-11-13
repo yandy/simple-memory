@@ -358,41 +358,41 @@ export class MemoryStore {
 		if (!body) throw new Error("body is required");
 
 		return this.#pipeline("add", options, async () => {
-				const summaries = await this.listEntries();
-				const existing = summaries.find((s) => s.name === name);
-				const file = existing?.file ?? (await this.#resolveTargetFile(name));
-				// 覆盖同名 entry 时**永远**保留磁盘上的 created（幂等覆盖的关键）；
-				// 只有新建时才接受调用方传入的值，缺省是今天。
-				const created = existing
-					? ((await this.readEntry(existing.file))?.created ?? isoDate(new Date()))
-					: (requestedCreated || isoDate(new Date()));
-				// `|| name` 是必需的：deriveDescription 可能返回 ""，而空 description 会让该 entry 对侧查询不可见。
-				const description = requestedDescription || deriveDescription(body) || name;
-				const now = new Date();
+			const summaries = await this.listEntries();
+			const existing = summaries.find((s) => s.name === name);
+			const file = existing?.file ?? (await this.#resolveTargetFile(name));
+			// 覆盖同名 entry 时**永远**保留磁盘上的 created（幂等覆盖的关键）；
+			// 只有新建时才接受调用方传入的值，缺省是今天。
+			const created = existing
+				? ((await this.readEntry(existing.file))?.created ?? isoDate(new Date()))
+				: requestedCreated || isoDate(new Date());
+			// `|| name` 是必需的：deriveDescription 可能返回 ""，而空 description 会让该 entry 对侧查询不可见。
+			const description = requestedDescription || deriveDescription(body) || name;
+			const now = new Date();
 
-				await this.#maybeSnapshot(options, "write", [INDEX_FILE, file]);
-				await this.#retry(() =>
-					writeFile(
-						join(this.cfg.memoryDir, file),
-						serializeEntryFile(
-							{
-								name,
-								description,
-								type: input.type ?? existing?.type ?? "feedback",
-								created,
-								modified: now.toISOString(),
-							},
-							body,
-						),
-						"utf8",
+			await this.#maybeSnapshot(options, "write", [INDEX_FILE, file]);
+			await this.#retry(() =>
+				writeFile(
+					join(this.cfg.memoryDir, file),
+					serializeEntryFile(
+						{
+							name,
+							description,
+							type: input.type ?? existing?.type ?? "feedback",
+							created,
+							modified: now.toISOString(),
+						},
+						body,
 					),
-				);
+					"utf8",
+				),
+			);
 
-				const next = upsertIndexLine(await this.readIndex(), { name, file, description });
-				await this.#retry(() => writeFile(this.#indexPath(), next, "utf8"));
-				this.#cache.delete(file);
+			const next = upsertIndexLine(await this.readIndex(), { name, file, description });
+			await this.#retry(() => writeFile(this.#indexPath(), next, "utf8"));
+			this.#cache.delete(file);
 
-				return { file, capacityWarning: this.#capacityWarning(next) };
+			return { file, capacityWarning: this.#capacityWarning(next) };
 		});
 	}
 
@@ -402,86 +402,82 @@ export class MemoryStore {
 		options?: WriteOptions,
 	): Promise<{ file: string; capacityWarning?: string }> {
 		return this.#pipeline("replace", options, async () => {
-				const current = await this.readEntry(ref);
-				if (!current) throw new Error(`Entry "${ref}" not found`);
+			const current = await this.readEntry(ref);
+			if (!current) throw new Error(`Entry "${ref}" not found`);
 
-				const name = (patch.name ?? current.name).trim();
-				this.#validateName(name);
-				const requestedDescription = patch.description?.trim();
-				this.#validateDescription(requestedDescription);
-				const body = patch.body === undefined ? current.body : patch.body.trim();
-				const description =
-					requestedDescription ||
-					(patch.body === undefined ? current.description : deriveDescription(body)) ||
-					current.description ||
-					name;
-				// 改名不得撞名。`resolveUniqueFileName` 只防**文件名**冲突，所以不在这里拦下的话，
-				// rename 到已存在的 name 会写出第二个同名 entry（索引里两行都写着 [A]），之后 readEntry /
-				// addEntry 都会命中其中较旧的那个 —— 「精确同名即幂等」的硬约束就断了。
-				// 选择报错而不是合并或自动加后缀：合并会静默覆盖对方的内容，加后缀则会篡改调用方给的 name，
-				// 两者都在用户没要求的地方动记忆。
-				if (name !== current.name && (await this.listEntries()).some((s) => s.name === name)) {
-					throw new Error(`Entry "${name}" already exists`);
-				}
-				// 自碰撞（如 "A B" → "A-B" 派生出同一个文件名）由 #resolveTargetFile 的 exclude 参数复用原文件
-				const file = name === current.name ? current.file : await this.#resolveTargetFile(name, current.file);
+			const name = (patch.name ?? current.name).trim();
+			this.#validateName(name);
+			const requestedDescription = patch.description?.trim();
+			this.#validateDescription(requestedDescription);
+			const body = patch.body === undefined ? current.body : patch.body.trim();
+			const description =
+				requestedDescription ||
+				(patch.body === undefined ? current.description : deriveDescription(body)) ||
+				current.description ||
+				name;
+			// 改名不得撞名。`resolveUniqueFileName` 只防**文件名**冲突，所以不在这里拦下的话，
+			// rename 到已存在的 name 会写出第二个同名 entry（索引里两行都写着 [A]），之后 readEntry /
+			// addEntry 都会命中其中较旧的那个 —— 「精确同名即幂等」的硬约束就断了。
+			// 选择报错而不是合并或自动加后缀：合并会静默覆盖对方的内容，加后缀则会篡改调用方给的 name，
+			// 两者都在用户没要求的地方动记忆。
+			if (name !== current.name && (await this.listEntries()).some((s) => s.name === name)) {
+				throw new Error(`Entry "${name}" already exists`);
+			}
+			// 自碰撞（如 "A B" → "A-B" 派生出同一个文件名）由 #resolveTargetFile 的 exclude 参数复用原文件
+			const file = name === current.name ? current.file : await this.#resolveTargetFile(name, current.file);
 
-				await this.#maybeSnapshot(options, "write", [INDEX_FILE, current.file, file]);
-				await this.#retry(() =>
-					writeFile(
-						join(this.cfg.memoryDir, file),
-						serializeEntryFile(
-							{
-								name,
-								description,
-								type: patch.type ?? current.type,
-								created: current.created,
-								modified: new Date().toISOString(),
-							},
-							body,
-						),
-						"utf8",
+			await this.#maybeSnapshot(options, "write", [INDEX_FILE, current.file, file]);
+			await this.#retry(() =>
+				writeFile(
+					join(this.cfg.memoryDir, file),
+					serializeEntryFile(
+						{
+							name,
+							description,
+							type: patch.type ?? current.type,
+							created: current.created,
+							modified: new Date().toISOString(),
+						},
+						body,
 					),
-				);
-				if (file !== current.file) {
-					// 大小写不敏感 / 做 Unicode 规范化的文件系统上，两个不同的字符串可能指向同一 inode；
-					// 那种情况下上面的 writeFile 已经写穿了原文件，再 unlink 会把刚写入的文件删掉。
-					const target = join(this.cfg.memoryDir, file);
-					const source = join(this.cfg.memoryDir, current.file);
-					if (!(await sameFile(target, source))) await this.#retry(() => unlinkStrict(source));
-				}
+					"utf8",
+				),
+			);
+			if (file !== current.file) {
+				// 大小写不敏感 / 做 Unicode 规范化的文件系统上，两个不同的字符串可能指向同一 inode；
+				// 那种情况下上面的 writeFile 已经写穿了原文件，再 unlink 会把刚写入的文件删掉。
+				const target = join(this.cfg.memoryDir, file);
+				const source = join(this.cfg.memoryDir, current.file);
+				if (!(await sameFile(target, source))) await this.#retry(() => unlinkStrict(source));
+			}
 
-				const raw = await this.readIndex();
-				// 目标文件名可能残留一条陈旧索引行（手工删了文件却没删行）。不先清掉的话，
-				// 下面的 atLineNo 覆盖会与它并存 → 同一个 file 出现两条索引行。
-				// 必须先清再重新解析行号：删除会让后面的行号前移。
-				// 仅在真正换文件时清理：未改名（含 "A B" → "A-B" 派生同名文件）时 file === current.file，
-				// removeIndexLine 会删掉我们要保留位置的那一行，它会被 upsert 追加到索引末尾。
-				const cleaned = file === current.file ? raw : removeIndexLine(raw, file);
-				const line = parseEntryIndex(cleaned).entries.find((e) => e.file === current.file);
-				const next = upsertIndexLine(
-					cleaned,
-					{ name, file, description },
-					line ? { atLineNo: line.lineNo } : undefined,
-				);
-				await this.#retry(() => writeFile(this.#indexPath(), next, "utf8"));
-				this.#cache.delete(current.file);
-				this.#cache.delete(file);
+			const raw = await this.readIndex();
+			// 目标文件名可能残留一条陈旧索引行（手工删了文件却没删行）。不先清掉的话，
+			// 下面的 atLineNo 覆盖会与它并存 → 同一个 file 出现两条索引行。
+			// 必须先清再重新解析行号：删除会让后面的行号前移。
+			// 仅在真正换文件时清理：未改名（含 "A B" → "A-B" 派生同名文件）时 file === current.file，
+			// removeIndexLine 会删掉我们要保留位置的那一行，它会被 upsert 追加到索引末尾。
+			const cleaned = file === current.file ? raw : removeIndexLine(raw, file);
+			const line = parseEntryIndex(cleaned).entries.find((e) => e.file === current.file);
+			const next = upsertIndexLine(cleaned, { name, file, description }, line ? { atLineNo: line.lineNo } : undefined);
+			await this.#retry(() => writeFile(this.#indexPath(), next, "utf8"));
+			this.#cache.delete(current.file);
+			this.#cache.delete(file);
 
-				return { file, capacityWarning: this.#capacityWarning(next) };
+			return { file, capacityWarning: this.#capacityWarning(next) };
 		});
 	}
 
 	async removeEntry(ref: string, options?: WriteOptions): Promise<void> {
 		await this.#pipeline("remove", options, async () => {
-				const current = await this.readEntry(ref);
-				if (!current) throw new Error(`Entry "${ref}" not found`);
+			const current = await this.readEntry(ref);
+			if (!current) throw new Error(`Entry "${ref}" not found`);
 
-				await this.#maybeSnapshot(options, "write", [INDEX_FILE, current.file]);
-				await this.#retry(() => unlinkStrict(join(this.cfg.memoryDir, current.file)));
-				const next = removeIndexLine(await this.readIndex(), current.file);
-				await this.#retry(() => writeFile(this.#indexPath(), next, "utf8"));
-				this.#cache.delete(current.file);
+			await this.#maybeSnapshot(options, "write", [INDEX_FILE, current.file]);
+			await this.#retry(() => unlinkStrict(join(this.cfg.memoryDir, current.file)));
+			const next = removeIndexLine(await this.readIndex(), current.file);
+			await this.#retry(() => writeFile(this.#indexPath(), next, "utf8"));
+			this.#cache.delete(current.file);
 		});
 	}
 
@@ -493,25 +489,20 @@ export class MemoryStore {
 	/** 从磁盘全量重建索引；保留第一条索引行之前的手写块，其余无法识别行丢弃。 */
 	async rebuildIndex(options?: WriteOptions): Promise<{ entries: number; headerLines: number }> {
 		return this.#pipeline("rebuild", options, async () => {
-				await this.#maybeSnapshot(options, "index", [INDEX_FILE]);
+			await this.#maybeSnapshot(options, "index", [INDEX_FILE]);
 
-				const summaries = await this.listEntries();
-				const { lines, entries } = parseEntryIndex(await this.readIndex());
+			const summaries = await this.listEntries();
+			const { lines, entries } = parseEntryIndex(await this.readIndex());
 
-				const header = lines.slice(0, entries[0]?.lineNo ?? lines.length);
-				while (header.length > 0 && header[header.length - 1].trim() === "") header.pop();
-				const effectiveHeader = header.length > 0 ? header : ["# Memory Index", ""];
+			const header = lines.slice(0, entries[0]?.lineNo ?? lines.length);
+			while (header.length > 0 && header[header.length - 1].trim() === "") header.pop();
+			const effectiveHeader = header.length > 0 ? header : ["# Memory Index", ""];
 
-				const rebuilt = [
-					...effectiveHeader,
-					...summaries.map((s) => formatIndexLine(s.name, s.file, s.description)),
-				];
-				await this.#retry(() =>
-					writeFile(this.#indexPath(), rebuilt.length === 0 ? "" : `${rebuilt.join("\n")}\n`, "utf8"),
-				);
-				this.#cache.clear();
+			const rebuilt = [...effectiveHeader, ...summaries.map((s) => formatIndexLine(s.name, s.file, s.description))];
+			await this.#retry(() => writeFile(this.#indexPath(), rebuilt.length === 0 ? "" : `${rebuilt.join("\n")}\n`, "utf8"));
+			this.#cache.clear();
 
-				return { entries: summaries.length, headerLines: effectiveHeader.length };
+			return { entries: summaries.length, headerLines: effectiveHeader.length };
 		});
 	}
 }

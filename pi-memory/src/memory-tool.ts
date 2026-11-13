@@ -60,9 +60,7 @@ function buildParameters(actions: readonly MemoryAction[]): TSchema {
 		const { enum: values, ...rest } = field;
 		// `StringEnum` 就是 `Type.Unsafe({ type: "string", enum, description })`（pi-ai 的
 		// typebox-helpers），单独走它是为了拿到 pi 对枚举参数的渲染与校验语义。
-		const schema = values
-			? StringEnum(values, { description: rest.description })
-			: Type.Unsafe<unknown>({ ...rest });
+		const schema = values ? StringEnum(values, { description: rest.description }) : Type.Unsafe<unknown>({ ...rest });
 		props[key] = required.has(key) ? schema : Type.Optional(schema);
 	}
 	return Type.Object(props);

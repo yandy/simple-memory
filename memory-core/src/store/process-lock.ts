@@ -62,7 +62,10 @@ async function acquire(key: string, timeoutMs: number): Promise<() => void> {
 	const gate = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	state.tail = previous.then(() => gate, () => gate);
+	state.tail = previous.then(
+		() => gate,
+		() => gate,
+	);
 	state.waiters += 1;
 
 	let timer: ReturnType<typeof setTimeout> | undefined;

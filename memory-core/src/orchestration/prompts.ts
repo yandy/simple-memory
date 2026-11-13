@@ -112,4 +112,3 @@ export function buildExtractTask(
 		conversation,
 	].join("\n");
 }
-

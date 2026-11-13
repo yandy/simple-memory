@@ -64,10 +64,9 @@ export function assertPromptHygiene(options: PromptHygieneOptions): void {
 			expect(c.Snippet.length, `${label}: promptSnippet 缺失`).toBeGreaterThan(0);
 			expect(c.Snippet.length, `${label}: snippet 超过 ${SNIPPET_MAX} 字符`).toBeLessThanOrEqual(SNIPPET_MAX);
 			// 宿主已渲染 `- <name>: `，snippet 再写一遍工具名会显示成「websearch: websearch: …」
-			expect(
-				c.Snippet.toLowerCase().startsWith(`${tool.name.toLowerCase()}:`),
-				`${label}: snippet 重复了工具名`,
-			).toBe(false);
+			expect(c.Snippet.toLowerCase().startsWith(`${tool.name.toLowerCase()}:`), `${label}: snippet 重复了工具名`).toBe(
+				false,
+			);
 			expect(c.Snippet.endsWith("."), `${label}: 目录行不该以句号结尾`).toBe(false);
 			expect(IMPERATIVE_START.test(c.Snippet), `${label}: 目录行不该是指令`).toBe(false);
 		}

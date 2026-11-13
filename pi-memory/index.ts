@@ -206,9 +206,7 @@ export default function (pi: ExtensionAPI) {
 		// biome-ignore lint/style/noNonNullAssertion: config 在 session_start 里赋值，工具执行必然晚于它
 		getConfig: () => config!,
 		getUnavailableMessage: () =>
-			configError
-				? `Memory not initialized — ${configError.split("\n")[0]}; run /memory for details`
-				: null,
+			configError ? `Memory not initialized — ${configError.split("\n")[0]}; run /memory for details` : null,
 		searchSessions,
 		cwd: () => currentCwd,
 	};
@@ -320,7 +318,11 @@ export default function (pi: ExtensionAPI) {
 					const dir = nudgeDir;
 					// `runTask` 是 async：缺模型不会在调用点同步抛，而是变成这条链的 rejection，
 					// 由下面的两参 `.then` 失败分支报「Dream failed」，`.finally` 负责清状态行。
-					const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } });
+					const dreamRun = runTask(
+						TASKS.dream,
+						{},
+						{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } },
+					);
 					ui.setStatus("dream", "Consolidating memory...");
 					// dream 的 7 个 action 只注入它自己的 headless 子会话；整轮持锁与进入时的
 					// 全目录快照都在 runTask(TASKS.dream) 里，所以内部原语两个 skip 都开（由 core 表达）。
@@ -365,7 +367,7 @@ export default function (pi: ExtensionAPI) {
 		// <active_agent name="..."/> tag into every subagent's system prompt.
 		// Main sessions (including forks) never have this tag. Our own headless
 		// sessions use noExtensions (never bind), so they never reach here.
-		const isSubagent = event.systemPrompt?.includes("<active_agent name=\"");
+		const isSubagent = event.systemPrompt?.includes('<active_agent name="');
 		// biome-ignore lint/suspicious/noExplicitAny: message injection result
 		let injectedMessage: any;
 		if (autoSurfacing?.enabled && event.prompt && !isSubagent) {
@@ -409,11 +411,7 @@ export default function (pi: ExtensionAPI) {
 		if (!config || !activeStore) return;
 		// compaction 会把已注入的内容挤出上下文：不清空，这些 entry 本会话再也不会浮现。
 		injectedFiles.clear();
-		indexSnapshot = await buildIndexSection(
-			activeStore,
-			config.memIndexInjectMaxLines,
-			config.memIndexInjectMaxBytes,
-		);
+		indexSnapshot = await buildIndexSection(activeStore, config.memIndexInjectMaxLines, config.memIndexInjectMaxBytes);
 	});
 
 	// spec §10：退出前等在途写操作收尾（上限 lock.timeoutMs），避免留下 stale 锁。
@@ -521,10 +519,7 @@ export default function (pi: ExtensionAPI) {
 					try {
 						dir = await resolveMemoryDir(config, ctx.cwd);
 					} catch (e) {
-						ctx.ui.notify(
-							`Failed to resolve memory dir: ${e instanceof Error ? e.message : String(e)}`,
-							"error",
-						);
+						ctx.ui.notify(`Failed to resolve memory dir: ${e instanceof Error ? e.message : String(e)}`, "error");
 						return;
 					}
 				}
@@ -595,7 +590,11 @@ export default function (pi: ExtensionAPI) {
 			const dir = memoryDir;
 			// `runTask` 是 async：缺模型不在这里同步抛，而是作为 rejection 走下面的两参
 			// `.then` 失败分支（报「Dream failed」）；状态行由 `.finally` 兜底清除，不会残留。
-			const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } });
+			const dreamRun = runTask(
+				TASKS.dream,
+				{},
+				{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } },
+			);
 			ui?.setStatus("dream", "Consolidating memory...");
 			track(dreamRun);
 			void dreamRun

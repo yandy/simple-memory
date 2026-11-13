@@ -36,7 +36,12 @@ export type { LockInfo, LockOptions } from "./store/fs-lock.js";
 export { isTransientFsError, withFsRetry } from "./store/fs-retry.js";
 export type { FsRetryOptions } from "./store/fs-retry.js";
 
-export { ProcessLockTimeoutError, isProcessLockActive, tryWithProcessLock, withProcessLock } from "./store/process-lock.js";
+export {
+	ProcessLockTimeoutError,
+	isProcessLockActive,
+	tryWithProcessLock,
+	withProcessLock,
+} from "./store/process-lock.js";
 
 export { createSnapshot, pruneSnapshots, snapshotStamp } from "./store/snapshot.js";
 export type { SnapshotOptions } from "./store/snapshot.js";
@@ -44,7 +49,13 @@ export type { SnapshotOptions } from "./store/snapshot.js";
 export { withFileMutationQueue } from "./store/mutation-queue.js";
 
 // ── store/ 路径与安全 ──────────────────────────────────────────────────────────
-export { assertInsideRoot, normalizeRemoteUrl, projectDirName, projectIdentity, resolveMemoryDir } from "./store/paths.js";
+export {
+	assertInsideRoot,
+	normalizeRemoteUrl,
+	projectDirName,
+	projectIdentity,
+	resolveMemoryDir,
+} from "./store/paths.js";
 export type { NamingOptions, ProjectIdentity, ProjectKind } from "./store/paths.js";
 
 export { sanitizeForInjection, stripInvisibleChars } from "./store/sanitize.js";

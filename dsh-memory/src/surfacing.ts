@@ -150,9 +150,7 @@ export function createPreStepListener(
 				return decision;
 			}
 
-			const prompt = humanPromptText(
-				payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>,
-			);
+			const prompt = humanPromptText(payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>);
 			if (prompt === "") return decision;
 
 			const manifest = await scanEntries(rt.store);

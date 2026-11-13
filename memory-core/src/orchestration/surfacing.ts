@@ -65,4 +65,3 @@ export const autoSurfacing: MemoryTask<SurfacingInput, SurfacingResult> = {
 		return { files: [], content: "" };
 	},
 };
-

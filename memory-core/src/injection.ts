@@ -211,9 +211,7 @@ export async function scanEntries(store: MemoryStore): Promise<EntryManifest[]> 
 	const summaries = await store.listEntries();
 	return summaries
 		.map((s) => ({ file: s.file, name: s.name, description: s.description, type: s.type, modified: s.modified }))
-		.sort((a, b) =>
-			a.modified === b.modified ? a.file.localeCompare(b.file) : b.modified.localeCompare(a.modified),
-		)
+		.sort((a, b) => (a.modified === b.modified ? a.file.localeCompare(b.file) : b.modified.localeCompare(a.modified)))
 		.slice(0, SIDE_QUERY_MAX_ENTRIES);
 }
 

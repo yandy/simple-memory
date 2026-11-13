@@ -50,7 +50,10 @@ export interface SessionEventLike {
  */
 export interface SessionQueryLike {
 	listSessions(signal?: AbortSignal): Promise<SessionRecordLike[]>;
-	filterSessions(filters: ReadonlyArray<{ kind: string; values?: unknown }>, signal?: AbortSignal): Promise<SessionRecordLike[]>;
+	filterSessions(
+		filters: ReadonlyArray<{ kind: string; values?: unknown }>,
+		signal?: AbortSignal,
+	): Promise<SessionRecordLike[]>;
 	readSession(sessionId: string): Promise<SessionLogSnapshotLike>;
 }
 
@@ -121,11 +124,7 @@ function eventText(event: SessionEventLike): string {
 				| { message?: { content?: unknown }; error?: { name?: unknown; code?: unknown } }
 				| null
 				| undefined;
-			return [
-				contentText(result?.message?.content),
-				stringPart(result?.error?.name),
-				stringPart(result?.error?.code),
-			]
+			return [contentText(result?.message?.content), stringPart(result?.error?.name), stringPart(result?.error?.code)]
 				.filter(Boolean)
 				.join(" ");
 		}

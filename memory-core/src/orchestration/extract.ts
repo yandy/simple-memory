@@ -57,4 +57,3 @@ export const extractMemories: MemoryTask<ExtractInput, ExtractResult> = {
 		return { onWrite: input.onWrite };
 	},
 };
-

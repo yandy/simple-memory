@@ -37,4 +37,3 @@ export const dream: MemoryTask<Record<string, never>, string> = {
 		}
 	},
 };
-

@@ -1,11 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import {
-	requiredModel,
-	type MemoryConfig,
-	type ModelTask,
-	type SessionPersistenceConfig,
-} from "../config.js";
+import { requiredModel, type MemoryConfig, type ModelTask, type SessionPersistenceConfig } from "../config.js";
 import { BACKUP_DIR, type MemoryStore } from "../store/memory-store.js";
 import { createSnapshot } from "../store/snapshot.js";
 import { isReservedWindowsName } from "../store/windows-names.js";
@@ -62,10 +57,7 @@ export interface RequestHost {
 export type MemoryToolOnWrite = (info: { action: MemoryAction; name?: string }) => void;
 
 /** `notCompleted` 收的 `why`：core 自己的判定，或端口给的非 completed 结果。 */
-export type Incomplete =
-	| { status: "no-input" }
-	| { status: "lock-busy" }
-	| IncompleteOutcome;
+export type Incomplete = { status: "no-input" } | { status: "lock-busy" } | IncompleteOutcome;
 
 export interface MemoryTask<I, R> {
 	readonly id: ModelTask;

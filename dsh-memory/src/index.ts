@@ -126,11 +126,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// 而且连一行日志都没有（因为根本没抛错）。这是比「抛错型激活失败」更糟的静默失败。
 		// 有界之后，abort 会走 model.ts 既有的 try，降级成 `{ available: false, reason }` —— 正是「降级而
 		// 不失败」要的路径，所以不需要任何新的错误处理。别把它当「多余」删掉。
-		surfacing = await resolveSurfacingAvailability(
-			resolved.config,
-			resolveCallConfig,
-			AbortSignal.timeout(10_000),
-		);
+		surfacing = await resolveSurfacingAvailability(resolved.config, resolveCallConfig, AbortSignal.timeout(10_000));
 	} catch (e) {
 		surfacing = { available: false, reason: `autoSurfacing could not be resolved: ${errorMessage(e)}` };
 	}
@@ -186,7 +182,11 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			// 按 action 集（= 任务）挑 worker：extract 5 个、dream 7 个，两者能力面不同，不能混用。
 			const memoryTool = req.memoryTool;
 			if (memoryTool === null) {
-				return Promise.resolve({ status: "not-run" as const, cause: "host-refused" as const, detail: "no memory tool requested" });
+				return Promise.resolve({
+					status: "not-run" as const,
+					cause: "host-refused" as const,
+					detail: "no memory tool requested",
+				});
 			}
 			const actions = memoryTool.actions;
 			const isDream = actions === TASKS.dream.plan.memoryTool;
@@ -196,7 +196,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 					status: "not-run" as const,
 					cause: "host-refused" as const,
 					detail: isDream
-						? "dream has no prepared worker for this session: this adapter creates its sub-session at session start, so add a \"dream\" key (for example dream: { model: \"<provider>/<model>\" }) to the plugin row config and restart the session"
+						? 'dream has no prepared worker for this session: this adapter creates its sub-session at session start, so add a "dream" key (for example dream: { model: "<provider>/<model>" }) to the plugin row config and restart the session'
 						: "extractMemories has no prepared worker for this session",
 				});
 			}
@@ -223,7 +223,10 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	 * 三种绑定方式 + 宏任务延迟全部复现）。所以建会话提前到这里，每一轮只往里 `followup` 一条消息。
 	 * 代价：每个会话多一条**空的**子会话记录（只在相关任务启用时才建，见下方的门禁）。
 	 */
-	const workers = new Map<string, { extract: SessionWorker | null; dream: SessionWorker | null; failure: string | null }>();
+	const workers = new Map<
+		string,
+		{ extract: SessionWorker | null; dream: SessionWorker | null; failure: string | null }
+	>();
 	/** sessionId → 工具注册的清理项。 */
 	const cleanups = new Map<string, SessionCleanup>();
 
@@ -262,9 +265,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	// 用户在行 config 里写过的白名单顶层键，交给 `/memory` 就地报出未实现的任务
 	//（那些算未实现、是否只在真写了该键时才显示、怎么措辞，都在 commands.ts 的 renderStatus）。
 	const setKeys = rowConfigSetKeys(config);
-	ctx.commands.register(
-		createMemoryCommand({ registry, indexCache, warnings: resolved.warnings, setKeys }),
-	);
+	ctx.commands.register(createMemoryCommand({ registry, indexCache, warnings: resolved.warnings, setKeys }));
 	// `/dream`：整目录整理。命令立刻返回「已开始」，摘要在宿主日志里（dream 的 timeout 是 600s，
 	// 不能把命令处理器挂在那里等）。
 	ctx.commands.register(
@@ -323,7 +324,11 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 				return "error" in result ? { worker: null, error: result.error } : { worker: result, error: null };
 			};
 
-			const slot = { extract: null as SessionWorker | null, dream: null as SessionWorker | null, failure: null as string | null };
+			const slot = {
+				extract: null as SessionWorker | null,
+				dream: null as SessionWorker | null,
+				failure: null as string | null,
+			};
 			if (rt.config.extractMemories?.enabled === true) {
 				const made = await makeWorker("extractMemories");
 				slot.extract = made.worker;
@@ -336,7 +341,8 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			}
 			workers.set(sessionId, slot);
 			for (const extra of [slot.extract, slot.dream]) {
-				if (extra !== null && extra.sessionId !== "") ctx.logger.debug("simple-memory: sub-session %s prepared", extra.sessionId);
+				if (extra !== null && extra.sessionId !== "")
+					ctx.logger.debug("simple-memory: sub-session %s prepared", extra.sessionId);
 			}
 		}
 
