@@ -298,7 +298,8 @@ export interface RemoteView {
 	/** 不透明标识，写回 manifest 的 base.revision。git: commit sha；S3: manifest 对象的 etag。 */
 	readonly revision: string;
 	/**
-	 * 远端在当前同步范围内的全部逻辑路径 + 内容 hash。
+	 * 远端在 `scope.prefix` 下的全部路径 + 内容 hash。
+	 * **路径相对于 `scope.prefix`**（因此就是单层 entry 文件名），与引擎差集的 key 同域。
 	 * **hash 恒为 sha256(bytes) 的十六进制小写** —— 这是端口契约的一部分，不是实现细节：
 	 * manifest 与三方差集都直接与它比较。backend 若原生只有别的标识（git blob sha1、S3 的
 	 * ETag/MD5），由 backend 自己负责换算（读内容后算 sha256，或自己存一份 sha256 清单对象）。
@@ -308,22 +309,31 @@ export interface RemoteView {
 	read(path: string): Promise<string>;
 }
 
+/**
+ * 远端内的一个前缀。v1 恒为 `git/<remoteProjectKey>`（§6.1）；backend 只在该前缀内活动，
+ * 因此引擎不必知道远端还有别的项目。
+ */
+export interface SyncScope {
+	readonly prefix: string;
+}
+
 export interface SyncBackend {
 	/** 是否已初始化（暂存 clone 是否存在等）。false 时自动路径直接跳过（§6.11）。 */
 	ready(): Promise<boolean>;
 	/** 首次初始化：只由显式命令触发（§6.12）。 */
 	init(opts: SyncRunOptions): Promise<void>;
 	/** 拉取远端最新状态。 */
-	fetch(opts: SyncRunOptions): Promise<RemoteView>;
+	fetch(scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView>;
 	/**
-	 * 把合并后的完整文件集发布到远端，返回新的 revision。
+	 * 把「从 `base`（= 本次 fetch 到的 theirs）到合并结果」的**增量**发布到远端，返回新的 revision。
+	 * 用增量而不是完整文件集：S3 这类 backend 只需 PUT/DELETE 变化的对象，不必重传全量。
 	 * 端口不承诺原子，但要求 backend **要么整体成功、要么抛错且不留下半推状态**
 	 * （git 天然是一个 commit；S3 需要清单对象 + 条件写）。
 	 * `base.revision` 用于乐观并发：远端已经不在 base 上时抛 NonFastForward（§6.11）。
 	 */
 	publish(
-		files: Iterable<{ path: string; content: string }>,
-		deletions: Iterable<string>,
+		scope: SyncScope,
+		changes: { writes: Array<{ path: string; content: string }>; deletions: string[] },
 		base: { revision: string },
 		opts: SyncRunOptions & { message: string; author: { name: string; email: string } },
 	): Promise<string>;
@@ -350,10 +360,11 @@ export interface SyncRunOptions {
   `git cat-file --batch` 读出全部 blob 并逐个算 sha256（`ls-tree` 给的是 blob sha1，与端口契约的
   sha256 不同源；记忆文本量小，一次批量读比维护两套 hash 语义简单）。
 - `read()` 复用同一次 `cat-file --batch` 的结果（`fetch()` 内部缓存），不额外 spawn。
-- `publish()`：`git reset --hard origin/<branch>`（暂存 = theirs）→ 把合并结果写进暂存工作树 →
-  `git add -- git/<project-key>`（限定路径，不吞用户随手丢进暂存目录的东西）→ `git commit`
-  （作者 = `device.json`）→ `git push origin <branch>`。因为我们的 commit 是 theirs 的子提交，
-  push 是快进。**不触发任何 git merge** —— 三方差集已经在引擎里算完了。
+- `publish()`：`git reset --hard origin/<branch>`（暂存 = theirs）→ 写入 `changes.writes`、删除
+  `changes.deletions` → `git add -A -- git/<project-key>`（限定路径，不吞用户随手丢进暂存目录的
+  东西；`-A` 让删除也进索引）→ `git commit`（作者 = `device.json`）→ `git push origin <branch>`。
+  因为我们的 commit 是 theirs 的子提交，push 是快进。**不触发任何 git merge** —— 三方差集已经在
+  引擎里算完了。
 - push 撞上非快进（fetch 与 publish 之间另一台设备推了）：抛 `NonFastForward`，引擎整轮重跑，
   上限 1 次；仍失败则本轮放弃（manifest 的 base 不前进），下次再来。
 
