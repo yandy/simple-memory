@@ -307,6 +307,12 @@ export interface RemoteView {
 	list(): Promise<Array<{ path: string; hash: string }>>;
 	/** 取内容。只会被 list() 报出的路径调用。 */
 	read(path: string): Promise<string>;
+	/**
+	 * 远端存在、但不属于本 scope 的 entry 的路径（**仓库根相对**）。纯报告用：引擎把它抄进
+	 * 同步结果与 `status`，让人知道远端有东西没被同步（有人手工推了 `MEMORY.md`、`local/...`、
+	 * 或 scope 下的嵌套目录）。**不得静默丢弃范围外路径**；无法廉价判断的 backend 返回 `[]`。
+	 */
+	readonly outOfScope: string[];
 }
 
 /**
@@ -355,10 +361,11 @@ export interface SyncRunOptions {
 
 - 全部走 `execFile("git", [...])`（不是 shell），带 `timeoutMs`、`cwd: <root>/.sync/repo`、
   可选 `signal`；沿用 `store/paths.ts` 的口径（`promisify(execFile)` + catch）。
-- `fetch()`：`git fetch --quiet origin <branch>`；`list()` 用
-  `git ls-tree -r --name-only origin/<branch> -- git/<project-key>` 拿路径，再用**一次**
-  `git cat-file --batch` 读出全部 blob 并逐个算 sha256（`ls-tree` 给的是 blob sha1，与端口契约的
-  sha256 不同源；记忆文本量小，一次批量读比维护两套 hash 语义简单）。
+- `fetch()`：`git fetch --quiet origin <branch>`；`list()` 用 `git ls-tree -r --name-only FETCH_HEAD`
+  （**整棵树**）再分类：在 `<scope.prefix>/` 下且去掉前缀后不再含 `/` 的 → 进 scope，其余 →
+  进 `outOfScope`；再用**一次** `git cat-file --batch` 读出范围内全部 blob 并逐个算 sha256
+  （`ls-tree` 给的是 blob sha1，与端口契约的 sha256 不同源；记忆文本量小，一次批量读比维护两套
+  hash 语义简单）。
 - `read()` 复用同一次 `cat-file --batch` 的结果（`fetch()` 内部缓存），不额外 spawn。
 - `publish()`：`git reset --hard origin/<branch>`（暂存 = theirs）→ 写入 `changes.writes`、删除
   `changes.deletions` → `git add -A -- git/<project-key>`（限定路径，不吞用户随手丢进暂存目录的
@@ -535,7 +542,7 @@ pi 的 `memory.json` / dsh 的行 `config:` 读出后交给 `mergeConfig`）：
 | publish 非快进 | 整轮重跑 1 次，仍失败则留到下次（§6.5） |
 | 暂存 clone 损坏 / 卡在 merge 中间态 | `git reset --hard` + 重试 1 次；仍失败报"请手动检查 `<root>/.sync/repo`"，不再自动动它 |
 | 逻辑锁忙（dream 在跑）或根 sync 锁忙 | 跳过本轮 + 记原因（§6.7） |
-| 远端出现范围外的路径（有人手工推了 `local/...` 或 `MEMORY.md`） | 忽略，不拉到本地，`status` 报一行 |
+| 远端出现范围外的路径（有人手工推了 `local/...` 或 `MEMORY.md`） | 忽略，不拉到本地；backend 经 `RemoteView.outOfScope` 报上来，`status` 报一行 |
 | 远端文件解析不出 frontmatter / 过不了 name·created·type 校验 | **拒收**，不覆盖本地同名文件，`status` 报一行（§6.6） |
 | 远端文件与本地/批内发生大小写或 Unicode 规范化碰撞 | **跳过**该文件 + `status` 报一行，绝不静默写穿（§6.6） |
 | 本地有解析不出的 `.md` | 不参与同步，`status` 报一行（§6.6） |
