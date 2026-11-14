@@ -192,10 +192,10 @@ S3 backend 会长成两个形状，接口被迫向 git 妥协。方案 2 要自�
 
 ```
 远端路径 = git/<remoteProjectKey>/<entry 文件名>
-remoteProjectKey = projectDirName(identity.key, { platform: "posix" })   // 恒按 POSIX 规则派生
+remoteProjectKey = projectDirName(identity.key, { platform: "linux" })   // 恒按非 win32（= POSIX）规则派生
 ```
 
-`projectDirName` 在 win32 上还有两条额外变换（`\` 参与分段、`windowsSafeName` 改写结尾的 `.`/空格
+`NodeJS.Platform` 里没有 `posix` 这个值，而 `projectDirName` 只在 `win32` 上分支，所以传任一非 win32 值（这里用 `linux`，与既有测试同口径）就是 POSIX 规则。`projectDirName` 在 win32 上还有两条额外变换（`\` 参与分段、`windowsSafeName` 改写结尾的 `.`/空格
 与保留设备名），`paths.ts` 顶部也记录了 cygwin 构建会打印 POSIX 形态路径这个已知限制。任何一种都
 会让两台设备算出**不同**的目录名 → 远端出现两个目录、各同步各的、静默分叉。恒用 POSIX 规则派生
 远端 key 就与本地平台解耦；本地目录名与远端 key 不同时（win32 的那几种情况），由 `projectIdentity(cwd)`
@@ -418,6 +418,18 @@ async applyEntryFiles(
 **本地扫描口径**同步改为「`#entryFiles()` 的路径过滤 + `parseEntryFile` 能解析」（即 `listEntries()`
 的口径）。差集因此只对**可解析**的 entry 成立；解析不出的本地 `.md` 不参与同步，由 `status` 报一行
 「本地有 N 个无法解析的 .md，未同步」—— 不推上去污染远端，也不让用户毫不知情。
+
+**一个有意的读路径收窄**（建造者审阅提出、已裁定）：`isEntryFileName` 把「含 `/` 或 `\`」也判为
+不合格，而 `MemoryStore.#entryFiles()` 现在复用它 —— 于是在 POSIX 上，一个名字里**字面含反斜杠**的
+`.md` 文件（ext4/APFS 允许，但 store 自己永远造不出来：`entryFileName` 的 `UNSAFE` 类会剔掉 `\`）
+不再出现在 `listEntries()` / 搜索 / dream 里。这是对既有可见集合的收窄，记在这里而不是悄悄发生：
+
+- **为什么接受**：这种文件只能来自手工创建或外部工具。若留在读路径里，它会被同步扇描收进
+  manifest、推到远端，然后在**对端**的 `applyEntryFiles` 触发整批 fail-closed 抛错 —— 一个怪文件
+  会让两台设备的同步全断。收窄到"看不见"的代价是一条记忆不可见（文件仍在盘上，重命名即恢复），
+  比"同步全断"轻。
+- **迁移**：无需动作。它也不会被 `status` 报出来（与任何非 `.md`、点开头的文件同样对待）——
+  只有"能看见但解析不了"的文件才进 `unparsable` 报告。
 
 ### 6.7 锁与快照
 
