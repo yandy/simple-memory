@@ -6,6 +6,7 @@ import {
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
+	syncConfigErrors,
 	taskModel,
 	type EffortLevel,
 	type MemoryConfig,
@@ -197,6 +198,112 @@ describe("mergeConfig", () => {
 	});
 	it("null 子树原样带入", () => {
 		expect(mergeConfig(DEFAULT_CONFIG, { extractMemories: null }) as any).toMatchObject({ extractMemories: null });
+	});
+});
+
+describe("sync 配置", () => {
+	it("默认值：关闭，且每个键的类型都对（dsh 的行 config 白名单从 DEFAULT_CONFIG 派生，类型即校验）", () => {
+		expect(DEFAULT_CONFIG.sync).toEqual({
+			enabled: false,
+			remote: "",
+			branch: "main",
+			pullOnStart: true,
+			pushOnWrite: true,
+			pushDebounceMs: 5000,
+			autoTimeoutMs: 5000,
+			timeoutMs: 20000,
+		});
+		// 类型也逐个钉住：dsh 的嵌套键校验是从这棵子树的形状**推导**出来的，一个键写成错的 JS 类型
+		// 就会让用户完全正确的写法被判成「类型不符」告警并丢弃。
+		expect(typeof DEFAULT_CONFIG.sync.enabled).toBe("boolean");
+		expect(typeof DEFAULT_CONFIG.sync.remote).toBe("string");
+		expect(typeof DEFAULT_CONFIG.sync.branch).toBe("string");
+		expect(typeof DEFAULT_CONFIG.sync.pullOnStart).toBe("boolean");
+		expect(typeof DEFAULT_CONFIG.sync.pushOnWrite).toBe("boolean");
+		expect(typeof DEFAULT_CONFIG.sync.pushDebounceMs).toBe("number");
+		expect(typeof DEFAULT_CONFIG.sync.autoTimeoutMs).toBe("number");
+		expect(typeof DEFAULT_CONFIG.sync.timeoutMs).toBe("number");
+		// 两档超时是刻意分开的：自动路径被 await 在会话启动路径上，自动档必须短于手动档，
+		// 否则离线时每开一次会话都要等满一个手动预算。
+		expect(DEFAULT_CONFIG.sync.autoTimeoutMs).toBeLessThan(DEFAULT_CONFIG.sync.timeoutMs);
+	});
+
+	it("mergeConfig 深合并 sync 子树，且不污染 DEFAULT_CONFIG", () => {
+		const merged = mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true, remote: "git@github.com:o/r.git" } });
+		expect(merged.sync).toMatchObject({
+			enabled: true,
+			remote: "git@github.com:o/r.git",
+			branch: "main",
+			pushDebounceMs: 5000,
+		});
+		expect(DEFAULT_CONFIG.sync.enabled).toBe(false);
+		expect(DEFAULT_CONFIG.sync.remote).toBe("");
+	});
+
+	it("syncConfigErrors：enabled 而 remote 为空 → 一条可读错误", () => {
+		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true } }))).toEqual([
+			'sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"',
+		]);
+	});
+
+	it("未启用 → 空数组（remote 为空也不报）", () => {
+		expect(syncConfigErrors(DEFAULT_CONFIG)).toEqual([]);
+		// 显式写了坏值但保持关闭：同样一条都不报 —— 关掉的开关不该逼用户先去修别的键。
+		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { branch: "", pushDebounceMs: 0 } }))).toEqual([]);
+	});
+
+	it("branch 为空 / 三个数字键非正数 → 各一条错误", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			sync: {
+				enabled: true,
+				remote: "git@example.com:o/r.git",
+				branch: "",
+				pushDebounceMs: 0,
+				autoTimeoutMs: -1,
+				timeoutMs: 0,
+			},
+		});
+		// 恰好四条（branch + 三个数字键），一个不多一个不少，且顺序固定。
+		const errors = syncConfigErrors(cfg);
+		expect(errors).toHaveLength(4);
+		expect(errors[0]).toContain('"sync.branch"');
+		expect(errors[1]).toContain('"sync.pushDebounceMs"');
+		expect(errors[2]).toContain('"sync.autoTimeoutMs"');
+		expect(errors[3]).toContain('"sync.timeoutMs"');
+		// 消息要能让用户动手：名字里带键，值也带出来。
+		expect(errors[2]).toContain("-1");
+	});
+
+	// `mergeConfig` 不校验类型：手写配置里的 `"5000"` 会一路传到定时器 / 子进程 budget 上。
+	it("数字键不是数字 → 同样报一条，并原样带出值", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			sync: { enabled: true, remote: "git@example.com:o/r.git", pushDebounceMs: "5000" },
+		});
+		expect(syncConfigErrors(cfg)).toEqual([
+			'sync is enabled but "sync.pushDebounceMs" must be a positive number of milliseconds (got "5000")',
+		]);
+	});
+
+	// 非字符串的远端同样按「空」报，而不是在 `.trim()` 上抛错。
+	it("remote 不是字符串时按空报错，不抛 TypeError", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			sync: { enabled: true, remote: 42, branch: "main" },
+		});
+		expect(syncConfigErrors(cfg)).toEqual([
+			'sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"',
+		]);
+	});
+
+	it("★不进 modelConfigErrors：sync 的错误不会让模型校验失败（它是非致命的）", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true } });
+		expect(modelConfigErrors(cfg, () => true, [])).toEqual([]);
+		expect(syncConfigErrors(cfg)).toHaveLength(1);
+	});
+
+	// 用户的 `"sync": null` 经 `mergeConfig` 原样带进来（与 `dream` / `extractMemories` 同一条路径）：
+	// 读不懂的子树按「未启用」处理，不能变成一句看不懂的 TypeError。
+	it("sync 子树为 null 时按未启用处理，不抛错", () => {
+		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: null }))).toEqual([]);
 	});
 });
 
