@@ -70,6 +70,18 @@ interface RunOptions {
 	input?: string;
 }
 
+/**
+ * 抹掉 URL 里的口令。
+ *
+ * `https://user:<token>@host/...` 是 git 官方支持的凭据写法，也是 CI 上免交互推送的常规做法，
+ * 而 `args` 原样进错误信息就等于把 token 复制进同步错误 —— 错误会被宿主记进日志、被人贴进 issue。
+ * git 自己往终端与 stderr 里写的那份我们管不了，**我们拼出来的这一条**必须干净。
+ * 只认 authority 段里的 `user:pass@`（`//` 之后、下一个 `/` 之前），本地路径里的 `:` 与 `@` 不受影响。
+ */
+function redactCredentials(text: string): string {
+	return text.replace(/(\/\/[^/\s:@]+:)[^@\s]+@/g, "$1***@");
+}
+
 /** 把子进程失败拼成一条能读的错误：带上命令与 git 自己的 stderr（远端路径、拒绝原因都在里面）。 */
 function asGitError(args: string[], timeoutMs: number, err: unknown): GitCommandError {
 	const e = err as { code?: number | string; killed?: boolean; stderr?: unknown; message?: string };
@@ -78,7 +90,24 @@ function asGitError(args: string[], timeoutMs: number, err: unknown): GitCommand
 	const exitCode = typeof e?.code === "number" ? e.code : undefined;
 	// 被超时杀掉时 stderr 是空的，只剩一句 “Command failed”，说明不了任何事
 	const detail = stderr || (e?.killed ? `timed out after ${timeoutMs}ms` : (e?.message ?? "unknown error"));
-	return new GitCommandError(`git ${args.join(" ")} failed: ${detail}`, exitCode, err);
+	return new GitCommandError(redactCredentials(`git ${args.join(" ")} failed: ${detail}`), exitCode, err);
+}
+
+/**
+ * 把**前一步**的原始错误接到最终逃逸的错误上，两步的信息都不丢。
+ *
+ * `cause` 空着就直接挂上去；已经被占（`GitCommandError` 那里放着子进程错误，调用方靠它认
+ * AbortError 与退出码）时不覆盖 —— 改成拼进 message，并且拼进去的文案再过一遍凭据 redact
+ *（前一步的 `args` 里往往就带着远端 URL）。
+ */
+function withEarlierCause(err: unknown, what: string, earlier: unknown): Error {
+	const final = err instanceof Error ? err : new Error(String(err));
+	if (final.cause === undefined) {
+		final.cause = earlier;
+		return final;
+	}
+	const detail = redactCredentials((earlier as Error | undefined)?.message ?? String(earlier));
+	return new Error(`${final.message} (${what} had already failed: ${detail})`, { cause: final });
 }
 
 /**
@@ -149,8 +178,12 @@ function isNotFound(err: unknown): boolean {
  * `<>:"|?*` 与控制字符，**但不转义方括号**，于是 `ssh://git@[::1]/o/r` 这类远端算出来的 key
  * 就带着一个方括号对 —— 看上去就是个字符类。实测 git 2.56 在字面目录存在时仍按字面匹配
  *（目录前缀走的是字面比较），但那是匹配器的行为细节、不是承诺；`:(literal)` 把「按字面」
- * 写成显式契约，代价是零。万一哪个版本真的按 glob 解释：`add` 匹配不到东西直接 fatal，
- * `clean` 则静默什么都不清 —— 后者正是最难查的失败形态（同步看起来成功了，其实一个字没推）。
+ * 写成显式契约，代价是零。万一哪个版本真的按 glob 解释，两个方向都出事：
+ * - **欠匹配**：`add` 匹配不到东西直接 fatal，`clean` 则静默什么都不清 —— 后者正是最难查的
+ *   失败形态（同步看起来成功了，其实一个字没推）。
+ * - **过匹配**（更要命，因为 `clean -fd` 是破坏性命令）：字符类是「任选其一」，`git/a[b]`
+ *   于是同时匹配兄弟目录 `git/ab` —— 那很可能是**另一个项目**的记忆前缀，`clean` 会把它整个删掉。
+ *   护栏的意义主要在这一侧：欠匹配只是同步不动，过匹配是删别人的数据。
  */
 function pathspec(prefix: string): string {
 	return `:(literal)${prefix}`;
@@ -404,16 +437,21 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 				// 所以 clone 失败基本等于「远端不可达 / 没有权限」。仍然退回本地 init：
 				// 紧跟其后的 push 会把不可达如实报出来，符合「init 只由显式命令触发，失败要让人看见」。
 				await runGit(["clone", "--quiet", remote, repoDir], o);
-			} catch {
-				// clone 的原始错误在这里被有意丢掉：不可达时紧随其后的 push 会以同一个远端为对象
-				// 再报一次（同样带着远端地址，那才是用户能行动的信息）。若是别的原因让 clone 失败
-				//（超时、盘满）而远端其实有内容，那次 push 会被当成非快进拒掉 —— 初始化失败，
-				// 但远端一个字不会被改。
+			} catch (cloneErr) {
+				// 不可达时紧随其后的 push 会以同一个远端为对象再报一次（同样带着远端地址，
+				// 那才是用户能行动的信息）。但 clone 的原始错误**不能就地丢掉**：若是别的原因
+				//（超时、盘满）让 clone 失败而远端其实有内容，那次 push 会被当成非快进拒掉 ——
+				// 用户看到的是「push 被拒」，方向完全错。所以它跟着一起报出去（cause 或 message）。
+				// 初始化失败但远端一个字不会被改。
 				await rm(repoDir, { recursive: true, force: true }); // clone 失败可能留下半个目录
-				await runGit(["init", "--quiet", repoDir], { ...o, cwd: syncRoot });
-				await runGit(["remote", "add", "origin", remote], inRepo(o));
-				await bootstrapBranch(o);
-				return;
+				try {
+					await runGit(["init", "--quiet", repoDir], { ...o, cwd: syncRoot });
+					await runGit(["remote", "add", "origin", remote], inRepo(o));
+					await bootstrapBranch(o);
+					return;
+				} catch (fallbackErr) {
+					throw withEarlierCause(fallbackErr, "git clone", cloneErr);
+				}
 			}
 
 			// clone 成功：远端有没有这个分支，用 clone 下来的 refs 就能判断，不必再联网一次。
@@ -445,6 +483,26 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		}
 	}
 
+	/**
+	 * 把本地 HEAD 推到远端分支，被拒时把「其实是远端又前进了」映射成 NonFastForwardError。
+	 *
+	 * push 被拒可能是「fetch 之后另一台设备又推了」= 非快进（引擎整轮重跑），也可能是
+	 * 认证 / 网络 / hook。不解析 git 的文案（会被 locale 改写）：再问一次远端的 head ——
+	 * 它不再等于我们提交所挂的那一个，就是非快进。
+	 * 本地那个没推上去的提交不算半推状态：下一轮的 reset --hard 会把它丢掉，远端一个字没动。
+	 */
+	async function pushBranch(o: SyncRunOptions, start: string): Promise<void> {
+		try {
+			await runGit(["push", "--quiet", "origin", `HEAD:${branch}`], inRepo(o));
+		} catch (err) {
+			const now = await remoteHead(o).catch(() => null);
+			if (now !== null && now !== start) {
+				throw new NonFastForwardError(`The remote moved on while publishing: based on ${start}, now ${now}`);
+			}
+			throw err;
+		}
+	}
+
 	async function publish(
 		scope: SyncScope,
 		changes: SyncPublishChanges,
@@ -466,10 +524,18 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		// 我们的提交要挂上去的那一个：远端的 head，或（远端还没这个分支时）本地已有的提交
 		const start = head ?? (await localHead(o));
 
+		// 前缀先算、先断言，**再跑任何破坏性命令**：`prefix` 是调用方给的，而紧随其后就是
+		// `clean -fd`（按 pathspec 删未跟踪文件）。唯一可达的坏值是空串 —— `:(literal)` 配空路径
+		// 匹配整个仓库，clean 会先把暂存 clone 里**所有**未跟踪文件清掉，然后才轮到断言报错。
+		// 破坏半径限于本模块自己的暂存目录（已跟踪内容下一轮 fetch+reset 就回来），但校验先于破坏是免费的。
+		const scopeBase = scopeDir(scope.prefix);
+
 		// 把暂存工作树对齐到 start。`reset --hard` 顺带修掉烂状态：改坏的已跟踪文件、
 		// 以及卡住的 merge 中间态（残留的 MERGE_HEAD 会让 commit 直接 fatal，
 		// 内容是个不存在的对象时 git 报的是 “Corrupt MERGE_HEAD file”）。
-		await runGit(["reset", "--hard", "--quiet", start], inRepo(o));
+		// 末尾的 `--` 与 clean/add 一致：明确宣告「后面没有 pathspec」，start 只可能被当成提交
+		//（放到 start 前面反而不行：`reset --hard -- <sha>` 会被当成路径限定形式，git 直接 fatal）。
+		await runGit(["reset", "--hard", "--quiet", start, "--"], inRepo(o));
 		// `clean` 只清**本前缀**下的未跟踪垃圾（上一轮失败留下的）；范围外一律不碰，
 		// 用户随手丢进暂存目录的东西也不会被删。
 		await runGit(["clean", "--quiet", "-fd", "--", pathspec(scope.prefix)], inRepo(o));
@@ -477,7 +543,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		// 先建出前缀目录：增量可能整个是空的（或删除的文件对端早已删掉），而 git add 对
 		// 「匹配不到任何文件」的 pathspec 是 fatal 退出 —— 那种情况的正确答案是「无变化」，不是报错。
 		// 空目录 git 不跟踪，因此它进不了提交，下一轮的 clean 会把它收掉。
-		await mkdir(scopeDir(scope.prefix), { recursive: true });
+		await mkdir(scopeBase, { recursive: true });
 		for (const { path, content } of changes.writes) {
 			const target = scopedPath(scope.prefix, path);
 			// 先删再写：远端可能被人手工推了个同名**符号链接**，直接 writeFile 会顺着链接
@@ -491,8 +557,16 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		}
 
 		await runGit(["add", "-A", "--", pathspec(scope.prefix)], inRepo(o));
-		// 没有变化就不提交、不推送：空提交会让 git log 里全是噪声，也白耗一次远端往返
-		if (!(await hasStagedChanges(inRepo(o)))) return start;
+		if (!(await hasStagedChanges(inRepo(o)))) {
+			// 没有变化就不提交、不推送：空提交会让 git log 里全是噪声，也白耗一次远端往返。
+			// **但这条捷径只在远端已经有这个分支时走得**：远端连分支都没有（被删了、或 init 那次
+			// push 其实没成功）时返回本地 head，交出去的是一个远端并不存在的 revision ——
+			// 引擎会把它写进基线，下一轮的 base 与远端 head 永远对不上（每轮白判一次非快进）。
+			// 那种情况必须真的 push 一次，把分支建在我们要返回的那个提交上。
+			if (head !== null) return start;
+			await pushBranch(o, start);
+			return await localHead(o);
+		}
 
 		// 作者从入参传，不读环境里的 git 配置：设备归属靠 git log 查（而不是塞进文件名 ——
 		// 文件名必须由内容派生，两台设备才能收敛到同一个名字）。
@@ -501,19 +575,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 			inRepo(o),
 		);
 
-		try {
-			await runGit(["push", "--quiet", "origin", `HEAD:${branch}`], inRepo(o));
-		} catch (err) {
-			// push 被拒可能是「fetch 之后另一台设备又推了」= 非快进（引擎整轮重跑），也可能是
-			// 认证 / 网络 / hook。不解析 git 的文案（会被 locale 改写）：再问一次远端的 head ——
-			// 它不再等于我们提交所挂的那一个，就是非快进。
-			// 本地那个没推上去的提交不算半推状态：下一轮的 reset --hard 会把它丢掉，远端一个字没动。
-			const now = await remoteHead(o).catch(() => null);
-			if (now !== null && now !== start) {
-				throw new NonFastForwardError(`The remote moved on while publishing: based on ${start}, now ${now}`);
-			}
-			throw err;
-		}
+		await pushBranch(o, start);
 		return await localHead(o);
 	}
 

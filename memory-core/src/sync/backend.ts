@@ -91,6 +91,14 @@ export class NonFastForwardError extends Error {
 	}
 }
 
+/**
+ * 一个传输后端。实现方只需满足本接口的方法语义，不必也不得假定调用方认识具体存储。
+ *
+ * **并发假设**：backend 可以假定调用方已经把同一份本地状态（同一个 `syncRoot`）上的调用
+ * **串行化**了 —— 引擎在同步轮的入口持有一把根级 sync 锁（try 语义：拿不到就本轮直接跳过），
+ * 锁没拿到根本走不到这里，而拿到锁的一轮里 `fetch`/`publish` 是顺序调的。因此以独立包实现的
+ * backend **不必**自己再加内部锁；反过来，端口也不承诺任何并发安全，直接并行调用同一个实例属于误用。
+ */
 export interface SyncBackend {
 	/**
 	 * 是否已初始化（本地那点状态在不在）。false 时自动路径直接跳过 ——
@@ -111,6 +119,10 @@ export interface SyncBackend {
 	 * 抛错之后远端内容与本地状态都原样可解释，引擎才敢下一轮重来。
 	 * `base.revision` 用于乐观并发：远端已经不在 base 上时抛 {@link NonFastForwardError}。
 	 * 空串的 base 表示「没有基线」（首次发布），**不算**非快进。
+	 *
+	 * 返回的 revision **必须是远端真的有的那一个**：引擎会原样写进基线，下一轮拿它当 base 比对。
+	 * 返回一个只存在于本地状态的标识（例如「本轮无变化，就把本地 head 交上去」而远端根本没这个分支），
+	 * 会让下一轮的 base 永远对不上远端 —— 看起来只是多一次重跑，实际上是每轮都白跑。
 	 */
 	publish(
 		scope: SyncScope,
