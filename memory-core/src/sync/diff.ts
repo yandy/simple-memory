@@ -3,15 +3,19 @@ import type { SyncFileInfo, SyncFileSet } from "./types.js";
 /**
  * 一条冲突：同一个 entry 文件名在两侧都「有话说」且内容不同。
  *
- * 一侧**已删除**时，该侧的指纹用空 hash 标记（真实 sha256 恒为 64 位十六进制，空串不会与任何内容相撞）：
- * 「删 vs 改」与「改 vs 改」的后续动作完全不同（前者删除照办、被改的那份按新 entry 留下），
- * 调用方必须能分辨这两种，而 `SyncFileInfo` 的字段里只有 hash 有这个表达能力。
+ * `null` = 这一侧已经删除（删除 vs 修改的冲突）。两侧不可能同时为 null —— 那是「两边都删」，
+ * 属于无动作行，不进 conflicts。
+ * **不要用哨兵值**（例如 `hash: ""`）表示删除：冲突收敛与同步引擎都要判这一侧，
+ * 显式 null 让 TypeScript 强制每个消费者处理它，哨兵值只靠约定 —— 约定错一次就会静默吞掉用户的删除，
+ * 让那条记忆在两台设备上一起复活。
  */
 export interface SyncConflict {
 	/** entry 文件名（单层，与 `SyncFileSet` 的 key 同口径）。 */
 	file: string;
-	ours: SyncFileInfo;
-	theirs: SyncFileInfo;
+	/** `null` = 本地这一侧已删除。 */
+	ours: SyncFileInfo | null;
+	/** `null` = 远端这一侧已删除。 */
+	theirs: SyncFileInfo | null;
 }
 
 /** 一次三方合并的完整结论：四张单侧动作清单，外加要交给冲突收敛的那些路径。 */
@@ -32,9 +36,6 @@ export interface SyncDiff {
 function same(left: SyncFileInfo | undefined, right: SyncFileInfo | undefined): boolean {
 	return left?.hash === right?.hash;
 }
-
-/** 已删除一侧的指纹标记（见 `SyncConflict` 的说明）。冻结，避免调用方把共享的标记对象改坏。 */
-const GONE: SyncFileInfo = Object.freeze({ hash: "", modified: "", bytes: 0 });
 
 /**
  * 码点序，不是 locale 序。
@@ -101,8 +102,8 @@ export function diffThreeWay(base: SyncFileSet, ours: SyncFileSet, theirs: SyncF
 				// 活着的那侧没动过它，这边的删除就是唯一的变更 → 把删除传播到对侧。
 				(oursSurvives ? diff.deleteLocal : diff.deleteRemote).push(file);
 			} else {
-				// 一侧删、另一侧改：谁都不许丢内容，交给冲突收敛。
-				diff.conflicts.push({ file, ours: inOurs ?? GONE, theirs: inTheirs ?? GONE });
+				// 一侧删、另一侧改：谁都不许丢内容，交给冲突收敛。被删的那侧是 null。
+				diff.conflicts.push({ file, ours: inOurs ?? null, theirs: inTheirs ?? null });
 			}
 			continue;
 		}

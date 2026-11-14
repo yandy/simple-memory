@@ -26,12 +26,6 @@ const noopDiff = (): SyncDiff => ({
 	conflicts: [],
 });
 
-/**
- * 被删的一侧没有内容可比：冲突里该侧的指纹用空 hash 标记。
- * 真实 sha256 恒为 64 位十六进制，空串不会与任何内容相撞。
- */
-const GONE: SyncFileInfo = { hash: "", modified: "", bytes: 0 };
-
 /** 深拷贝一份 set，用来证明纯函数没有改写入参。 */
 const snapshot = (source: SyncFileSet): SyncFileSet => new Map([...source].map(([file, info]) => [file, { ...info }]));
 
@@ -77,18 +71,21 @@ describe("diffThreeWay", () => {
 		});
 	});
 
-	it("base有|ours删|theirs改 → conflicts", () => {
-		const d = diffThreeWay(set(["a", "1"]), empty(), set(["a", "2"]));
-		expect(d.conflicts).toEqual([{ file: "a", ours: GONE, theirs: f("2") }]);
-		// 删除照办是冲突收敛的后续动作（把被改的那份按新 entry 留下、原路径删掉），
-		// 不在四个单侧清单里 —— 否则原路径会被"删一次、写一次"。
-		expect({ ...d, conflicts: [] }).toEqual(noopDiff());
+	it("base有|ours删|theirs改 → conflicts，被删的一侧是 null", () => {
+		// 删除 vs 修改：删除照办、被改的那份由冲突收敛留下。
+		// 原路径的删除归冲突收敛所有，所以这里绝不同时出现在 deleteLocal / deleteRemote 里 ——
+		// 否则引擎会先删原路径、再被冲突收敛写回，同一轮里对同一个路径既删又写。
+		const d = diffThreeWay(set(["a", "1"]), new Map(), set(["a", "2"]));
+		expect(d.conflicts).toEqual([{ file: "a", ours: null, theirs: f("2") }]);
+		expect(d.deleteLocal).toEqual([]);
+		expect(d.deleteRemote).toEqual([]);
 	});
 
-	it("base有|ours改|theirs删 → conflicts", () => {
-		const d = diffThreeWay(set(["a", "1"]), set(["a", "2"]), empty());
-		expect(d.conflicts).toEqual([{ file: "a", ours: f("2"), theirs: GONE }]);
-		expect({ ...d, conflicts: [] }).toEqual(noopDiff());
+	it("base有|ours改|theirs删 → conflicts（镜像，theirs 侧是 null）", () => {
+		const d = diffThreeWay(set(["a", "1"]), set(["a", "2"]), new Map());
+		expect(d.conflicts).toEqual([{ file: "a", ours: f("2"), theirs: null }]);
+		expect(d.deleteLocal).toEqual([]);
+		expect(d.deleteRemote).toEqual([]);
 	});
 
 	it("两边都删 → 空差集", () => {
