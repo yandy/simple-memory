@@ -33,7 +33,9 @@ export interface LocalScan {
  * 别的通道能表达「扫描失败」，调用方无从分辨。抛出去之后由引擎捕获、把本轮变成跳过（fail-closed）。
  *
  * 文件级的两件「不抛」，是为了让一轮同步不因为一个文件而整体失败：
- * - **单个文件读失败**（权限、刚被删掉）→ 该文件进 `unparsable`，其余照常扫描。
+ * - **单个文件读失败**（权限、刚被删掉）→ 该文件进 `unparsable`，其余照常扫描。同一口径也适用于符号
+ *   链接：目标`stat`失败时，只有 `ENOENT`/`ENOTDIR`（目标确实不存在）算「不是 entry」而跳过，
+ *   其余 errno 进 `unparsable` —— 理由与目录级相同，名字不能同时从两侧消失。
  * - **`parseEntryFile` 返回 null** → 同样进 `unparsable`：解析不出 `modified` 就没法定序，也就无法安全参与合并。
  * 单个坏文件与整个目录读不了是两件事：前者可报告可跳过，后者必须中止。
  *
@@ -61,8 +63,19 @@ export async function scanLocalEntries(
 		if (!isEntryFileName(dirent.name, platform)) continue;
 		if (dirent.isSymbolicLink()) {
 			// store 的 stat 跟随链接：指向普通文件的符号链接在 store 眼里是合法 entry，扫描也必须看得见，
-			// 且只对符号链接多付一次 stat。断链（stat 抛错）跳过，与 listEntries() 的 !info?.isFile() 同口径。
-			const target = await stat(join(memoryDir, dirent.name)).catch(() => null);
+			// 且只对符号链接多付一次 stat。
+			const target = await stat(join(memoryDir, dirent.name)).catch((err: unknown) => {
+				const code = (err as NodeJS.ErrnoException).code;
+				// 只有「目标确实不存在」才等于「不是 entry」，与 listEntries() 的 stat + isFile() 同口径：
+				// 断链是 ENOENT，链接路径中某一段不是目录是 ENOTDIR。
+				if (code === "ENOENT" || code === "ENOTDIR") return null;
+				// 其余 errno（EMFILE / EIO / EACCES / 网络盘……）是「这一次读不出目标」，不是「目标不存在」，
+				// 必须进 unparsable。若跟着静默跳过，这个名字会同时从 files 与 unparsable 里消失 —— 而扫描是
+				// 三方合并的 ours 侧，「base 有、ours 没有」读作**用户删了它**，引擎会把这条删除传播到远端，
+				// 删掉对端设备上仍在盘的那份记忆。进了 unparsable，调用方才能判成「不可判定」而不是「删除」。
+				unparsable.push(dirent.name);
+				return null;
+			});
 			if (!target?.isFile()) continue;
 		} else if (!dirent.isFile()) {
 			// 目录、FIFO、socket 一律跳过：与 listEntries() 的 stat + isFile() 同口径；也是安全要求 ——
@@ -92,6 +105,9 @@ export async function scanLocalEntries(
 		};
 		files.set(name, info);
 	}
+	// 符号链接 stat 失败的名字在 dirent 循环里就已进 unparsable（早于 entries 排序），所以这里再排一次，
+	// 才能让「同一目录两次扫描、两台设备之间」的报告顺序稳定。
+	unparsable.sort();
 
 	return { files, unparsable };
 }

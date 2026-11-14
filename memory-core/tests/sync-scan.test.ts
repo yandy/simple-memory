@@ -1,10 +1,24 @@
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat as fsStat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeEntryFile } from "../src/store/entry-file.js";
 import { scanLocalEntries } from "../src/sync/scan.js";
 import { createReservedNameFixture, removeReservedNameFixture } from "./helpers/reserved-name.js";
+
+// `vi.spyOn` 对 `node:fs/promises` 不可用（ESM 命名空间不可配置，vitest 直接抛 “Module namespace is not
+// configurable”），所以用整模块 mock + `importOriginal` 透传真实实现、只把 `stat` 包成 spy：除被点名的调用外
+// 全部照旧走真实 fs，其余用例的行为不受影响。
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return { ...actual, stat: vi.fn(actual.stat) };
+});
+
+function errnoError(code: string): NodeJS.ErrnoException {
+	const e = new Error(`${code}: simulated`) as NodeJS.ErrnoException;
+	e.code = code;
+	return e;
+}
 
 const raw = (name: string, modified = "2026-11-09T10:00:00.000Z", body = "正文") =>
 	serializeEntryFile({ name, description: "d", type: "feedback", created: "2026-11-09", modified }, body);
@@ -93,7 +107,9 @@ describe("scanLocalEntries", () => {
 			await writeFile(join(dir, "a.md"), raw("A"));
 			await chmod(dir, 0o000);
 			try {
-				await expect(scanLocalEntries(dir)).rejects.toThrow();
+				// 断言 errno 本身而不是只断言「抛了」：否则这条测不出「EACCES 被原样传播」，
+				// 扫描抛任何别的错误也能让 `toThrow()` 绿。
+				await expect(scanLocalEntries(dir)).rejects.toMatchObject({ code: "EACCES" });
 			} finally {
 				await chmod(dir, 0o755); // afterEach 的 rm 需要能进去
 			}
@@ -117,6 +133,44 @@ describe("scanLocalEntries", () => {
 			const scan = await scanLocalEntries(dir);
 			expect([...scan.files.keys()].sort()).toEqual(["link.md", "real.md"]);
 			expect(scan.files.get("link.md")?.hash).toBe(scan.files.get("real.md")?.hash);
+		},
+	);
+
+	it(
+		"断链（ENOENT）既不进 files 也不进 unparsable（目标确实不存在 = 不是 entry）",
+		{ skip: process.platform === "win32" },
+		async () => {
+			// 与 listEntries() 的 stat + isFile() 同口径：断链不是「读不了」，而是「本来就不存在」。
+			await writeFile(join(dir, "a.md"), raw("A"));
+			await symlink(join(dir, "missing.md"), join(dir, "broken.md"));
+			const scan = await scanLocalEntries(dir);
+			expect([...scan.files.keys()]).toEqual(["a.md"]);
+			expect(scan.unparsable).toEqual([]);
+		},
+	);
+
+	it(
+		"符号链接目标 stat 报非 ENOENT/ENOTDIR 的 errno（EMFILE）→ 进 unparsable、不进 files",
+		{ skip: process.platform === "win32" },
+		async () => {
+			// 数据安全线：瞬时 errno 若被当成「跳过」，这个名字会同时从 files 与 unparsable 消失，
+			// 三方合并就会把「base 有、ours 没有」读成用户删除，进而删掉对端仍在盘上的记忆。
+			await writeFile(join(dir, "real.md"), raw("R"));
+			await symlink(join(dir, "real.md"), join(dir, "link.md"));
+			const statSpy = vi.mocked(fsStat);
+			// 只毒化第一次（也就是 link.md 那次）调用：普通文件不进 stat 分支，真实实现照旧。
+			statSpy.mockImplementationOnce(() => Promise.reject(errnoError("EMFILE")));
+			try {
+				const scan = await scanLocalEntries(dir);
+				expect(scan.unparsable).toEqual(["link.md"]);
+				expect([...scan.files.keys()]).toEqual(["real.md"]);
+			} finally {
+				// 收尾必须装回真实实现：`mockImplementationOnce` 若没被消费（例如上面提前失败）留着会污染
+				// 后续用例，所以先 `mockReset` 清掉一次性实现、再把 `importActual` 的真实 stat 装上。
+				const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+				statSpy.mockReset();
+				statSpy.mockImplementation(actual.stat);
+			}
 		},
 	);
 
