@@ -2,76 +2,54 @@
 
 English | [中文](./README.zh.md)
 
-One on-disk memory, shared by every AI coding agent you run. A memory is a plain Markdown file; an
-index lists each one on a single line. Two harnesses pointed at the same machine read and write the
-same files.
+One on-disk memory, shared by every AI coding agent you run. A memory is one Markdown file, listed on a
+single line in `MEMORY.md`; two harnesses pointed at the same machine read and write the same files.
 
-## Packages
-
-| Package | Description | npm |
+| Package | What it is | npm |
 |---|---|---|
-| [memory-core](./memory-core) | Harness-agnostic layer: disk format, `MemoryStore`, two-level locking, snapshots, project paths, injection policy, dream/extract orchestration, and the neutral `memory` tool contract (JSON Schema + handler). Imports only `node:*`. | `@yandy0725/memory-core` |
-| [pi-memory](./pi-memory) | pi adapter: extension wiring, `/memory` and `/dream`, typebox schema + pi-tui rendering, prompt-cache section freezing, headless sub-sessions, session search. | `@yandy0725/pi-memory` |
-| [dsh-memory](./dsh-memory) | DeepSeek harness (`@deepseek-ai/dsh`, cordis) adapter: cordis bundle, `memory_index` section, `memory` tool + `/memory`, per-turn recall, per-turn extraction and `/dream` — same on-disk memory as `pi-memory`. | `@yandy0725/dsh-memory` |
+| [memory-core](./memory-core) | Harness-agnostic layer: disk format, `MemoryStore`, two-level locking, snapshots, injection policy, the `memory` tool contract. Imports only `node:*`. | `@yandy0725/memory-core` |
+| [pi-memory](./pi-memory) | pi adapter: the `memory` tool, `/memory`, `/dream`, auto-surfacing and extraction, cross-device sync. | `@yandy0725/pi-memory` |
+| [dsh-memory](./dsh-memory) | DeepSeek harness (`@deepseek-ai/dsh`, cordis) adapter, sharing the same on-disk memory as pi. | `@yandy0725/dsh-memory` |
 
-An adapter owns the host-specific half — when to inject, how to render, which model to call. `memory-core`
-owns the half that must be identical everywhere, which is why the files below are shared rather than
-duplicated per harness.
+The adapter owns the host-specific half — when to inject, how to render, which model to call.
+`memory-core` owns the half that must be identical everywhere.
 
-## Shared data root
+## Try it
+
+With pi:
+
+```sh
+pi install npm:@yandy0725/pi-memory
+```
+
+With dsh: see the two build/install commands in [dsh-memory](./dsh-memory).
+
+You do not install `memory-core` yourself; both adapters depend on it.
+
+## Where memory lives
 
 ```
 $XDG_DATA_HOME/simple-memory/<git|local>/<project>/
 ```
 
-`~/.local/share/simple-memory` when `XDG_DATA_HOME` is unset or relative. `git/<host__owner__repo>` for a
-repository with an http(s)/ssh/git remote (clones and worktrees share it); `local/<escaped-absolute-path>`
-otherwise.
+`~/.local/share/simple-memory` when `XDG_DATA_HOME` is unset or relative. A repository with a remote
+lands in `git/<host__owner__repo>` (clones and worktrees share it); anything else in `local/<path>`.
+`memoryDir` overrides the root, but it is **per-harness configuration** — if you override it, override it
+in every harness, or sharing silently stops working.
 
-Each project directory holds `MEMORY.md` (the index), one `*.md` per memory, `.lock`, `.backups/`,
-`.dream-meta.json`, and `sessions/`. The `memoryDir` config key overrides the root; `~` and `~/` are
-expanded and relative values are resolved against the working directory. `memoryDir` is **per-harness configuration**
-(pi reads it from `memory.json`, dsh from its cordis row `config:`): if you override it, override it in **every**
-harness, or the two harnesses write different directories and stop sharing.
+## Docs
 
-The disk format is byte-for-byte the one `pi-memory` 2.x writes: YAML frontmatter with
-`name`/`description`/`type`/`created`/`modified`, one index line per memory
-(`- [Name](file.md) — description`), and `.backups/<ts>-<label>/` rollback points.
-
-## Migrating from pi-memory 2.x
-
-2.x kept memory under `~/.pi/memory/`. 3.0 moved it out of the pi directory so any harness can read it.
-Nothing migrates automatically — silently moving user data is worse than a prompt — so migrate once:
-
-```sh
-# a relative XDG_DATA_HOME is ignored (the XDG spec says so), exactly as the package resolves it:
-case "${XDG_DATA_HOME:-}" in /*) root="$XDG_DATA_HOME";; *) root="$HOME/.local/share";; esac
-mkdir -p "$root"
-mv ~/.pi/memory "$root/simple-memory"                                    # 2.x -> 3.0
-mv "$root/auto-memory" "$root/simple-memory" 2>/dev/null || true         # pre-release working name
-```
-
-`mv` into an **existing** `$root/simple-memory` nests the source inside it instead of merging. If that
-directory is already there (a 3.0 run created it, or the first command ran twice), move the per-project
-directories instead and check for name clashes: `mv ~/.pi/memory/* "$root/simple-memory"/`.
-
-`/memory` prints a one-line hint when it finds pre-3.0 data still in place; it only reports, it never
-moves or modifies anything. It prints nothing at `session_start` and nothing once this project's new
-directory exists — so check the hint *before* writing anything with 3.0 if you are unsure.
+- Reference: [memory-core](./docs/reference/memory-core.md) · [pi-memory](./docs/reference/pi-memory.md) · [dsh-memory](./docs/reference/dsh-memory.md)
+- Development: [architecture](./docs/guides/architecture.md) · [dependencies](./docs/guides/dependencies.md) · [testing](./docs/guides/testing.md) · [release](./docs/guides/release.md)
 
 ## Development
 
-```bash
-npm ci                        # root + all three workspaces
-npm test                      # memory-core, pi-memory and dsh-memory
+```sh
+npm ci                         # root + all three workspaces
+npm test                       # tests for all three packages
 npm run typecheck && npm run lint
-npm run build -w memory-core  # dist/ (ESM + .d.ts + maps); CI validates the packed tarball
-npm run check:host-deps       # host packages must be peerDependencies, never dependencies
-npm run check:memory-core-deps # dev resolves the monorepo source, runtime the registry copy
-npm run smoke:registry        # installs the adapter tarball in a clean dir, pulling memory-core from the registry
+npm run build -w memory-core   # dist/ (ESM + .d.ts + maps)
+npm run smoke:registry         # build first: pulls memory-core from the registry and checks the published shape
 ```
 
-`memory-core`'s `src/**` may import only `node:*` and relative paths — `memory-core/tests/neutrality.test.ts`
-fails the build if that ever changes, and it is the only reason a second harness can depend on the package.
-
-Releases: see [docs/guides/release.md](./docs/guides/release.md).
+MIT
