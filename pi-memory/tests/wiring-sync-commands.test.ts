@@ -971,6 +971,8 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect(await git(["remote", "get-url", "origin"], repo)).toBe(nextRemote);
 		expect((await readManifest(paths.manifest))?.base.revision).toBe("");
 		expect((await readManifest(paths.manifest))?.files).toEqual({});
+		expect(notify.mock.calls[0]?.[0]).toContain("Memory sync remote preparation");
+		expect(notify.mock.calls[0]?.[0]).toContain("deterministic conflict copies");
 		expect(notify.mock.calls.at(-1)?.[0]).toContain("Memory sync remote:");
 
 		await commands["memory"].handler("sync status", s.uiCtx(uiWith(notify)));

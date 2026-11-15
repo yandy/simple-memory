@@ -31,6 +31,7 @@ import {
 	resetWiringMocks,
 	sectionsEvent,
 	setupSession,
+	syncEngines,
 	syncEvents,
 	syncInitBarrier,
 	syncInitSignals,
@@ -498,7 +499,30 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(syncEvents).toContain("pull");
 		expect(syncEvents).not.toContain("push:start");
 		expect(await exists(devicePath(syncPaths().syncRoot))).toBe(true);
+		expect(notify.mock.calls[0]?.[0]).toContain("Memory sync pull preparation");
+		expect(notify.mock.calls[0]?.[0]).toContain("deterministic conflict copies");
 		expect(notify.mock.calls.at(-1)?.[0]).toContain("Memory sync pull");
+	});
+
+	it("disposes the pending engine when reading the conflict preview fails", async () => {
+		const config = memoryConfig();
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		vi.spyOn(store, "listEntries").mockRejectedValue(new Error("preview read failed"));
+		const { runtime } = await createPiSyncRuntime({ config, store, projectDir: s.dir, identity: gitIdentity(s.cwd) });
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+
+		expect(prepared.ok).toBe(false);
+		expect(prepared.ok ? "" : prepared.reason).toContain("preview read failed");
+		expect(syncEngines.length).toBeGreaterThan(0);
+		expect(syncEvents.filter((event) => event === "dispose")).toHaveLength(1);
+		expect(runtime.engine).toBeNull();
+		runtime.dispose();
 	});
 
 	it("previews possible conflict copies before the first startup push, and only once per baseline", async () => {
@@ -524,6 +548,37 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 
 		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
 		expect(notify).toHaveBeenCalledTimes(1);
+	});
+
+	it("after an early preview reports only the new startup failure without repeating the preview", async () => {
+		const config = memoryConfig({ pullOnStart: true });
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		await store.addEntry({ name: "Existing local memory", description: "local before first sync", body: "keep me" });
+		await enableSync({ pullOnStart: true });
+		const register = syncEngines.push.bind(syncEngines);
+		const registration = vi.spyOn(syncEngines, "push").mockImplementation((engine) => {
+			const result = register(engine);
+			vi.spyOn(engine, "push").mockRejectedValue(new Error("startup push failed"));
+			return result;
+		});
+		const notify = vi.fn();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		try {
+			await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+		} finally {
+			registration.mockRestore();
+		}
+
+		expect(notify).toHaveBeenCalledTimes(2);
+		expect(notify.mock.calls[0][0]).toContain("deterministic conflict copies");
+		expect(notify.mock.calls[1][0]).toContain("startup push failed");
+		expect(notify.mock.calls[1][0]).not.toContain("deterministic conflict copies");
 	});
 
 	it("warns once about configured remote drift but keeps publishing to origin", async () => {

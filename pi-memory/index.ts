@@ -813,6 +813,10 @@ export default function (pi: ExtensionAPI) {
 					notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(prepared.reason)}`);
 					return;
 				}
+				if (prepared.warning) {
+					// 手动恢复也必须先让人看到预告，再执行会产生/发布副本的那一轮。
+					notifySync(ui, `Memory sync ${kind} preparation:\n${syncErrorMessage(prepared.warning)}`, "info");
+				}
 				const round = await prepared.engine[kind](cfg.sync.timeoutMs);
 				const errors = [...syncPersistentErrors];
 				if (prepared.warning) errors.push(prepared.warning);
@@ -852,6 +856,9 @@ export default function (pi: ExtensionAPI) {
 			if (!prepared.ok) {
 				notifySync(ui, `Memory sync remote failed: ${syncErrorMessage(prepared.reason)}`);
 				return;
+			}
+			if (prepared.warning) {
+				notifySync(ui, `Memory sync remote preparation:\n${syncErrorMessage(prepared.warning)}`, "info");
 			}
 			notifySync(
 				ui,
