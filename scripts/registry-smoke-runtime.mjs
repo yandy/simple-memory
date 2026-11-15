@@ -1,9 +1,10 @@
-// 由 scripts/registry-smoke.mjs 拷进「只装了适配层 tarball」的干净目录后执行，因此
-// import 到的 @yandy0725/memory-core 只可能来自 registry（仓库自己的 node_modules 不在解析路径上）。
+// 由 scripts/registry-smoke.mjs 拷进干净目录后执行，因此 import 到的 @yandy0725/memory-core
+// 只可能来自本次显式安装的 registry 包或仓内 tarball（仓库自己的 node_modules 不在解析路径上）。
 //
-// 用法: node registry-smoke-runtime.mjs <expected-versions-json> <package-label> <entry>
-//   expected-versions-json: `npm view <core>@<range> version --json` 的原始结果（数组）
+// 用法: node registry-smoke-runtime.mjs <expected-versions-json> <package-label> <entry> <source>
+//   expected-versions-json: registry 命中列表，或 workspace 的单一版本（数组）
 //   entry: 适配层的 main 或 exports["."].default
+//   source: "registry" | "workspace"——只影响报告措辞，不影响断言。
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile } from "node:fs/promises";
@@ -12,8 +13,9 @@ import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DEFAULT_CONFIG, MemoryStore } from "@yandy0725/memory-core";
 
-const [versionsJson, label, entry] = process.argv.slice(2);
-assert.ok(versionsJson && label && entry, "usage: node registry-smoke-runtime.mjs <versions-json> <label> <entry>");
+const [versionsJson, label, entry, source = "registry"] = process.argv.slice(2);
+assert.ok(versionsJson && label && entry, "usage: node registry-smoke-runtime.mjs <versions-json> <label> <entry> <source>");
+assert.ok(source === "registry" || source === "workspace", `unknown smoke source: ${source}`);
 /** 适配层声明的范围在 registry 上命中的那些版本（由驱动脚本查好传进来，避免在这里再写一个 semver）。 */
 const expected = JSON.parse(versionsJson);
 
@@ -71,5 +73,5 @@ if (entry.endsWith(".js")) {
 }
 
 console.log(
-	`${label}: registry 上的 ${installed} OK（${entryNote}；解析到 ${relative(installer, corePath) || corePath}）`,
+	`${label}: ${source === "workspace" ? "仓内 tarball" : "registry"} 上的 ${installed} OK（${entryNote}；解析到 ${relative(installer, corePath) || corePath}）`,
 );

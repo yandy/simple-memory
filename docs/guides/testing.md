@@ -71,5 +71,6 @@ loadConfigMock.mockRejectedValueOnce(new Error("getAgentDir failed"));
 真机上插件一次都没激活）。
 
 各包把「真机验过什么、怎么验、还有哪些限制」写在**自己的 README**（`## 验证状态`）；
-`memory-core` 另有两个冒烟脚本替它守发布形态（`scripts/pack-smoke.mjs`、`scripts/registry-smoke.mjs`）。
+`memory-core` 另有冒烟脚本替它守发布形态（`scripts/pack-smoke.mjs`；`scripts/registry-smoke.mjs` 分
+`--workspace-core` 的仓内 tarball 模式与默认的 registry 模式）。
 这里不重复这些内容，避免同一份实现被两处文档追着改。

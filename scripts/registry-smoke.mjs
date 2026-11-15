@@ -8,8 +8,11 @@
  * 解析到的 memory-core 落在该目录内、版本满足适配层声明的范围，并真跑一次 store 读写。
  * 仓内的 `npm test` 永远走 alias → 源码，这条路径只有真装一次才看得见。
  *
- * 用法：node scripts/registry-smoke.mjs [pi-memory|dsh-memory ...]
+ * 用法：node scripts/registry-smoke.mjs [--workspace-core] [pi-memory|dsh-memory ...]
  *       （默认两个适配层都跑；需要先 `npm run build -w memory-core -w dsh-memory`）
+ *
+ * `--workspace-core` 是 PR 用的仓内路径：core 也取仓内 tarball，在干净目录里同时安装 core 与适配层，
+ * 输出会明确写成 workspace，绝不冒充 registry 验证。默认路径仍只从 registry 拉 core。
  *
  * 未发布的适配层（`private: true`），或「核心无可用版本且适配层自己也没发布」的发布进行中状态，只打
  * notice 跳过 —— 那时这条路径客观上无法验证。但适配层已发布、而声明的范围在 registry 上不存在，仍然
@@ -25,8 +28,13 @@ import { fileURLToPath } from "node:url";
 const CORE = "@yandy0725/memory-core";
 const REGISTRY = "https://registry.npmjs.org";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const adapters = process.argv.slice(2);
+const args = process.argv.slice(2);
+const workspaceCore = args.includes("--workspace-core");
+const adapters = args.filter((arg) => arg !== "--workspace-core");
 const targets = adapters.length > 0 ? adapters : ["pi-memory", "dsh-memory"];
+const workspaceCoreVersion = workspaceCore
+	? JSON.parse(readFileSync(join(repoRoot, "memory-core", "package.json"), "utf8")).version
+	: null;
 
 const run = (command, args, options = {}) =>
 	execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options });
@@ -79,9 +87,9 @@ for (const target of targets) {
 	const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
 	const label = manifest.name ?? target;
 	const range = coreRange(manifest, label);
-	const versions = publishedVersions(`${CORE}@${range}`);
+	const versions = workspaceCoreVersion === null ? publishedVersions(`${CORE}@${range}`) : [workspaceCoreVersion];
 
-	if (versions.length === 0) {
+	if (!workspaceCore && versions.length === 0) {
 		if (manifest.private === true) {
 			skipped += 1;
 			console.log(
@@ -118,6 +126,9 @@ for (const target of targets) {
 	const packed = unpackOne(
 		run("npm", ["pack", "-w", target, "--pack-destination", packDir, "--json"], { cwd: repoRoot }),
 	);
+	const corePacked = workspaceCore
+		? unpackOne(run("npm", ["pack", "-w", "memory-core", "--pack-destination", packDir, "--json"], { cwd: repoRoot }))
+		: null;
 	// 入口取宿主的加载点：pi 走 `pi.extensions[0]`，dsh 走 `main` / `exports["."]`。
 	const entry = manifest.pi?.extensions?.[0] ?? manifest.main ?? manifest.exports?.["."]?.default;
 	if (entry === undefined) throw new Error(`${label}: package.json 没有 pi.extensions / main / exports["."]，无法验证运行时入口`);
@@ -131,11 +142,14 @@ for (const target of targets) {
 	writeFileSync(join(installDir, "package.json"), `${JSON.stringify({ name: "registry-smoke", private: true, type: "module" }, null, "\t")}\n`);
 	// --legacy-peer-deps：宿主包由宿主提供，冒烟只需要 memory-core 这条运行时依赖（装上
 	// @earendil-works/* 会拉进几百 MB，且与本次验证无关）。
+	const installPackages = corePacked
+		? [join(packDir, corePacked.filename), join(packDir, packed.filename)]
+		: [join(packDir, packed.filename)];
 	run(
 		"npm",
 		[
 			"install",
-			join(packDir, packed.filename),
+			...installPackages,
 			`--registry=${REGISTRY}`,
 			"--legacy-peer-deps",
 			"--no-audit",
@@ -150,15 +164,22 @@ for (const target of targets) {
 	copyFileSync(join(repoRoot, "scripts", "registry-smoke-runtime.mjs"), probe);
 	const reported = run(
 		"node",
-		[probe, JSON.stringify(versions), label, entry],
+		[probe, JSON.stringify(versions), label, entry, workspaceCore ? "workspace" : "registry"],
 		// XDG_DATA_HOME 指向临时目录：core 的默认数据根在模块加载时求值，不设就会碰真实数据根。
 		{ cwd: installDir, env: { ...process.env, XDG_DATA_HOME: join(work, "xdg") } },
 	);
 	for (const line of reported.trim().split("\n")) console.log(line);
 }
 
-console.log(
-	skipped === 0
-		? `registry 运行时冒烟通过：${targets.join(", ")} 都能从 registry 解析到 ${CORE}`
-		: `registry 运行时冒烟结束：${targets.length - skipped} 个适配层通过，${skipped} 个因未发布跳过`,
-);
+if (workspaceCore) {
+	console.log(
+		`workspace 运行时冒烟通过：${targets.join(", ")} 都能从仓内 tarball 解析到 ${CORE}` +
+			"（这是仓内发布形态验证，registry 路径未验证）",
+	);
+} else {
+	console.log(
+		skipped === 0
+			? `registry 运行时冒烟通过：${targets.join(", ")} 都能从 registry 解析到 ${CORE}`
+			: `registry 运行时冒烟结束：${targets.length - skipped} 个适配层通过，${skipped} 个因未发布跳过`,
+	);
+}

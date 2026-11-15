@@ -757,7 +757,8 @@ pi 在 `resume` / `fork` / `reload` 三种 reason 下**刻意**用 transcript �
 发布按 `docs/guides/release.md`，并注意 #13：**core 先发**（minor → 2.1.0，新增公开面无破坏），
 两个适配层的 `dependencies` 同批提到 `^2.1.0`。`registry-smoke` 的两段式窗口要排好 —— 适配层的刀
 在 core 2.1.0 上 registry 之前合并会硬失败（"适配层已发布/已声明而范围不存在"），所以顺序是
-core 合并 → core 发布 → 适配层合并 → 在同一条合并提交的 workflow 上重跑 `registry-smoke`。
+core 合并 → core 发布 → 适配层合并 → 在同一条合并提交的 workflow 上重跑 `registry-smoke`。PR 阶段另有
+`workspace-smoke` 用仓内 core + 适配层 tarball 验证干净目录安装，不把尚未可验的 registry 路径冒充为通过。
 `npm version` 会用 2 空格缩进重写 `package.json`，发布后不要手改，直接
 `npx biome format --write <包>/package.json` 再提交。
 

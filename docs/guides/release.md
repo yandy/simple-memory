@@ -60,11 +60,15 @@ gh release create pi-memory-v<新版本号> --target "$COMMIT" \
 
 `memory-core` 带 `prepublishOnly: npm run build`，所以发布前一定会重新构建 `dist/`；不要提交 `dist/`。
 
-## `registry-smoke`：发布前是**硬失败**，不是跳过
+## `workspace-smoke`（PR）与 `registry-smoke`（main）
 
-`registry-smoke` 把适配层的 tarball 装进干净目录、**从 registry** 拉 core 再 `import` 入口。所以当核心的新版本
-还没发布时，这条路径**客观上无法验证**。脚本按「声明的范围在 registry 上存不存在」与「适配层自己是否已发布」
-分三种情形：
+PR 的 `workspace-smoke` 把 core 与适配层各自的**仓内 tarball** 在干净目录同时安装，验证发布形态与实际解析；
+它会在输出里明确写「registry 路径未验证」，因此 core 尚未发布时也能把代码、打包和仓内依赖问题先测出来，
+不需要为了跑 CI 临时发版。
+
+`registry-smoke` 把适配层的 tarball 装进干净目录、**从 registry** 拉 core 再 `import` 入口，只在 main 上跑。
+所以当核心的新版本还没发布时，这条路径**客观上无法验证**，也不会用 workspace 的结果冒充。脚本按
+「声明的范围在 registry 上存不存在」与「适配层自己是否已发布」分三种情形：
 
 - **适配层已发布、而 `dependencies` 里的 core 范围在 registry 上不存在** → **硬失败**。本功能就是这种：
   `pi-memory@4.0.1` 已经在 registry 上，把范围改成 `^2.1.0` 之后立刻报
@@ -75,7 +79,8 @@ gh release create pi-memory-v<新版本号> --target "$COMMIT" \
 - **范围在 registry 上查得到** → 真装一遍，并断言解析到的 core 带声明的版本范围。
 
 因此顺序固定为：先发 core → 在 registry 上确认新版本可查 → 再升 `pi-memory` 版本并发布。在 core 2.1.0
-上架之前，CI 的 `registry-smoke` job 会一直是红的（硬失败），那是闸门在正常工作。
+上架之前，main 的 `registry-smoke` job 会一直是红的（硬失败），那是闸门在正常工作；PR 则先由
+`workspace-smoke` 验证仓内 tarball，不以它为借口跳过发布后的 registry 验收。
 
 发完 core 之后，***在同一条合并提交的 workflow 上重跑***，那一次它会真的装一遍：
 
