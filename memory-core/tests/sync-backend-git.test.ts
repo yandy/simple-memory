@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
+import { inspect, promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NonFastForwardError, type SyncRunOptions, type SyncScope } from "../src/sync/backend.js";
 import { createGitSyncBackend, gitAvailable } from "../src/sync/backend-git.js";
@@ -709,6 +709,13 @@ describe.skipIf(!GIT)(
 			// 远端本身还是要能认出来（否则用户不知道该看哪个远端），只是口令没了
 			expect(err?.message).toMatch(/127\.0\.0\.1/);
 			expect(err?.message).not.toContain(token);
+			// 载重：宿主一句 `console.error(err)` 走的是 `util.inspect`，它会**递归打印整条 cause 链**
+			//（子进程错误的 message 里就带着完整命令行）。只 redact 我们自己拼的那条 message，
+			// token 会从 cause 这条路照样进日志。
+			const printed = inspect(err, { depth: 6 });
+			expect(printed).toContain("[cause]"); // 自检：链确实被打出来了，否则下面那条是恒真
+			expect(printed).not.toContain(token);
+			expect(printed).toContain("127.0.0.1");
 			expect(await bad.ready()).toBe(false);
 		});
 	},

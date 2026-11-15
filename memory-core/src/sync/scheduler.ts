@@ -128,8 +128,11 @@ export function createSyncScheduler<T = unknown>(options: SyncSchedulerOptions<T
 		const started: Promise<T | null> = (async () => {
 			try {
 				const result = await run(runTimeoutMs);
-				// 白跑的一轮（被锁跳过、传输失败）不算发布：内容仍然只在本地，得活到 flush 再试一次
-				if (result === null) unpublished = true;
+				// 白跑的一轮（被锁跳过、传输失败）不算发布：内容仍然只在本地，得活到 flush 再试一次。
+				// **收摊之后不再置起来**：dispose-while-in-flight 是被显式支持的，而这一轮很可能正因为
+				// 被中止而失败 —— 那时把标记重新置起，等于在宿主已经明说「不再等了」之后又留了一个
+				// 「有东西没推出去」，接着一次 flush() 就会启动全新的推送 I/O（见 flush 的守卫）。
+				if (result === null && !disposed) unpublished = true;
 				return result;
 			} catch {
 				/*
@@ -137,7 +140,8 @@ export function createSyncScheduler<T = unknown>(options: SyncSchedulerOptions<T
 				 * 而失败本身引擎已经处理了：基线不前进、内容还在本地、下一次写入或 flush 再试。
 				 * 所以这里连一条日志都不打 —— 用户该看到的是状态报告，不是一行栈。
 				 */
-				unpublished = true;
+				// 同上：收摊之后不再置起来（被 dispose 中止的那一轮正是从这里回来的）
+				if (!disposed) unpublished = true;
 				return null;
 			}
 		})();
@@ -170,6 +174,10 @@ export function createSyncScheduler<T = unknown>(options: SyncSchedulerOptions<T
 	}
 
 	async function flush(runTimeoutMs?: number): Promise<T | null> {
+		// 收摊之后的 flush 一律是「没有待发布的内容」（返回 null）：宿主退出路径上问的就是这一句，
+		// 而 dispose 已经明说不再等了。少了这道守卫，在途那一轮收尾时重新置起的 `unpublished`
+		// 会让这里启动一次**全新的**推送 I/O —— 拆除之后又开始联网，正是宿主最不能接受的那件事。
+		if (disposed) return null;
 		const budget = runTimeoutMs ?? timeoutMs;
 		// flush 跑的是「此刻该跑的那一次」：先取消待跑的去抖定时器，别让它在同一份工作上空转
 		cancelTimer();
@@ -207,7 +215,9 @@ export function createSyncScheduler<T = unknown>(options: SyncSchedulerOptions<T
 			cancelTimer();
 			dirty = false;
 			// 「没发布成功」这个标记一起丢：收摊就是宿主明说「不再等了」，
-			// 留着它只会让 `dirty` 在收摊之后继续报「有东西没推出去」
+			// 留着它只会让 `dirty` 在收摊之后继续报「有东西没推出去」。
+			// 在途那一轮收尾时会试图把它置回来（它多半正是被这次中止弄失败的），
+			// 所以那两处都带 `!disposed` 守卫、flush 也有一道 —— 三者是同一条不变量的三个面。
 			unpublished = false;
 		},
 		get inFlight(): Promise<T | null> | null {

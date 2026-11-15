@@ -103,6 +103,12 @@ function tempPath(path: string): string {
  * 网络盘：读者（另一次同步、另一个进程）撞上它只会得到「读不懂 → 无 base」，
  * 白白丢掉一次基线并多写出冲突副本。`rename` 在同一目录内是原子的替换，
  * 读者要么看到旧文件、要么看到完整的新文件。
+ *
+ * **这里刻意不与 `device.ts` 共用一个 `writeJsonAtomic`**（这件事已经被提过两次，所以把决定写下来）：
+ * 基线要的就是上面这一句「原子替换」—— 目标名上没有需要保护的东西，盖掉旧的即可；而身份文件要的是
+ * **排他创建**（`link` 原子失败于 `EEXIST`）+ 发布后读回 + 无硬链接时退回覆盖，那是三种发布形态。
+ * 合成一个函数必然带 flag，而 flag 恰好会把 `device.ts` 里那条论证清楚的排他性边界
+ *（何时排他、何时不排他、不排他时靠什么兜）压成一个参数默认值。两处重复的只有「写临时文件」这几行。
  */
 export async function writeManifest(path: string, manifest: SyncManifest): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });

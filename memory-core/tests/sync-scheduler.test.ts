@@ -389,6 +389,41 @@ describe("createSyncScheduler", () => {
 		expect(run).not.toHaveBeenCalled();
 	});
 
+	it("★dispose 撞在在途那一轮上：它失败也不得把「有待发布」置回来，收摊后的 flush 不启新 I/O", async () => {
+		// dispose-while-in-flight 是被显式支持的（宿主退出时正是这个形状：引擎先 abort 那一轮的信号，
+		// 再转发 dispose）。那一轮因此多半以「没发布成功」收尾，而收尾会试图把 `unpublished` 置起来 ——
+		// 置起来了，收摊之后的 `dirty` 就还报「有东西没推出去」，而一次 `flush()` 会启动**全新的**推送 I/O。
+		const g = gate();
+		// 这一轮永远失败：被 dispose 中止的那一轮正是以「没发布成功」收尾的
+		const run = vi.fn(async (_timeoutMs: number): Promise<unknown> => {
+			await g.promise;
+			throw new Error("aborted by dispose");
+		});
+		const scheduler = createSyncScheduler({ debounceMs: DEBOUNCE, timeoutMs: TIMEOUT, run });
+
+		scheduler.noteWrite();
+		await vi.advanceTimersByTimeAsync(DEBOUNCE);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(scheduler.inFlight).not.toBeNull();
+
+		scheduler.dispose(); // 在途时就收摊
+		expect(scheduler.dirty).toBe(false);
+		g.open(); // 那一轮此刻才收尾（失败）
+		const settled = scheduler.inFlight;
+		if (settled !== null) await settled;
+		await vi.advanceTimersByTimeAsync(0);
+
+		// 载重：失败的那一轮没有把标记置回来，收摊之后一律报干净
+		expect(scheduler.dirty).toBe(false);
+		expect(run).toHaveBeenCalledTimes(1); // 收尾也没有重排一次
+		// 载重：收摊后的 flush 不启动新的推送（宿主退出路径上问的就是这一句）
+		expect(await scheduler.flush()).toBeNull();
+		expect(await scheduler.flush(TIMEOUT)).toBeNull();
+		expect(run).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(5 * DEBOUNCE);
+		expect(run).toHaveBeenCalledTimes(1);
+	});
+
 	it("★ 定时器不吊住进程：debounce 定时器必须 unref", () => {
 		// 真句柄才能问出 ref 状态（假定时器给的是 sinon 自己造的对象），所以这一条用真定时器
 		vi.useRealTimers();

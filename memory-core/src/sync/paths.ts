@@ -44,8 +44,10 @@ export function remotePrefix(identityKey: string): string {
 /**
  * 同步状态目录在记忆根下的名字：`<记忆根>/.sync`。
  *
- * 这个字面值是**用户可见的布局契约**：它出现在文档、备份排除清单与用户自己的脚本里，而引擎、git
- * backend、设备身份与 manifest 都把它当入参 `syncRoot` 收发。适配层若各自写一遍
+ * 这个字面值是**用户可见的布局契约**：它出现在记忆根下（用户自己的备份与清理脚本会撞上它），
+ * 而引擎、git backend、设备身份与 manifest 都把它当入参 `syncRoot` 收发。
+ * 它**不是**记忆内容：`createSnapshot` 收的是显式文件清单，扫的是项目记忆目录那一层，
+ * 所以快照里本来就不会有它 —— 不要为了「排除」而在哪里再加一条规则。适配层若各自写一遍
  * `join(memoryRoot, ".sync")`，布局一改就要同步改若干处 —— 所以派生只留在这里一份，
  * 适配层一律调 `syncRootPath`。
  */

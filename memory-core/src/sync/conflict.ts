@@ -107,9 +107,10 @@ function keepsFingerprint(file: string, fingerprint: string): boolean {
  * 而指纹正是「同名不同内容」时唯一的区分位，切掉它等于让两份不同的记忆抢同一个文件名。
  * 做法：指纹永远拼在主干之后，主干被截断时就从末尾逐个码点回退，直到派生结果重新以指纹结尾。
  *
- * 回退用二分找起点（超长 name 上逐码点回退会退化成平方级），再用线性收尾兜住「二分假设的单调性
- * 万一不成立」的极端输入（例如主干以 `con.` 开头时 `entryFileName` 会补一个 `_` 前缀）。
- * 两种路径都只依赖入参，因此仍然是确定性的。
+ * 回退用二分找起点（超长 name 上逐码点回退会退化成平方级）。二分的前提是 `fits` 对 `keep` 单调
+ * （放得下的前缀越长越可能放不下），而它确实单调：`fits` 只看**结尾**是不是指纹，主干头部发生什么
+ * （例如 `con.` 这类保留名让 `entryFileName` 补一个 `_` 前缀）都不影响结尾；`build` 的输入又恒以
+ * `-<6 位十六进制>` 结尾，所以「截断后仍以指纹结尾」只取决于截断点。二分只依赖入参，因此是确定性的。
  */
 function fileNameEndingWith(head: string, fingerprint: string): string {
 	const points = Array.from(head);
@@ -125,10 +126,9 @@ function fileNameEndingWith(head: string, fingerprint: string): string {
 		if (fits(mid)) low = mid;
 		else high = mid - 1;
 	}
-	for (let keep = low; ; keep -= 1) {
-		const candidate = build(keep);
-		if (keepsFingerprint(candidate, fingerprint) || keep === 0) return candidate;
-	}
+	// `low` 就是「仍能放下指纹」的最长前缀：它只在 `fits(mid)` 为真时前移，起点 0 恒真
+	// （空主干派生成 `-<指纹>`，7 字节，不可能被截断）。
+	return build(low);
 }
 
 /** 已占用文件名的索引：名字 → 该文件内容的 hash（`undefined` = 调用方不知道 hash）。 */

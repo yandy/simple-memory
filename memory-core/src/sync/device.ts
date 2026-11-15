@@ -146,6 +146,14 @@ function tempPath(path: string): string {
  * 先写临时文件再发布，是为了「目标名一旦出现就指向写完整的字节」：记忆根可能就是云盘目录 /
  * 网络盘，直接写目标文件会留下「写了一半的 JSON」这一窗口 —— 撞上它的那次启动读不懂 →
  * 重新生成 → 又有了新 `id`，而两台设备的云盘还在互相覆盖这个文件。
+ *
+ * **这里刻意不抽一个公用的 `writeJsonAtomic`**（已经提过两次了，把决定写在代码里）：
+ * 本文件要的是「**排他创建** + 发布后读回 + 无硬链接时退回覆盖」三种发布形态，而
+ * `manifest.ts` 要的只是「原子替换」（目标名上没有需要保护的东西，`rename` 就够了）。
+ * 两套语义合成一个函数必然带 flag，而 flag 恰好会把下面 `createDevice` 里那条论证清楚的
+ * 排他性边界（何时排他、何时不排他、不排他时靠什么兼容）掩盖成一个参数默认值。
+ * 重复的只是「写临时文件 + `unlink(temp).catch(() => {})`」这几行尾巴，代价比一个带 flag
+ * 的公用原语低。
  */
 async function writeTemp(path: string, device: DeviceIdentity): Promise<string> {
 	await mkdir(dirname(path), { recursive: true });
@@ -178,6 +186,9 @@ const NO_HARDLINK_CODES = new Set(["EPERM", "EACCES", "ENOSYS", "ENOTSUP", "EOPN
  *
  * `rename` 是无条件覆盖的：并发的两个首次运行各写各的，败者会把赢者刚挂上去的 id 盖掉，
  * 可赢者早已返回了那个 id，那一轮的提交就挂在一个盘上已经不存在的作者上。
+ *
+ * 注意这条排他性**只在硬链接可用的文件系统上成立**，而下面那个退回分支正好是部署目标
+ * （云盘 / 网络挂载）会走到的地方。
  */
 async function createDevice(path: string, device: DeviceIdentity): Promise<DeviceIdentity> {
 	const temp = await writeTemp(path, device);
@@ -193,8 +204,12 @@ async function createDevice(path: string, device: DeviceIdentity): Promise<Devic
 		}
 		if (!NO_HARDLINK_CODES.has(code)) throw err;
 		// 没有硬链接可用：退回 rename 覆盖，再从盘上读回返回值。这里**失去了排他性** —— 两个并发的
-		// 首次运行可能各覆盖一次（窗口极窄，且两边写出的都是合法身份，没人会丢掉可用身份）；返回值
-		// 仍取「发布之后盘上那份」，所以不会把一具自己凭空造出、盘上从未存在过的 id 拿去当作者。
+		// 首次运行可能各覆盖一次（窗口极窄，且两边写出的都是合法身份，没人会丢掉可用身份）。
+		// `readBack` 只是**收窄**不一致窗口，没有关掉它：它保证的是「返回的那一份在读的那一刻
+		// 确实在盘上」，但另一个进程可以在读回之后又覆盖一次 —— 于是本轮拿到的 id 与盘上最终的
+		// 那一份仍可能不同，那一次的提交作者就对不上盘。这是无硬链接文件系统上的固有残余风险
+		//（不是可以再写几行关掉的），与裁定接受的那个窗口相同：两边写的都是合法身份，不会丢身份，
+		// 只是提交作者可能漂移一次。它不会把一具自己凭空造出、盘上从未存在过的 id 拿去当作者。
 		await rename(temp, path);
 		return readBack(path);
 	} finally {
@@ -223,10 +238,15 @@ async function replaceBrokenDevice(path: string, device: DeviceIdentity): Promis
 /**
  * 读这台设备的身份，没有（或读不懂）就生成一份并落盘。
  *
- * **调用方不需要持有根 sync 锁**：本函数自己收敛。并发的首次运行各自生成，但发布是排他的
- * （见 `createDevice`），所以最终只有一个 `id` 落盘，两个调用方都返回它 —— 不会有人返回一个
- * 盘上已不存在、却已经被拿去当提交作者的 id。加锁只是把这一点从「自己收敛」变成「靠别人」，
- * 而根 sync 锁是 try 语义、允许被跳过的，靠它保证身份的稳定性并不成立。
+ * **调用方不需要持有根 sync 锁**：本函数自己收敛。并发的首次运行各自生成，而发布在支持硬链接的
+ * 文件系统上是**排他**的（见 `createDevice`），所以最终只有一个 `id` 落盘，两个调用方都返回它 ——
+ * 不会有人返回一个盘上已不存在、却已经被拿去当提交作者的 id。
+ *
+ * **云盘 / 网络挂载上这条排他性不成立**（那里 `link` 往往直接不支持，`createDevice` 退回 `rename`）：
+ * 两个并发的首次运行可能各覆盖一次，于是本轮拿到的 `id` 与盘上最终那份可能不同，后果是那**一次**
+ * 提交的作者对不上盘（身份本身不会丢、也不会变成两份，下一轮开始就稳定了）。这是故意接受的残余
+ * 风险：两条发布路径写出的都是合法身份，而加锁也治不了它 —— 根 sync 锁是 try 语义、允许被跳过的，
+ * 靠它保证身份的稳定性并不成立。
  *
  * `now` 只为测试能固定 `createdAt`；生产调用不需要传。`syncRoot` 可能还不存在
  * （首次同步时 `.sync` 目录可能还没人建过），这里自己 `mkdir`。

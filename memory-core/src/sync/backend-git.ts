@@ -129,24 +129,59 @@ function asGitError(args: string[], timeoutMs: number, err: unknown): GitCommand
 	const exitCode = typeof e?.code === "number" ? e.code : undefined;
 	// 被超时杀掉时 stderr 是空的，只剩一句 “Command failed”，说明不了任何事
 	const detail = stderr || (e?.killed ? `timed out after ${timeoutMs}ms` : (e?.message ?? "unknown error"));
-	return new GitCommandError(redactCredentials(`git ${args.join(" ")} failed: ${detail}`), exitCode, err);
+	// message 与 cause 两边都得抹：宿主打印错误对象时走的是 cause 链（见 `redactCauseInPlace`）
+	return new GitCommandError(
+		redactCredentials(`git ${args.join(" ")} failed: ${detail}`),
+		exitCode,
+		redactCauseInPlace(err),
+	);
+}
+
+/**
+ * **就地**抹掉一个将要被挂上 `cause` 的错误里的凭据。
+ *
+ * 只 redact 我们自己拼的那条 message 不够：宿主一句 `console.error(err)` 会经 `util.inspect`
+ * **递归打印整条 cause 链**（`[cause]: Error: Command failed: git clone https://user:token@…`），
+ * 于是 token 从旁边这条路照样进了日志与 issue。子进程的 `message` 与 `stderr` 里都带着完整命令行，
+ * 所以两个字段都要抹（stderr 是 Buffer 时按字节重建）。
+ *
+ * 就地改写是安全的：这个错误对象是 `execFile` 刚刚为我们这一次调用造的，不与任何其他人共享；
+ * 对象身份不变，所以调用方照旧读得到 `cause.name`（认 AbortError）与 `cause.code`（认退出码）。
+ *
+ * 沿着 cause 链一路抹（有深度上限）：挂上去的可能是一个已经包过一层的错误，token 在里层那一份上。
+ */
+function redactCauseInPlace(cause: unknown, depth = 8): unknown {
+	if (typeof cause !== "object" || cause === null || depth <= 0) return cause;
+	// `cmd` 是 `execFile` 自己加的字段，内容就是完整命令行（含 `clone <url>` 里的那份凭据）
+	const c = cause as { message?: unknown; stderr?: unknown; cmd?: unknown; cause?: unknown };
+	if (typeof c.message === "string") c.message = redactCredentials(c.message);
+	if (typeof c.cmd === "string") c.cmd = redactCredentials(c.cmd);
+	if (typeof c.stderr === "string") c.stderr = redactCredentials(c.stderr);
+	else if (Buffer.isBuffer(c.stderr)) c.stderr = Buffer.from(redactCredentials(c.stderr.toString("utf8")), "utf8");
+	if (c.cause !== undefined) redactCauseInPlace(c.cause, depth - 1);
+	return cause;
 }
 
 /**
  * 把**前一步**的原始错误接到最终逃逸的错误上，两步的信息都不丢。
  *
- * `cause` 空着就直接挂上去；已经被占（`GitCommandError` 那里放着子进程错误，调用方靠它认
- * AbortError 与退出码）时不覆盖 —— 改成拼进 message，并且拼进去的文案再过一遍凭据 redact
- *（前一步的 `args` 里往往就带着远端 URL）。
+ * `cause` 空着就直接挂上去（挂之前先就地 redact：宿主打印错误对象走的是 cause 链）；已经被占
+ * （`GitCommandError` 那里放着子进程错误，调用方靠它认 AbortError 与退出码）时不覆盖 ——
+ * 改成拼进 message，并且拼进去的文案再过一遍凭据 redact（前一步的 `args` 里往往就带着远端 URL）。
+ *
+ * 这时**就地改写 `final.message` 并返回 `final` 自己**，而不是包一个新的 `Error`：包一层会把
+ * `GitCommandError` 的类型与 `exitCode` 留在里层，而调用方问的都是最外面那个对象 ——
+ * 认 AbortError、读退出码、判非快进全部落空，一条「认证失败」就被读成「未知错误」。
  */
 function withEarlierCause(err: unknown, what: string, earlier: unknown): Error {
 	const final = err instanceof Error ? err : new Error(String(err));
+	const detail = redactCredentials((earlier as Error | undefined)?.message ?? String(earlier));
 	if (final.cause === undefined) {
-		final.cause = earlier;
+		final.cause = redactCauseInPlace(earlier);
 		return final;
 	}
-	const detail = redactCredentials((earlier as Error | undefined)?.message ?? String(earlier));
-	return new Error(`${final.message} (${what} had already failed: ${detail})`, { cause: final });
+	final.message = `${final.message} (${what} had already failed: ${detail})`;
+	return final;
 }
 
 /**

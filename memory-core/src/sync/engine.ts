@@ -94,7 +94,14 @@ export interface SyncRoundResult {
 	 * 别的项目的记忆**不在这里** —— 那是设计规定的常态，报出来就等于每轮上千条噪声。
 	 */
 	outOfScopeRemote: string[];
-	/** 本轮结束时基线指向的远端版本（发布成功则是发布后的那一个）。 */
+	/**
+	 * 本轮结束时基线指向的远端版本（发布成功则是发布后的那一个）。
+	 *
+	 * **不变量：只有基线真写进盘了才有值。** 写基线失败、或在写基线之前就失败的那些轮
+	 * （锁忙、未初始化、未配置、传输失败、扫描抛错）一律是 `undefined` —— 基线是适配层
+	 * 渲染「同步到哪了」的唯一依据，报一个盘上根本不存在的 revision，等于让用户对着一个
+	 * 假状态去排查（而 `pulled` / `conflicts` 那一堆部分结果反而可能非空：失败轮也可能已经改过本地）。
+	 */
 	revision?: string;
 }
 
@@ -340,7 +347,8 @@ function agreedBaseFiles(
  * 解析不出/读不了的本地文件本轮**一律不动**：从差集产出的每一张动作清单里剔除。
  *
  * 扫描把这种文件放进 `unparsable` 而不是 `files`，于是差集看到「`ours` 里没有它」，
- * 按标准三方语义会有三种结论，每一种都会动到这份读不出的文件：
+ * 按标准三方语义有**会动到这份读不出的文件**的三种结论（落在哪一种取决于它在 `base` 里有没有、
+ * 以及远端相对基线动没动；两侧都没动、或远端也没这个名字时，差集判的是无动作）：
  * - `base` 里有、远端未动 → 判成**用户删除** → 删除被推到远端：一个坏文件（手滑编辑、半截写入、
  *   权限抖动）就能把两台设备上的同一条记忆一起删掉，而本地那份还躺在盘上；
  * - `base` 里有、远端改过 → 判成**删除 vs 修改**冲突 → 删除那半边照办：这份读不出的文件从原路径被
@@ -355,9 +363,10 @@ function agreedBaseFiles(
  * 5 份快照，不足以当作覆盖的补偿。所以这里连 `conflicts` 一起剔：这份文件既不被覆盖、也不被删除、
  * 更不触发对端删除，只出现在 `unparsableLocal` 报告里，每轮都报，直到用户自己修好或自己删掉它。
  *
- * 剔完之后**不需要**再把这些名字按基线补回 `ours`：补回只能压掉第一种（`deleteRemote`），
- * 压不住第二、第三种；而两套机制并存会让「差集的结论」与「实际执行的动作」长期不一致，
- * 后来人再也看不出哪一套算数。
+ * 剔完之后**不需要**再把这些名字按基线补回 `ours`：补回只能压掉「判成本地删除 → 推到远端」那一种
+ * （`deleteRemote`）；「删 vs 改」冲突压不住（冲突收敛照样把原路径删掉），而「远端新增」那一种更是
+ * 无从定义 —— 它在 `base` 里根本没有可补的那一份。两套机制并存还会让「差集的结论」与「实际执行的
+ * 动作」长期不一致，后来人再也看不出哪一套算数。
  */
 function withoutUnparsable(diff: SyncDiff, untouched: ReadonlySet<string>): SyncDiff {
 	if (untouched.size === 0) return diff;
@@ -687,6 +696,12 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	/**
 	 * ② 应用段：整轮持有项目的进程内逻辑锁，所以每一次 store 调用都传
 	 * `{ skipLogicalLock: true, skipSnapshot: true }`，而整段只拍**一份** `-sync` 快照。
+	 *
+	 * **这把锁只到进程边界**：`process-lock` 是同进程内的一个队列，它保证的是「本进程里这一整段
+	 * 不与同进程的另一次 store 写入交错」。跳进程的那一半由每个写原语自己的 `<memoryDir>/.lock`
+	 * 承担（`tryWithLock` 逐原语串行物理写入），**不是**由这里这把逻辑锁承担。所以本段对
+	 * 另一个进程里的写入者只逐原语互斥：它可能在两次写入之间插进来。这是可接受的 ——
+	 * 基线只记「两侧达成一致的那一份字节」，而插入者改的是本地文件，下一轮重新扫描就能看见。
 	 */
 	async function applyPhase(snapshot: RemoteSnapshot, result: SyncRoundResult): Promise<AppliedRound> {
 		const applied = await store.tryWithLogicalLock((): Promise<AppliedRound> => converge(snapshot, result));

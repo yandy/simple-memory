@@ -480,8 +480,11 @@ describe("sync engine（假 backend）", () => {
 		expect(await readFile(join(first.projectDir, copiesOne[0].file), "utf8")).toBe(
 			await readFile(join(second.projectDir, copiesTwo[0].file), "utf8"),
 		);
-		// 后缀取自**败者**（台式机那份）的 modified 与指纹
-		expect(copiesOne[0].file).toMatch(/^发布状态-\(冲突-2026-11-05\)-[0-9a-f]{6}\.md$/);
+		// 后缀取自**败者**（台式机那份）的 modified 与指纹。指纹钉成字面量而不是一段形状正则：
+		// 它必须取自败者的**原始字节**，而不是加后缀重序列化之后的那一份 —— 两种取法都满足
+		// `[0-9a-f]{6}`，只有字面量能钉住「指纹取自哪一份字节」（与用户在 name 后缀里看到的同源）。
+		expect(copiesOne[0].file).toBe("发布状态-(冲突-2026-11-05)-656074.md");
+		expect(copiesOne[0].name).toBe("发布状态 (冲突 2026-11-05 656074)");
 	});
 
 	it("删除 vs 修改：删除照办，被修改的那份作为新 entry 留下", async () => {

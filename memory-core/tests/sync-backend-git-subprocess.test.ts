@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
+import { inspect, promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SyncScope } from "../src/sync/backend.js";
 
@@ -23,10 +23,12 @@ const harness = vi.hoisted(() => ({
 vi.mock("node:child_process", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:child_process")>();
 	const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+	// 照 `execFile` 的形状造错误：`message` 与 `cmd` 里都带着**完整命令行**（凭据就在里面）
 	const fakeError = (args: string[]): Error =>
 		Object.assign(new Error(`Command failed: git ${args.join(" ")}`), {
 			code: 128,
 			killed: false,
+			cmd: `git ${args.join(" ")}`,
 			stderr: `fatal: unable to access '${args.at(-1)}': could not resolve host`,
 		});
 
@@ -120,6 +122,41 @@ describe("git backend 的子进程启动参数", () => {
 		// 载重：第二个子进程不得又拿一份满额预算（那样子进程一多，一次调用就是配置值的好几倍）
 		expect(second).toBeLessThan(first);
 		expect(second).toBeGreaterThanOrEqual(1);
+	});
+
+	it("★逃逸错误的整条 cause 链都不带凭据，且仍是 GitCommandError（类型与退出码没被包丢）", async () => {
+		// 远端 URL 里带 token（`https://user:token@host` 是 git 官方写法，也是 CI 免交互推送的常规做法）。
+		// 让 `clone` 与退回路径上的 `remote add origin <url>` 都失败：这两条命令的 args 里都有那份 URL，
+		// 于是逃逸出去的错误链上会同时出现「前一步的 clone」与「本次 remote add 的原始子进程错误」。
+		const token = "s3cr3t-token";
+		const bad = createGitSyncBackend({
+			syncRoot: join(dir, "creds"),
+			remote: `https://sync-user:${token}@127.0.0.1:1/o/r.git`,
+			branch: "main",
+		});
+		harness.fail.add("clone");
+		harness.fail.add("remote");
+
+		const err = await bad.init({ timeoutMs: 30_000 }).then(
+			() => null,
+			(e: unknown) => e as Error & { exitCode?: number },
+		);
+		expect(err).toBeInstanceOf(Error);
+
+		// 载重一：宿主一句 `console.error(err)` 走的就是 `util.inspect`，它会**递归打印整条 cause 链**
+		// （`execFile` 的原始错误在 `message` 与 `cmd` 两个字段上都带着完整命令行）。
+		// 只 redact 我们自己拼的那条 message，token 会从 cause 这条路照样进日志与 issue。
+		const printed = inspect(err, { depth: 8 });
+		expect(printed).toContain("[cause]"); // 自检：链确实被打出来了，否则下面那条是恒真
+		expect(printed).not.toContain(token);
+		expect(printed).toContain("sync-user:***@"); // 远端仍然认得出是哪个，只是口令没了
+
+		// 载重二：拼进「前一步也失败了」时不得换对象 —— 调用方靠最外面这个对象认类型与退出码
+		//（认 AbortError、区分 `diff --cached --quiet` 的 0/1），包一层普通 Error 就等于把这些判定废掉。
+		expect(err?.name).toBe("GitCommandError");
+		expect(err?.exitCode).toBe(128);
+		expect(err?.message).toMatch(/git remote add/);
+		expect(err?.message).toMatch(/git clone had already failed/);
 	});
 
 	it("预算耗尽时给出去的也不是 0：`timeout: 0` 在子进程上是「不限时」", async () => {

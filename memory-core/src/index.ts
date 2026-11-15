@@ -201,7 +201,17 @@ export { sha256Hex } from "./sync/hash.js";
 export { MANIFEST_VERSION, emptyManifest, manifestPath, readManifest, writeManifest } from "./sync/manifest.js";
 export type { SyncManifest } from "./sync/manifest.js";
 
-export { SYNC_DIR_NAME, remoteEntryPath, remotePrefix, remoteProjectKey, syncRootPath } from "./sync/paths.js";
+// 远端布局的单一来源：适配层渲染「这条记忆在远端哪里」一律调这两个，不要就地拼 `git/` 字面量。
+// `remotePrefix` 收**身份 key**（在这里派生成项目 key），`remotePrefixFromKey` 收已经派生好的
+// **项目 key**（适配层算 status 时手上往往就是它）；拿错一个是二次转义，不报错，只是远端多一个谁也不认的目录。
+export {
+	SYNC_DIR_NAME,
+	remoteEntryPath,
+	remotePrefix,
+	remotePrefixFromKey,
+	remoteProjectKey,
+	syncRootPath,
+} from "./sync/paths.js";
 
 export { scanLocalEntries } from "./sync/scan.js";
 export type { LocalScan } from "./sync/scan.js";
