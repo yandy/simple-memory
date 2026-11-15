@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakePi, expectedDir, fakeRegistry, resetWiringMocks, resolveMemoryDirMock, runTaskMock, setupSession, uiCtx, uiWith } from "./helpers/wiring-harness";
+import { createFakePi, DISK_INDEX, expectedDir, fakeRegistry, resetWiringMocks, resolveMemoryDirMock, runTaskMock, sectionsEvent, setupSession, uiCtx, uiWith } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { loadConfig } from "../src/config";
 
@@ -106,6 +106,33 @@ describe("index wiring — config errors", () => {
 			await s.writeConfig({ defaults: { model: "test/model", sessionPersistence: { enabled: false } } });
 			await rm(cwdB, { recursive: true, force: true });
 		}
+	});
+
+	it("disables only sync for sync config errors and keeps the store, tool, and index healthy", async () => {
+		await s.writeConfig({ sync: { enabled: true, remote: "" } });
+		const notify = vi.fn();
+		const { pi, tools, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+
+		await expect(handlers["session_start"][0]({}, s.uiCtx(uiWith(notify)))).resolves.toBeUndefined();
+
+		expect(tools).toHaveLength(1);
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify.mock.calls[0][1]).toBe("error");
+		expect(notify.mock.calls[0][0]).toContain("pi-memory sync error:");
+		expect(notify.mock.calls[0][0]).toContain('sync is enabled but "sync.remote" is empty');
+		expect(notify.mock.calls[0][0]).not.toContain("pi-memory config error:");
+
+		const event = sectionsEvent();
+		await handlers["before_agent_start"][0](event, s.uiCtx());
+		expect(event.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
+		await expect(tools[0].execute("sync-config-list", { action: "list" }, undefined, undefined, undefined)).resolves.toBeDefined();
+
+		notify.mockClear();
+		await commands["memory"].handler("", s.uiCtx(uiWith(notify)));
+		expect(notify.mock.calls[0][0]).toContain(`Dir: ${s.dir}`);
+		expect(notify.mock.calls[0][0]).toContain('sync is enabled but "sync.remote" is empty');
+		expect(notify.mock.calls[0][0]).not.toContain("Memory: misconfigured");
 	});
 
 	// ── 模型校验（设计 §2）─────────────────────────────────────────────

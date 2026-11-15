@@ -15,7 +15,8 @@
 		"check:host-deps": "node scripts/check-host-deps.mjs",
 		"check:license": "node scripts/assert-license-source.mjs",
 		"check:memory-core-deps": "node scripts/check-memory-core-deps.mjs",
-		"smoke:registry": "node scripts/registry-smoke.mjs"
+		"smoke:registry": "node scripts/registry-smoke.mjs",
+		"smoke:workspace": "node scripts/registry-smoke.mjs --workspace-core"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.6.4",

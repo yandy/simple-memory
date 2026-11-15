@@ -94,8 +94,10 @@ describe.skipIf(!GIT)("sync engine（真 git）", { timeout: TEST_TIMEOUT_MS }, 
 		const projectDir = join(root, "git", "proj");
 		await mkdir(projectDir, { recursive: true });
 		const store = new MemoryStore(CFG(projectDir));
-		const backend = createGitSyncBackend({ syncRoot, remote: remoteUrl, branch: BRANCH });
-		// 初始化只由显式命令触发：引擎绝不偷偷 clone
+		// memoryRoot 就是这台设备的记忆根（`.sync` 的上一层）：初始化前的共存检查靠它。
+		// 这里没有 `<root>/.git`，所以检查直接跳过，而 init 也不会往记忆根里写任何东西。
+		const backend = createGitSyncBackend({ syncRoot, memoryRoot: root, remote: remoteUrl, branch: BRANCH });
+		// 初始化只由适配层触发：引擎绝不偷偷 clone
 		await backend.init({ timeoutMs: GIT_TIMEOUT_MS });
 		const identity = await loadOrCreateDevice(syncRoot);
 		const projectKey = remoteProjectKey(IDENTITY_KEY);

@@ -1,6 +1,9 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
+import type { SyncEngine } from "@yandy0725/memory-core";
 import { vi } from "vitest";
 import type { MemoryConfig } from "../../src/config";
 import { PI_HOST_DEFAULTS } from "../../src/config";
@@ -31,6 +34,18 @@ const mocks = vi.hoisted(() => ({
 	runTaskMock: vi.fn(),
 	shouldNudgeMock: vi.fn(),
 	readRecordedMemoryIndexMock: vi.fn(),
+	projectIdentityMock: vi.fn(),
+	/** 真 backend/engine 的观察带：只记顺序，调用仍委托 core 的真实现。 */
+	syncEvents: [] as string[],
+	/** 当前装配出的真实 engine 包装；测试可在慢 I/O 边界上 spy，不替换调度与落盘实现。 */
+	syncEngines: [] as SyncEngine[],
+	/** dispose 竞争测试只延迟真实 push/init 的起点，不替换其结果或行为。 */
+	syncPushBarrier: { current: null as Promise<void> | null },
+	syncPushTimeouts: [] as number[],
+	syncInitBarrier: { current: null as Promise<void> | null },
+	syncInitSignals: [] as Array<AbortSignal | undefined>,
+	/** 只故障注入适配层直接调用的 writeManifest；core engine 内部仍走真实实现。 */
+	syncManifestWriteFailure: { current: null as Error | null },
 	readDreamMetaMock: vi.fn(),
 	writeDreamMetaMock: vi.fn().mockResolvedValue(undefined),
 	detectLegacyMemoryDirMock: vi.fn().mockResolvedValue(null),
@@ -70,6 +85,80 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 			// 真实 config 的 memoryDir + cwd 末段：不 spawn git，也不依赖任何可变引用
 			return join((cfg as { memoryDir: string }).memoryDir, config.basename(cwd));
 		}),
+		// 与 resolveMemoryDir 的 stub 一样按 cwd 末段派生稳定身份；backend/engine/device 保持真实。
+		projectIdentity: mocks.projectIdentityMock.mockImplementation(async (cwd: string) => ({
+			kind: "git",
+			key: `example.com/org/${config.basename(cwd)}`,
+		})),
+		createGitSyncBackend: (options: Parameters<typeof actual.createGitSyncBackend>[0]) => {
+			const backend = actual.createGitSyncBackend(options);
+			return {
+				...backend,
+				init: async (opts: Parameters<typeof backend.init>[0]) => {
+					mocks.syncEvents.push("init:start");
+					mocks.syncInitSignals.push(opts.signal);
+					try {
+						if (mocks.syncInitBarrier.current) await mocks.syncInitBarrier.current;
+						return await backend.init(opts);
+					} finally {
+						mocks.syncEvents.push("init:end");
+					}
+				},
+				fetch: async (scope: Parameters<typeof backend.fetch>[0], opts: Parameters<typeof backend.fetch>[1]) => {
+					mocks.syncEvents.push("fetch");
+					return backend.fetch(scope, opts);
+				},
+			};
+		},
+		writeManifest: async (...args: Parameters<typeof actual.writeManifest>) => {
+			const failure = mocks.syncManifestWriteFailure.current;
+			if (failure) {
+				mocks.syncManifestWriteFailure.current = null;
+				throw failure;
+			}
+			return actual.writeManifest(...args);
+		},
+		createSyncEngine: (options: Parameters<typeof actual.createSyncEngine>[0]) => {
+			const engine = actual.createSyncEngine(options);
+			const observed: SyncEngine = {
+				...engine,
+				noteWrite: () => {
+					mocks.syncEvents.push("noteWrite");
+					engine.noteWrite();
+				},
+				pull: async (timeoutMs?: number) => {
+					mocks.syncEvents.push("pull");
+					return engine.pull(timeoutMs);
+				},
+				push: async (timeoutMs?: number) => {
+					mocks.syncEvents.push("push:start");
+					mocks.syncPushTimeouts.push(timeoutMs as number);
+					if (mocks.syncPushBarrier.current) await mocks.syncPushBarrier.current;
+					try {
+						return await engine.push(timeoutMs);
+					} finally {
+						mocks.syncEvents.push("push:end");
+					}
+				},
+				flush: async (timeoutMs?: number) => {
+					mocks.syncEvents.push("flush");
+					return engine.flush(timeoutMs);
+				},
+				dispose: () => {
+					mocks.syncEvents.push("dispose");
+					engine.dispose();
+				},
+				get inFlight() {
+					return engine.inFlight;
+				},
+			};
+			mocks.syncEngines.push(observed);
+			return observed;
+		},
+		buildIndexSection: async (...args: Parameters<typeof actual.buildIndexSection>) => {
+			mocks.syncEvents.push("index");
+			return actual.buildIndexSection(...args);
+		},
 		scanEntries: mocks.scanEntriesMock,
 		runTask: mocks.runTaskMock,
 	};
@@ -102,11 +191,25 @@ vi.mock("../../src/session-search", () => ({
 // 「哪个 reason 走录制值、拿到/拿不到分别怎么办」。
 vi.mock("../../src/index-source", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../src/index-source")>();
-	return { ...actual, readRecordedMemoryIndex: mocks.readRecordedMemoryIndexMock };
+	return {
+		...actual,
+		readRecordedMemoryIndex: (...args: Parameters<typeof actual.readRecordedMemoryIndex>) => {
+			mocks.syncEvents.push("recorded-index");
+			return mocks.readRecordedMemoryIndexMock(...args);
+		},
+	};
 });
 
 export const loadConfigMock = mocks.loadConfigMock;
 export const resolveMemoryDirMock = mocks.resolveMemoryDirMock;
+export const projectIdentityMock = mocks.projectIdentityMock;
+export const syncEvents = mocks.syncEvents;
+export const syncEngines = mocks.syncEngines;
+export const syncPushBarrier = mocks.syncPushBarrier;
+export const syncPushTimeouts = mocks.syncPushTimeouts;
+export const syncInitBarrier = mocks.syncInitBarrier;
+export const syncInitSignals = mocks.syncInitSignals;
+export const syncManifestWriteFailure = mocks.syncManifestWriteFailure;
 export const scanEntriesMock = mocks.scanEntriesMock;
 export const runTaskMock = mocks.runTaskMock;
 export const shouldNudgeMock = mocks.shouldNudgeMock;
@@ -146,6 +249,18 @@ export function resetWiringMocks(): void {
 	// `mockImplementationOnce` 队列也不会串到下一条用例。
 	mocks.loadConfigMock.mockReset();
 	if (config.loadConfigDispatch.current) mocks.loadConfigMock.mockImplementation(config.loadConfigDispatch.current);
+	projectIdentityMock.mockReset();
+	projectIdentityMock.mockImplementation(async (cwd: string) => ({
+		kind: "git",
+		key: `example.com/org/${config.basename(cwd)}`,
+	}));
+	syncEvents.length = 0;
+	syncEngines.length = 0;
+	syncPushBarrier.current = null;
+	syncPushTimeouts.length = 0;
+	syncInitBarrier.current = null;
+	syncInitSignals.length = 0;
+	syncManifestWriteFailure.current = null;
 	scanEntriesMock.mockReset();
 	runTaskMock.mockReset();
 	runTaskMock.mockImplementation((task: { id?: string }, _input: unknown, ctx?: { cfg?: MemoryConfig }) => {
@@ -176,6 +291,11 @@ export function expectedDir(memoryDirRoot: string, cwd: string): string {
 	return join(memoryDirRoot, String(cwd).split(/[\\/]/).filter(Boolean).pop() ?? "");
 }
 
+/** 直接装配 runtime 的测试与 projectIdentity stub 共用同一个稳定 git 身份。 */
+export function gitIdentity(cwd: string) {
+	return { kind: "git" as const, key: `example.com/org/${config.basename(cwd)}` };
+}
+
 export interface SessionSetup {
 	/** 本会话的记忆目录 = `expectedDir(memoryDirRoot, cwd)` */
 	dir: string;
@@ -187,6 +307,36 @@ export interface SessionSetup {
 	writeConfig(patch?: Record<string, unknown>): Promise<void>;
 	uiCtx(over?: Record<string, unknown>): any;
 	cleanup(): Promise<void>;
+}
+
+const execFileP = promisify(execFile);
+
+/**
+ * 给接线用例准备一个纯本地 bare remote，并启用真实同步装配。
+ * 只隔离 git 的全局/系统配置；不访问网络，也不替换 backend/engine。
+ */
+export async function enableTestSync(s: SessionSetup, over: Record<string, unknown> = {}): Promise<string> {
+	const emptyGitConfig = join(s.cwd, "gitconfig-empty");
+	await writeFile(emptyGitConfig, "", "utf8");
+	vi.stubEnv("GIT_CONFIG_GLOBAL", emptyGitConfig);
+	vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+	const remote = join(s.cwd, "sync-remote.git");
+	await execFileP("git", ["init", "--bare", "--quiet", remote], { cwd: s.cwd, timeout: 15_000 });
+	await s.writeConfig({
+		sync: {
+			enabled: true,
+			remote,
+			branch: "main",
+			pullOnStart: false,
+			pushOnWrite: true,
+			// 写触发用例只观察 noteWrite；自动推送由 core 自己的套件覆盖。
+			pushDebounceMs: 60_000,
+			autoTimeoutMs: 10_000,
+			timeoutMs: 10_000,
+			...over,
+		},
+	});
+	return remote;
 }
 
 export interface SetupSessionOptions {

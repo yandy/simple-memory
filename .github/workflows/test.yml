@@ -74,7 +74,24 @@ jobs:
   # 拉，再断言解析到的 memory-core 在干净目录内、版本满足声明的范围、且能真读写。
   # 未发布的适配层（dsh-memory 目前 private: true）在 registry 上没有满足范围的版本时只打 notice 跳过；
   # 去掉 private 之后同一条件变成失败。
+  # PR 上 core 可能尚未发布：用仓内 tarball 与适配层 tarball 在干净目录里同时安装，验证发布形态与
+  # 实际解析，不把 workspace 链接或 registry 可用性当成前提。输出明确标为 workspace，不冒充 registry。
+  workspace-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w memory-core && npm run build -w dsh-memory
+      - run: npm run smoke:workspace
+
+  # registry 路径只在 main 上验：PR 阶段尚未发布的 core 客观上没有这条路径可验，不能假装通过。
   registry-smoke:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

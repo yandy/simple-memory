@@ -53,12 +53,14 @@ spec 与迁移说明。
 不需要先 build。`dsh-memory` 的 `tsconfig.build.json` 再把 `paths` 清空，构建因此经包 `exports`
 解析 `memory-core/dist`。
 
-发布形态有两条，分别由两个 job 覆盖：
+发布形态有三条，分别由对应 job 覆盖：
 
 - **仓内的 `dist`**：`test-dist` 用 `MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到
   `memory-core/dist`（经包 `exports` 解析）。
+- **仓内 tarball**：`workspace-smoke` 把 core 与适配层各自的 tarball 在干净目录同时安装，验证 PR 阶段的
+  发布形态与解析；输出明确标注 registry 路径未验证。
 - **registry 上的 core**：`registry-smoke` 把适配层打成 tarball 装进干净目录，依赖只从 registry 拉，
-  断言解析到的 core 在该目录内、版本满足声明的范围、并能真读写。用户装包时走的就是这条。
+  断言解析到的 core 在该目录内、版本满足声明的范围、并能真读写。用户装包时走的就是这条，只在 main 上跑。
 
 解析路径的完整约定与静态闸门（`npm run check:memory-core-deps`）见
 [dependencies.md](./dependencies.md) 的「开发走仓内源码，运行走 registry」一节。
@@ -85,7 +87,8 @@ LICENSE 复制进包目录，`postpack` 再删掉；生成物被 `.gitignore` �
 | `lockfile-sync` | `package-lock.json` 与各 `package.json` 未漂移 |
 | `test` | 逻辑（ubuntu + windows），含 `check:license` / `check:host-deps` / `check:memory-core-deps` / `typecheck` / `lint` / `test` |
 | `test-dist` | 发布形态的解析路径（见上节） |
-| `registry-smoke` | 适配层 tarball 从 registry 装上 memory-core 后能跑（见上节） |
+| `workspace-smoke` | core 与适配层的仓内 tarball 在干净目录安装后能跑（PR 阶段；不冒充 registry） |
+| `registry-smoke` | 适配层 tarball 从 registry 装上 memory-core 后能跑（只在 main 上跑，见上节） |
 | `pack-smoke` | tarball 里带齐了 `dist/`、types、`LICENSE` 与 `pi-memory` 的 TS 入口；在干净目录装包后能跑 |
 
 `pack-smoke` 跑 Node 20.16.0（`memory-core` 的 `engines` 下限）与 24 两档，只验证运行时形状，

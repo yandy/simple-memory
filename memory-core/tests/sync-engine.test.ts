@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,7 +16,13 @@ import {
 import type { DeviceIdentity } from "../src/sync/device.js";
 import { createSyncEngine, type SyncEngine } from "../src/sync/engine.js";
 import { sha256Hex } from "../src/sync/hash.js";
-import { MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "../src/sync/manifest.js";
+import {
+	MANIFEST_VERSION,
+	type SyncManifest,
+	manifestPath,
+	readManifest,
+	writeManifest,
+} from "../src/sync/manifest.js";
 import { remoteProjectKey } from "../src/sync/paths.js";
 import { serializeEntryFile } from "../src/store/entry-file.js";
 import { tryWithLock } from "../src/store/fs-lock.js";
@@ -86,6 +93,15 @@ interface FakeRemote extends SyncBackend {
 	nonFastForward: number;
 	/** `ready()` 的答案。 */
 	initialized: boolean;
+	/**
+	 * `getRemote()` 的答案（= 暂存 clone 的 origin）。初始化之后它是「同步到底去哪儿」的真相来源，
+	 * 而构造引擎用的配置值可能与它不同（甚至为空）—— 两边刻意分开存，才测得出「报的是哪一个」。
+	 */
+	origin: string | null;
+	/** `init()` 交回的 warnings（适配层要把它排进非致命提示）。 */
+	initWarnings: string[];
+	/** `setRemote()` 收到的地址（按调用顺序）。 */
+	setRemoteCalls: string[];
 	initCalls: number;
 	fetches: number;
 	publishAttempts: number;
@@ -122,6 +138,9 @@ function createFakeRemote(): FakeRemote {
 		failNext: null,
 		nonFastForward: 0,
 		initialized: true,
+		origin: SYNC_CONFIG.remote,
+		initWarnings: [],
+		setRemoteCalls: [],
 		initCalls: 0,
 		fetches: 0,
 		publishAttempts: 0,
@@ -135,6 +154,19 @@ function createFakeRemote(): FakeRemote {
 		async init() {
 			remote.initCalls += 1;
 			remote.initialized = true;
+			// 口径同 git backend：交回的 revision 是远端真的有的那一个
+			return { revision: remote.revision, warnings: [...remote.initWarnings] };
+		},
+		async getRemote() {
+			// 端口口径：未初始化时本地没有可自省的状态 → null
+			return remote.initialized ? remote.origin : null;
+		},
+		async setRemote(url: string) {
+			remote.setRemoteCalls.push(url);
+			// 未初始化时什么都不改（那是配置的活）；空地址 fail-closed
+			if (!remote.initialized) return;
+			if (url.trim() === "") throw new Error("refusing to set an empty sync remote");
+			remote.origin = url;
 		},
 
 		async fetch(scope: SyncScope): Promise<RemoteView> {
@@ -297,6 +329,36 @@ async function makeDevice(
 	};
 }
 
+/** 同一记忆根里的另一个项目：共享暂存 clone、根锁与 state 目录，但本地目录和 projectKey 不同。 */
+async function makeSharedProject(name: string, identityKey: string, config: SyncConfig = SYNC_CONFIG): Promise<Device> {
+	const project = join(device.root, "git", name);
+	await mkdir(project, { recursive: true });
+	const memoryStore = new MemoryStore(CFG(project));
+	const key = remoteProjectKey(identityKey);
+	return {
+		root: device.root,
+		syncRoot,
+		projectDir: project,
+		projectKey: key,
+		prefix: `git/${key}`,
+		store: memoryStore,
+		engine: createSyncEngine({
+			syncRoot,
+			projectDir: project,
+			projectKey: key,
+			store: memoryStore,
+			backend: remote,
+			device: DEVICE,
+			config,
+			now: NOW,
+		}),
+	};
+}
+
+function withTransport(manifest: SyncManifest, branch = "main", remoteHash = "0".repeat(64)): SyncManifest {
+	return { ...manifest, transport: { remoteHash, branch } };
+}
+
 /** 目录的「名字 + mtime」指纹：用来断言「一个字都没动」。 */
 async function fingerprint(target: string): Promise<Array<[string, number]>> {
 	const out: Array<[string, number]> = [];
@@ -341,6 +403,10 @@ describe("sync engine（假 backend）", () => {
 		expect(res.revision).toBe(remote.revision);
 		const manifest = await readManifest(manifestPath(syncRoot, projectKey));
 		expect(manifest?.base.revision).toBe(remote.revision);
+		expect(manifest?.transport).toEqual({
+			remoteHash: createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex"),
+			branch: "main",
+		});
 		expect(manifest?.files["a.md"].hash).toBe(sha256Hex(raw("A")));
 	});
 
@@ -369,6 +435,10 @@ describe("sync engine（假 backend）", () => {
 
 		const res = await engine.push();
 		expect(res.pushed).toEqual(["B.md"]);
+		expect((await readManifest(manifestPath(syncRoot, projectKey)))?.transport).toEqual({
+			remoteHash: createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex"),
+			branch: "main",
+		});
 		// 名字与 mtime 都没变 = 本轮真的一个字都没写（含 MEMORY.md 没被重写）
 		expect(await fingerprint(projectDir)).toEqual(before);
 		expect(await backupNames(projectDir, "sync")).toEqual([]); // 没有收敛动作 → 不快照
@@ -454,6 +524,10 @@ describe("sync engine（假 backend）", () => {
 			await one.store.applyEntryFiles({ writes: [{ file: "发布状态.md", raw: desktop }], deletes: [] });
 			await writeManifest(manifestPath(one.syncRoot, one.projectKey), {
 				version: MANIFEST_VERSION,
+				transport: {
+					remoteHash: createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex"),
+					branch: "main",
+				},
 				base: { revision: remote.revision, syncedAt: "" },
 				files: {
 					"发布状态.md": {
@@ -833,39 +907,94 @@ describe("sync engine（假 backend）", () => {
 	it("backend 未初始化（ready()=false）→ skipped，且绝不偷偷 init", async () => {
 		remote.initialized = false;
 		const spy = vi.spyOn(remote, "init");
-		expect(await engine.pull()).toMatchObject({
+		const res = await engine.pull();
+		expect(res).toMatchObject({
 			ok: false,
 			skipped: { reason: expect.stringMatching(/not initialized/i) },
 		});
+		// 文案指向配置，而不是那条已经不存在的初始化命令（用户照着敲只会得到「没有这个命令」）
+		expect(res.skipped?.reason).toContain("memory.json");
+		expect(res.skipped?.reason).toContain("sync.remote");
+		expect(res.skipped?.reason).not.toMatch(/sync init command/i);
 		expect(spy).not.toHaveBeenCalled();
 		expect(remote.fetches).toBe(0);
 	});
 
-	it("未配置（enabled 为假 / remote 为空）→ skipped，且不碰远端", async () => {
-		const off = createSyncEngine({
-			syncRoot,
-			projectDir,
-			projectKey,
-			store,
-			backend: remote,
-			device: DEVICE,
-			config: { ...SYNC_CONFIG, enabled: false },
-			now: NOW,
-		});
-		expect(await off.pull()).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
-
-		const noRemote = createSyncEngine({
-			syncRoot,
-			projectDir,
-			projectKey,
-			store,
-			backend: remote,
-			device: DEVICE,
-			config: { ...SYNC_CONFIG, remote: "   " },
-			now: NOW,
-		});
-		expect(await noRemote.push()).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
+	it("未配置（enabled 为假）→ skipped，且不碰远端", async () => {
+		const off = engineWith(remote, { enabled: false });
+		const res = await off.pull();
+		expect(res).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
+		expect(res.skipped?.reason).toContain("memory.json");
 		expect(remote.fetches).toBe(0);
+		off.dispose();
+	});
+
+	it("★未初始化且配置的 remote 为空 → 报「没有地址可初始化」，不偷偷 init", async () => {
+		// 没有地址就无从初始化：这是一条**非致命**提示（指向配置里的 sync.remote），不是故障
+		remote.initialized = false;
+		const spy = vi.spyOn(remote, "init");
+		const eng = engineWith(remote, { remote: "   " });
+
+		const res = await eng.push();
+		expect(res).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
+		expect(res.skipped?.reason).toContain("sync.remote");
+		expect(res.skipped?.reason).toContain("memory.json");
+		expect(res.skipped?.reason).not.toMatch(/sync init command/i);
+		expect(spy).not.toHaveBeenCalled();
+		expect(remote.fetches).toBe(0);
+
+		const report = await eng.status();
+		expect(report.configured).toBe(false);
+		expect(report.initialized).toBe(false);
+		expect(report.errors).toEqual([expect.stringMatching(/not configured/i)]);
+		expect(remote.fetches).toBe(0);
+		eng.dispose();
+	});
+
+	it("★已初始化时配置里的 remote 可以留空：一轮照常跑，status 报的是 origin", async () => {
+		// origin 才是初始化之后的真相来源；配置里的 remote 只是「未初始化时的输入」。
+		// 两边刻意不同：只有这样才能证明报告里那一行不是从配置抄来的。
+		remote.origin = "https://origin.example.invalid/org/proj.git";
+		await remote.write(prefix, "a.md", raw("A"));
+		const eng = engineWith(remote, { remote: "" });
+		await store.addEntry({ name: "B", body: "b" });
+
+		expect(await eng.pull()).toMatchObject({ ok: true, pulled: ["a.md"] });
+		expect(await eng.push()).toMatchObject({ ok: true, pushed: ["B.md"] });
+
+		const report = await eng.status();
+		expect(report.configured).toBe(true);
+		expect(report.initialized).toBe(true);
+		// 载重：这一行来自 getRemote()，而不是构造时的配置值（后者是空串）
+		expect(report.remote).toBe(remote.origin);
+		expect(report.errors).toEqual([]);
+		eng.dispose();
+	});
+
+	it("配置的 remote 与 origin 不一致时，status 报 origin（配置值不再冒充真相）", async () => {
+		remote.origin = "https://origin.example.invalid/elsewhere/proj.git";
+		const report = await engine.status();
+		expect(report.remote).toBe(remote.origin);
+		expect(report.remote).not.toBe(SYNC_CONFIG.remote);
+		// 不一致是**非致命**的：同步继续按 origin 走，报告也不因此多一条错误
+		expect(report.errors).toEqual([]);
+		expect(report.initialized).toBe(true);
+	});
+
+	it("origin 读不出来（null 或抛错）时，status 退回配置值而不让整份报告失败", async () => {
+		// 有人手工删了 origin：那一行没值可填，但 ahead/behind 仍然算得出来
+		remote.origin = null;
+		const report = await engine.status();
+		expect(report.remote).toBe(SYNC_CONFIG.remote);
+		expect(report.initialized).toBe(true);
+		expect(report.errors).toEqual([]);
+
+		// 抛错也不能把整份报告拖下水：status 是干跑的，它的每一段失败都只该变成一条 errors
+		vi.spyOn(remote, "getRemote").mockRejectedValueOnce(new Error("origin is unreadable"));
+		const broken = await engine.status();
+		expect(broken.remote).toBe(SYNC_CONFIG.remote);
+		expect(broken.initialized).toBe(true);
+		expect(broken.errors.join("\n")).toContain("origin is unreadable");
 	});
 
 	it("★\"enabled\": \"false\" 是字符串真值 → 仍按未启用处理，一个字节都不推", async () => {
@@ -1133,6 +1262,9 @@ describe("sync engine（假 backend）", () => {
 	);
 
 	it("status 在未配置时也给出字段齐全的报告（不碰远端）", async () => {
+		// 未初始化 + 空 remote：没有地址可初始化，所以报的是「未配置」
+		remote.initialized = false;
+		const spy = vi.spyOn(remote, "init");
 		const off = createSyncEngine({
 			syncRoot,
 			projectDir,
@@ -1148,6 +1280,7 @@ describe("sync engine（假 backend）", () => {
 		expect(report).toMatchObject({
 			configured: false,
 			initialized: false,
+			// 未初始化时无从问 origin，报的是配置里那个值（哪怕是空的）
 			remote: "   ",
 			branch: "main",
 			projectDir,
@@ -1163,6 +1296,7 @@ describe("sync engine（假 backend）", () => {
 		expect(report.device).toEqual(DEVICE);
 		expect(report.errors).toEqual([expect.stringMatching(/not configured/i)]);
 		expect(remote.fetches).toBe(0);
+		expect(spy).not.toHaveBeenCalled(); // status 永远不初始化
 	});
 
 	it("status 是 dry-run：报出 ahead/behind/conflicts 与范围外路径，且不改任何文件", async () => {
@@ -1232,6 +1366,78 @@ describe("sync engine（假 backend）", () => {
 		const second = await readManifest(manifestPath(syncRoot, projectKey));
 		expect(second?.version).toBe(MANIFEST_VERSION);
 		expect(second?.files["A.md"].hash).toBe(first?.files["A.md"].hash);
+	});
+
+	it.each([
+		{ label: "空的新 origin", unrelated: false },
+		{ label: "无关且非空的新 origin", unrelated: true },
+	])("$label：A 换传输后写入的旧清单绝不删除 B 的未改本地条目", async ({ unrelated }) => {
+		const other = await makeSharedProject("other", "example.com/org/other");
+		await store.addEntry({ name: "A", body: "a" });
+		await other.store.addEntry({ name: "B", body: "b" });
+		expect((await engine.push()).ok).toBe(true);
+		expect((await other.engine.push()).ok).toBe(true);
+		const oldA = await readManifest(manifestPath(syncRoot, projectKey));
+		const oldB = await readManifest(manifestPath(syncRoot, other.projectKey));
+		if (!oldA || !oldB) throw new Error("old baselines were not written");
+
+		// 模拟另一个进程把共享 clone 切到 O2 后，旧轮次才把自己的 O1 清单写回来。
+		remote.origin = join(dir, "new-origin.git");
+		await remote.remove(prefix, "A.md");
+		await remote.remove(other.prefix, "B.md");
+		if (unrelated) await remote.write(other.prefix, "unrelated.md", raw("Unrelated"));
+		await writeManifest(manifestPath(syncRoot, projectKey), withTransport(oldA));
+		await writeManifest(manifestPath(syncRoot, other.projectKey), withTransport(oldB));
+
+		const report = await other.engine.status();
+		expect(report.base).toBeNull();
+		expect(report.errors.join("\n")).toMatch(/transport.*(ignor|reset)/i);
+		const round = await other.engine.pull();
+		expect(round.ok).toBe(true);
+		expect(round.deletedLocal).toEqual([]);
+		expect(await readFile(join(other.projectDir, "B.md"), "utf8")).toContain("b");
+	});
+
+	it("branch 变化同样作废旧基线，不把新分支的空状态解释成本地删除", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		expect((await engine.push()).ok).toBe(true);
+		const old = await readManifest(manifestPath(syncRoot, projectKey));
+		if (!old) throw new Error("old baseline was not written");
+		const actualHash = createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex");
+		await writeManifest(manifestPath(syncRoot, projectKey), withTransport(old, "main", actualHash));
+		await remote.remove(prefix, "A.md");
+		const branchEngine = createSyncEngine({
+			syncRoot,
+			projectDir,
+			projectKey,
+			store,
+			backend: remote,
+			device: DEVICE,
+			config: { ...SYNC_CONFIG, branch: "next" },
+			now: NOW,
+		});
+
+		const round = await branchEngine.pull();
+		expect(round.ok).toBe(true);
+		expect(round.deletedLocal).toEqual([]);
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("a");
+	});
+
+	it("v1 清单在新传输状态下必须被忽略，而不是继续参与删除差集", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		expect((await engine.push()).ok).toBe(true);
+		const path = manifestPath(syncRoot, projectKey);
+		const old = await readManifest(path);
+		if (!old) throw new Error("old baseline was not written");
+		const { transport: _transport, ...v1 } = { ...old, version: 1 };
+		await writeFile(path, JSON.stringify(v1), "utf8");
+		remote.origin = join(dir, "another-origin.git");
+		await remote.remove(prefix, "A.md");
+
+		const round = await engine.pull();
+		expect(round.ok).toBe(true);
+		expect(round.deletedLocal).toEqual([]);
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("a");
 	});
 
 	it("同一台机器上两个项目的引擎可以先后完成同步（根锁不整轮互斥）", async () => {
@@ -1437,6 +1643,12 @@ describe("sync engine（假 backend）", () => {
 			async init(opts: SyncRunOptions) {
 				return remote.init(opts);
 			},
+			async getRemote() {
+				return remote.getRemote();
+			},
+			async setRemote(url: string, opts: SyncRunOptions) {
+				return remote.setRemote(url, opts);
+			},
 			async fetch(scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView> {
 				seen.push({ call: "fetch", timeoutMs: opts.timeoutMs, signal: opts.signal });
 				if (fetchDelayMs > 0) await sleep(fetchDelayMs);
@@ -1486,16 +1698,68 @@ describe("sync engine（假 backend）", () => {
 		eng.dispose();
 	});
 
-	it("★预算耗尽时给出去的也不是 0：子进程的 `timeout: 0` 是「不限时」，必须是「立刻超时」", async () => {
+	it("★传输段吃光整轮预算 → 首次 publish 根本不出发，原因说清是预算耗尽", async () => {
 		const seen: SeenCall[] = [];
 		// fetch 花掉的时间超过整轮预算（离线路径上真会发生：每个子进程各挂满一次）
 		const eng = engineWith(instrumented(seen, 80), { autoTimeoutMs: 20 });
 		await store.addEntry({ name: "A", body: "a" });
 
-		await eng.push();
-		expect(seen.map((item) => item.call)).toEqual(["fetch", "publish"]);
-		expect(seen[0].timeoutMs).toBeGreaterThanOrEqual(1);
-		expect(seen[1].timeoutMs).toBeGreaterThanOrEqual(1); // 不是 0，也不是负数
+		const res = await eng.push();
+		// 载重：没有那一次「带着 1ms 出发」的 publish —— 它必然超时，而用户拿到的是一句
+		// 读起来像传输故障的 “timed out after 1ms”，而不是「预算在发布之前就耗尽了」
+		expect(seen.map((item) => item.call)).toEqual(["fetch"]);
+		expect(remote.publishAttempts).toBe(0);
+		expect(res.ok).toBe(false);
+		expect(res.skipped?.reason).toMatch(/round budget of 20ms ran out before publishing/);
+		expect(res.skipped?.reason).not.toMatch(/timed out after 1ms/);
+		// 部分结果保留：应用段早就跑完了，本地已经收敛（只是没发布出去）
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("name: A");
+		expect(await remote.names(prefix)).toEqual([]);
+		// 交出去的每一份预算都不是 0（子进程的 `timeout: 0` 是「不限时」）
+		for (const call of seen) expect(call.timeoutMs).toBeGreaterThanOrEqual(1);
+		eng.dispose();
+	});
+
+	it("★发布根锁获取期间预算耗尽 → 不调用 publish，失败结果保留已拉取的部分", async () => {
+		const budgetMs = 20;
+		const start = 1_000_000;
+		await remote.write(prefix, "remote.md", raw("Remote"));
+		await store.addEntry({ name: "Local", body: "local" });
+		const eng = engineWith(remote, { autoTimeoutMs: budgetMs });
+		let fetched = false;
+		remote.hooks.onFetch = () => {
+			fetched = true;
+		};
+		// 取锁前时间不变； publish 根锁真正建立后才越过 deadline。这样第一次发布前检查通过，
+		// 锁内若不复查就会把 remainingMs 钳成 1ms 并发起一次本应禁止的发布。
+		const clock = vi.spyOn(Date, "now").mockImplementation(() =>
+			fetched && existsSync(join(syncRoot, "sync.lock")) ? start + budgetMs + 1 : start,
+		);
+		try {
+			const res = await eng.push();
+			expect(remote.publishAttempts).toBe(0);
+			expect(res.ok).toBe(false);
+			expect(res.skipped?.reason).toMatch(/round budget of 20ms ran out before publishing/);
+			expect(res.pulled).toEqual(["remote.md"]);
+			expect(res.pushed).toEqual([]);
+			expect(await readFile(join(projectDir, "remote.md"), "utf8")).toContain("name: Remote");
+			expect(await remote.names(prefix)).toEqual(["remote.md"]);
+		} finally {
+			clock.mockRestore();
+			remote.hooks.onFetch = undefined;
+			eng.dispose();
+		}
+	});
+
+	it("预算耗尽但没有待发布的增量 → 仍然算成功（发布段本来就一个字节也不发）", async () => {
+		const seen: SeenCall[] = [];
+		const eng = engineWith(instrumented(seen, 80), { autoTimeoutMs: 20 });
+		await engine.push(); // 先对齐：本轮没有任何增量
+
+		const res = await eng.push();
+		expect(res.ok).toBe(true);
+		expect(seen.map((item) => item.call)).toEqual(["fetch"]);
+		expect(remote.publishAttempts).toBe(0);
 		eng.dispose();
 	});
 
@@ -1523,7 +1787,13 @@ describe("sync engine（假 backend）", () => {
 			async ready() {
 				return true;
 			},
-			async init() {},
+			async init() {
+				return { revision: "", warnings: [] };
+			},
+			async getRemote() {
+				return null;
+			},
+			async setRemote() {},
 			async fetch(_scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView> {
 				seen.push({ call: "fetch", timeoutMs: opts.timeoutMs, signal: opts.signal });
 				await new Promise<void>((_resolve, reject) => {
@@ -1550,5 +1820,73 @@ describe("sync engine（假 backend）", () => {
 			skipped: { reason: expect.stringMatching(/abort/i) },
 		});
 		expect(eng.inFlight).toBeNull();
+	});
+
+	// ---------------------------------------------------------------------
+	// 收摊之后的入口：一个字节也不得再碰 backend
+	// ---------------------------------------------------------------------
+
+	it("★dispose() 之后 pull/push 不再启动任何 backend I/O，而是交回一句可读的失败", async () => {
+		// 宿主退出路径上最需要的那一句：拆除之后又开始联网，正是它最不能接受的事。
+		// 本地先放一条未发布的记忆：否则「没推出去」可能只是因为本来就没东西可推。
+		await store.addEntry({ name: "A", body: "a" });
+		const eng = engineWith(remote);
+		eng.dispose();
+		const before = { fetches: remote.fetches, publishes: remote.publishAttempts, inits: remote.initCalls };
+
+		for (const round of [await eng.pull(), await eng.push()]) {
+			expect(round.ok).toBe(false);
+			expect(round.skipped?.reason).toMatch(/disposed/i);
+			expect(round.pulled).toEqual([]);
+			expect(round.pushed).toEqual([]);
+			expect(round.revision).toBeUndefined(); // 基线没写，就不报 revision
+		}
+		// 载重：一次远端往返都没发生
+		expect(remote.fetches).toBe(before.fetches);
+		expect(remote.publishAttempts).toBe(before.publishes);
+		expect(remote.initCalls).toBe(before.inits);
+		expect(await remote.names(prefix)).toEqual([]);
+		// 未发布的内容原样留在本地：dispose 不是「丢掉它」，下一次会话照样推得出去
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("name: A");
+	});
+
+	it("★dispose() 之后 status 不抛错，交回字段齐全、只带一条错误的报告", async () => {
+		const eng = engineWith(remote);
+		eng.dispose();
+		const fetches = remote.fetches;
+
+		// 不抛错是硬要求：宿主在退出路径上调它，那里再抛一次就是「退不掉」
+		const report = await eng.status();
+		expect(report.errors).toEqual([expect.stringMatching(/disposed/i)]);
+		// 字段齐全（调用方不必先判「这份报告能不能读」），装配参数那几项仍然是真值
+		expect(report).toMatchObject({
+			initialized: false,
+			branch: SYNC_CONFIG.branch,
+			projectDir,
+			projectKey,
+			base: null,
+			ahead: [],
+			behind: [],
+			conflicts: [],
+			rejected: [],
+			unparsableLocal: [],
+			outOfScopeRemote: [],
+		});
+		expect(report.device).toEqual(DEVICE);
+		// 也不碰 backend（连只读的 ready()/getRemote() 都不问）
+		expect(remote.fetches).toBe(fetches);
+	});
+
+	it("dispose() 之后 noteWrite/flush 也不起新一轮推送（与 pull/push 同一口径）", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		const eng = engineWith(remote);
+		eng.dispose();
+		const before = { fetches: remote.fetches, publishes: remote.publishAttempts };
+
+		eng.noteWrite();
+		expect(await eng.flush()).toBeNull();
+		expect(eng.inFlight).toBeNull();
+		expect(remote.fetches).toBe(before.fetches);
+		expect(remote.publishAttempts).toBe(before.publishes);
 	});
 });

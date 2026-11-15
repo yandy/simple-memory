@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { inspect, promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NonFastForwardError, type SyncRunOptions, type SyncScope } from "../src/sync/backend.js";
-import { createGitSyncBackend, gitAvailable } from "../src/sync/backend-git.js";
+import { NonFastForwardError, type SyncBackend, type SyncRunOptions, type SyncScope } from "../src/sync/backend.js";
+import { type GitSyncBackendOptions, createGitSyncBackend, gitAvailable } from "../src/sync/backend-git.js";
 import { sha256Hex } from "../src/sync/hash.js";
+import { syncLockPath } from "../src/sync/paths.js";
+import { withLock } from "../src/store/fs-lock.js";
 
 const execFileP = promisify(execFile);
 
@@ -76,12 +78,24 @@ describe.skipIf(!GIT)(
 			return stdout.trim();
 		}
 
-		/** 一台设备 = 一个 backend 实例 + 自己的 syncRoot，两台设备指向同一个 bare 远端。 */
-		function device(name: string) {
-			return createGitSyncBackend({ syncRoot: join(dir, name), remote, branch: "main" });
+		/**
+		 * 一台设备 = 一个 backend 实例 + 自己的 syncRoot，两台设备指向同一个 bare 远端。
+		 *
+		 * `memoryRoot` 一律显式给一个**还不存在**的目录：它是共存检查（`<memoryRoot>/.git`）的入参，
+		 * 靠可选参数绕过去的话，那一道数据安全线在这些用例里就从来没被执行过。需要真造一个用户仓库的
+		 * 用例走下面的 `userRepo`。
+		 */
+		function device(name: string, over: Partial<GitSyncBackendOptions> = {}): SyncBackend {
+			return createGitSyncBackend({
+				syncRoot: join(dir, name),
+				memoryRoot: memoryRootOf(name),
+				remote,
+				branch: "main",
+				...over,
+			});
 		}
 
-		async function onlineDevice(name: string) {
+		async function onlineDevice(name: string): Promise<SyncBackend> {
 			const backend = device(name);
 			await backend.init(runOpts);
 			return backend;
@@ -90,6 +104,25 @@ describe.skipIf(!GIT)(
 		/** 某台设备的暂存仓库（脏状态那条用例要直接往里塞垃圾）。 */
 		function repoDir(name: string): string {
 			return join(dir, name, "repo");
+		}
+
+		/** 某台设备的记忆根（默认夹具里它压根不存在：同步不该往记忆根里写任何东西）。 */
+		function memoryRootOf(name: string): string {
+			return join(dir, `${name}-root`);
+		}
+
+		/**
+		 * 造一个「用户自己把记忆根做成了 git 仓库」的现场，返回那个记忆根。
+		 * `remotes` 为空 = 一个 remote 都没有（那不算冲突，见下面的用例）。
+		 */
+		async function userRepo(name: string, remotes: Record<string, string> = {}): Promise<string> {
+			const root = join(dir, name);
+			await mkdir(root, { recursive: true });
+			await fixtureGit(["init", "--quiet", root], dir);
+			for (const [remoteName, url] of Object.entries(remotes)) {
+				await fixtureGit(["remote", "add", remoteName, url], root);
+			}
+			return root;
 		}
 
 		/** 存在性探测：断言「仓库外没多出新文件」时用，比 readdir 的快照稳。 */
@@ -449,11 +482,7 @@ describe.skipIf(!GIT)(
 			// 从没初始化过：远端不存在 → init 必须抛，而且不留半个暂存仓库
 			//（留下了 ready() 就是 true，而 origin 指着错的 URL；用户改对配置后 init 会因幂等直接返回，
 			// 于是同步永远去错的地方）。
-			const bad = createGitSyncBackend({
-				syncRoot: join(dir, "bad"),
-				remote: join(dir, "不存在的.git"),
-				branch: "main",
-			});
+			const bad = device("bad", { remote: join(dir, "不存在的.git") });
 			await expect(bad.init(runOpts)).rejects.toThrow(/不存在的\.git/);
 			expect(await bad.ready()).toBe(false);
 
@@ -675,7 +704,7 @@ describe.skipIf(!GIT)(
 			// 丢掉前者的话，「clone 因超时/盘满失败而远端其实有内容」会被报成「push 被拒」，方向全错。
 			const notARepo = join(dir, "not-a-repo");
 			await mkdir(notARepo, { recursive: true });
-			const bad = createGitSyncBackend({ syncRoot: join(dir, "bad"), remote: notARepo, branch: "main" });
+			const bad = device("bad", { remote: notARepo });
 
 			const err = await bad.init(runOpts).then(
 				() => null,
@@ -695,11 +724,7 @@ describe.skipIf(!GIT)(
 			// 用 127.0.0.1:1（立即 ECONNREFUSED）而不是域名：不依赖 DNS，也不会卡在解析超时上。
 			vi.stubEnv("GIT_TERMINAL_PROMPT", "0");
 			const token = "s3cr3t-token";
-			const bad = createGitSyncBackend({
-				syncRoot: join(dir, "creds"),
-				remote: `https://sync-user:${token}@127.0.0.1:1/o/r.git`,
-				branch: "main",
-			});
+			const bad = device("creds", { remote: `https://sync-user:${token}@127.0.0.1:1/o/r.git` });
 
 			const err = await bad.init(runOpts).then(
 				() => null,
@@ -717,6 +742,319 @@ describe.skipIf(!GIT)(
 			expect(printed).not.toContain(token);
 			expect(printed).toContain("127.0.0.1");
 			expect(await bad.ready()).toBe(false);
+		});
+
+		// -------------------------------------------------------------------
+		// init 的返回值、origin 自省、记忆根仓库的共存检查
+		// -------------------------------------------------------------------
+
+		it("init 交回远端**真的有**的那个 revision（引导提交，或已存在的 head）", async () => {
+			const a = device("a");
+			const first = await a.init(runOpts);
+			expect(first.warnings).toEqual([]);
+			expect(first.revision).toMatch(/^[0-9a-f]{40}$/);
+			// 它不是只在本地：远端那个分支此刻就指在这里（适配层要拿它写首份基线）
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], remote)).toBe(first.revision);
+
+			// 远端已经有内容时，第二台设备 init 交回的是远端那个 head，而不是它自己新造的提交
+			const rev = await a.publish(
+				scope,
+				{ writes: [{ path: "foo.md", content: "正文" }], deletions: [] },
+				{ revision: first.revision },
+				publishOpts,
+			);
+			const second = await device("b").init(runOpts);
+			expect(second.revision).toBe(rev);
+			expect(second.warnings).toEqual([]);
+			// 远端只有两个提交（引导 + 一条内容）：b 的 init 没在上面多造一个
+			expect(await fixtureGit(["rev-list", "--count", "main"], remote)).toBe("2");
+		});
+
+		it("幂等 init：不造第二个提交、不动已有仓库，交回的仍是远端那一个 revision", async () => {
+			const a = await onlineDevice("a");
+			const head = await fixtureGit(["rev-parse", "HEAD"], repoDir("a"));
+			const commits = await fixtureGit(["rev-list", "--count", "main"], remote);
+
+			const again = await a.init(runOpts);
+			expect(again.revision).toBe(head);
+			expect(again.warnings).toEqual([]);
+			expect(await fixtureGit(["rev-parse", "HEAD"], repoDir("a"))).toBe(head);
+			expect(await fixtureGit(["rev-list", "--count", "main"], remote)).toBe(commits);
+		});
+
+		it("setRemote() 切到空 origin 后，幂等 init 交回空 revision 而不是旧 tracking ref", async () => {
+			const a = await onlineDevice("a");
+			const oldRevision = await a.publish(
+				scope,
+				{ writes: [{ path: "old.md", content: "旧远端" }], deletions: [] },
+				{ revision: "" },
+				publishOpts,
+			);
+			const oldCommits = await fixtureGit(["rev-list", "--count", "main"], remote);
+			const other = join(dir, "other-empty.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await a.setRemote(other, runOpts);
+
+			const again = await a.init(runOpts);
+			expect(again.revision).toBe("");
+			expect(again.warnings).toEqual([]);
+			expect(await fixtureGit(["ls-remote", "--heads", other], dir)).toBe("");
+			// 幂等复核既不引导新远端，也不改旧远端或本地提交
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], remote)).toBe(oldRevision);
+			expect(await fixtureGit(["rev-list", "--count", "main"], remote)).toBe(oldCommits);
+			expect(await fixtureGit(["rev-parse", "HEAD"], repoDir("a"))).toBe(oldRevision);
+		});
+
+		it("setRemote() 切到非空 origin 后，幂等 init 交回新 head 且不造提交", async () => {
+			const a = await onlineDevice("a");
+			const oldRevision = await a.publish(
+				scope,
+				{ writes: [{ path: "old.md", content: "旧远端" }], deletions: [] },
+				{ revision: "" },
+				publishOpts,
+			);
+			const other = join(dir, "other-nonempty.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			const seed = device("seed", { remote: other });
+			const seeded = await seed.init(runOpts);
+			const newRevision = await seed.publish(
+				scope,
+				{ writes: [{ path: "new.md", content: "新远端" }], deletions: [] },
+				{ revision: seeded.revision },
+				publishOpts,
+			);
+			const newCommits = await fixtureGit(["rev-list", "--count", "main"], other);
+			await a.setRemote(other, runOpts);
+
+			const again = await a.init(runOpts);
+			expect(again.revision).toBe(newRevision);
+			expect(again.revision).not.toBe(oldRevision);
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], other)).toBe(newRevision);
+			expect(await fixtureGit(["rev-list", "--count", "main"], other)).toBe(newCommits);
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], remote)).toBe(oldRevision);
+		});
+
+		it("构造时没给 remote 而尚未初始化 → init 报一句指向 sync.remote 的错误（不是 git 那句 clone 用法）", async () => {
+			// 适配层重建 backend 时手上的 `sync.remote` 可能就是空的（已初始化时合法），
+			// 而它无法自己分辨「空 remote 但已初始化」与「空 remote 且从未初始化」—— 后者由这里报。
+			const a = device("empty", { remote: "   " });
+			await expect(a.init(runOpts)).rejects.toThrow(/sync\.remote/);
+			expect(await a.ready()).toBe(false);
+		});
+
+		it("getRemote() 读的是 origin；未初始化 / 没有 origin 时为 null", async () => {
+			expect(await device("a").getRemote()).toBe(null);
+
+			const a = await onlineDevice("a");
+			expect(await a.getRemote()).toBe(remote);
+
+			// 有人把 origin 删了（手工动过暂存仓库）：报 null，而不是抛错 ——
+			// 状态报告里那一行没有值可填，不该让整份报告失败
+			await fixtureGit(["remote", "remove", "origin"], repoDir("a"));
+			expect(await a.getRemote()).toBe(null);
+		});
+
+		it("setRemote() 之后 fetch/publish 都走新 origin，构造时的旧 remote 不再覆盖它", async () => {
+			const a = await onlineDevice("a");
+			const rev = await a.publish(
+				scope,
+				{ writes: [{ path: "foo.md", content: "正文" }], deletions: [] },
+				{ revision: "" },
+				publishOpts,
+			);
+
+			const other = join(dir, "other.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await a.setRemote(other, runOpts);
+			expect(await a.getRemote()).toBe(other);
+
+			// 发布走新 origin：旧远端一个字都不再收到
+			const next = await a.publish(
+				scope,
+				{ writes: [{ path: "bar.md", content: "第二条" }], deletions: [] },
+				{ revision: "" },
+				publishOpts,
+			);
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], other)).toBe(next);
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], remote)).toBe(rev);
+			// fetch 同样走新 origin
+			expect((await a.fetch(scope, runOpts)).revision).toBe(next);
+
+			// 载重：换一个**构造参数里仍写着旧 remote** 的实例（适配层每次启动都按配置重建 backend），
+			// origin 仍然是新的 —— 配置值只在 init 时用，旧配置不覆盖已初始化仓库的 origin
+			const stale = device("a");
+			expect(await stale.getRemote()).toBe(other);
+			expect((await stale.fetch(scope, runOpts)).revision).toBe(next);
+		});
+
+		it("setRemote 与传输轮共用根锁：锁忙时有界失败且 origin 不变", async () => {
+			const a = await onlineDevice("a");
+			const other = join(dir, "locked-remote.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await withLock(syncLockPath(join(dir, "a")), "test-holder", { timeoutMs: 1_000 }, async () => {
+				await expect(a.setRemote(other, { timeoutMs: 30 })).rejects.toThrow(/lock/i);
+			});
+			expect(await a.getRemote()).toBe(remote);
+		});
+
+		it("旧 fetch 的 base.remote 与当前 origin 不同 → NonFastForward，绝不写入新远端", async () => {
+			const a = await onlineDevice("a");
+			const oldOrigin = await a.getRemote();
+			if (!oldOrigin) throw new Error("old origin is missing");
+			const other = join(dir, "stale-publish.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await a.setRemote(other, runOpts);
+
+			await expect(
+				a.publish(
+					scope,
+					{ writes: [{ path: "poison.md", content: "旧轮次" }], deletions: [] },
+					{ revision: "", remote: oldOrigin },
+					publishOpts,
+				),
+			).rejects.toBeInstanceOf(NonFastForwardError);
+			expect(await fixtureGit(["ls-remote", "--heads", other], dir)).toBe("");
+
+			const revision = await a.publish(
+				scope,
+				{ writes: [{ path: "fresh.md", content: "新轮次" }], deletions: [] },
+				{ revision: "", remote: other },
+				publishOpts,
+			);
+			expect(revision).toMatch(/^[0-9a-f]{40}$/);
+			expect(await fixtureGit(["ls-tree", "--name-only", "-r", "main"], repoDir("a"))).toContain("fresh.md");
+		});
+
+		it("setRemote()：未初始化时什么都不改（那是配置的活），空地址 fail-closed", async () => {
+			// 未初始化：不报错、也不为此建出半个暂存仓库（否则 ready() 就是 true 了，而 origin 根本不存在）
+			const fresh = device("a");
+			await fresh.setRemote(join(dir, "other.git"), runOpts);
+			expect(await fresh.ready()).toBe(false);
+			expect(await exists(join(dir, "a"))).toBe(false);
+			expect(await fresh.getRemote()).toBe(null);
+
+			const a = await onlineDevice("b");
+			const before = await a.getRemote();
+			for (const bad of ["", "   "]) {
+				await expect(a.setRemote(bad, runOpts)).rejects.toThrow(/empty/i);
+			}
+			// 拒了就是什么都没改：origin 仍指原来那个地址
+			expect(await a.getRemote()).toBe(before);
+		});
+
+		it("★记忆根已经是仓库、且它的某个 remote 与目标相同 → 拒绝初始化，且不留任何产物", async () => {
+			const root = await userRepo("user-same", { origin: remote, backup: join(dir, "elsewhere.git") });
+			const a = device("user-same", { syncRoot: join(root, ".sync"), memoryRoot: root });
+
+			const err = await a.init(runOpts).then(
+				() => null,
+				(e: unknown) => e as Error,
+			);
+			expect(err).toBeInstanceOf(Error);
+			expect(err?.message).toMatch(/same remote/i);
+			expect(err?.message).toContain("origin"); // 点名是哪个 remote 撞上了，用户才改得动
+
+			// 拒绝就是拒绝：既没有暂存 clone，也没有设备身份。否则 ready() 变 true，
+			// 下一次启动会照着那个 origin 继续同步 —— 拒绝分支就成了假话。
+			expect(await a.ready()).toBe(false);
+			expect(await exists(join(root, ".sync"))).toBe(false);
+			// 检查排在 clone 之前：远端上连分支都没被引导出来
+			expect(await fixtureGit(["ls-remote", "--heads", remote], dir)).toBe("");
+			// 用户自己的仓库一个字没动
+			expect(await fixtureGit(["remote", "get-url", "origin"], root)).toBe(remote);
+			expect((await readdir(root)).sort()).toEqual([".git"]);
+		});
+
+		it("同一个远端的另一种写法（file:// 与本地路径）也算相同 → 同样拒绝", async () => {
+			// 比较靠归一化而不是字节相等：同一个仓库的 `file://` 写法与本地路径写法
+			// 必须被当成同一个远端，否则「两个写入者推同一个远端」这条护栏从旁边绕过去了。
+			const root = await userRepo("user-file", { origin: `file://${remote}` });
+			const a = device("user-file", { syncRoot: join(root, ".sync"), memoryRoot: root });
+			await expect(a.init(runOpts)).rejects.toThrow(/same remote/i);
+			expect(await a.ready()).toBe(false);
+			expect(await exists(join(root, ".sync"))).toBe(false);
+		});
+
+		it("记忆根是仓库但指向别处 → 允许初始化，并交回一条「不动用户仓库」的 warning", async () => {
+			const elsewhere = join(dir, "elsewhere.git");
+			await fixtureGit(["init", "--bare", "--quiet", elsewhere], dir);
+			const root = await userRepo("user-other", { origin: elsewhere });
+			await writeFile(join(root, "用户自己的文件.md"), "别动我", "utf8");
+			await fixtureGit(["add", "-A"], root);
+			await fixtureGit(
+				["-c", "user.name=用户", "-c", "user.email=u@example.com", "commit", "--quiet", "-m", "用户自己的提交"],
+				root,
+			);
+			const headBefore = await fixtureGit(["rev-parse", "HEAD"], root);
+
+			const a = device("user-other", { syncRoot: join(root, ".sync"), memoryRoot: root });
+			const result = await a.init(runOpts);
+			expect(result.revision).toMatch(/^[0-9a-f]{40}$/);
+			expect(result.warnings).toHaveLength(1);
+			expect(result.warnings[0]).toMatch(/already a git repository/i);
+			expect(result.warnings[0]).toContain(root); // 得说清是哪个目录，用户才知道在说他的仓库
+			expect(await a.ready()).toBe(true);
+
+			// 用户自己的仓库原样：HEAD、工作树、remote 全没动（同步只在自己的暂存 clone 里干活）
+			expect(await fixtureGit(["rev-parse", "HEAD"], root)).toBe(headBefore);
+			expect(await readFile(join(root, "用户自己的文件.md"), "utf8")).toBe("别动我");
+			expect(await fixtureGit(["remote", "get-url", "origin"], root)).toBe(elsewhere);
+			expect((await readdir(root)).sort()).toEqual([".git", ".sync", "用户自己的文件.md"]);
+		});
+
+		it("记忆根是仓库但一个 remote 都没有 → 不算冲突：允许初始化 + 一条 warning", async () => {
+			// 只有「同一个远端」才会互相覆盖；一个本地仓库（或只指向别处的仓库）与同步各推各的。
+			const root = await userRepo("user-noremote");
+			const a = device("user-noremote", { syncRoot: join(root, ".sync"), memoryRoot: root });
+
+			const result = await a.init(runOpts);
+			expect(result.revision).toMatch(/^[0-9a-f]{40}$/);
+			expect(result.warnings).toHaveLength(1);
+			expect(result.warnings[0]).toMatch(/already a git repository/i);
+			expect(await a.ready()).toBe(true);
+			expect(await exists(join(root, ".sync", "repo", ".git"))).toBe(true);
+		});
+
+		it("★共存检查的文案（拒绝与 warning 两边）都不回显 URL 里的凭据", async () => {
+			const token = "s3cr3t-token";
+			const withCreds = `https://sync-user:${token}@127.0.0.1:1/o/r.git`;
+
+			// 相同远端 → 拒绝，而拒绝文案里带着那个地址
+			const same = await userRepo("user-creds-same", { origin: withCreds });
+			const rejected = device("user-creds-same", {
+				syncRoot: join(same, ".sync"),
+				memoryRoot: same,
+				remote: withCreds,
+			});
+			const err = await rejected.init(runOpts).then(
+				() => null,
+				(e: unknown) => e as Error,
+			);
+			expect(err?.message).toMatch(/same remote/i);
+			expect(err?.message).toContain("127.0.0.1"); // 远端仍然认得出是哪个，只是口令没了
+			expect(err?.message).not.toContain(token);
+			expect(inspect(err, { depth: 4 })).not.toContain(token);
+
+			// 不同远端 → warning，而用户那份带凭据的地址不得从 warning 里泄出去
+			const other = await userRepo("user-creds-other", { origin: withCreds });
+			const warned = device("user-creds-other", {
+				syncRoot: join(other, ".sync"),
+				memoryRoot: other,
+				remote,
+			});
+			const result = await warned.init(runOpts);
+			expect(result.warnings).toHaveLength(1);
+			expect(result.warnings.join("\n")).not.toContain(token);
+			expect(result.warnings.join("\n")).toContain("origin"); // 只报 remote 的**名字**，不报它的地址
+		});
+
+		it("init 不往记忆根里写任何东西（全部状态都在 syncRoot 底下）", async () => {
+			// 默认夹具里的 memoryRoot 压根不存在，而 init 也不应该把它建出来：
+			// 记忆根是用户的数据目录，多一个空目录就会多一处“这是什么”的困惑。
+			const a = await onlineDevice("a");
+			expect(await exists(memoryRootOf("a"))).toBe(false);
+			expect(await readdir(join(dir, "a"))).toEqual(["repo"]);
+			expect(await a.ready()).toBe(true);
 		});
 	},
 );

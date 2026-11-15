@@ -70,18 +70,21 @@ typecheck。`src/host-types.ts` 从 `@deepseek-ai/dsh-agent` 取 `Agent`，而 `
 「只服务一个宿主」的键，只属于那个宿主的配置（pi 侧的 `PiHostConfig`），不得进 `MemoryConfig`。core 的
 配置契约只收两个宿主共有的语义。
 
-执行点两条：
+执行点三条：
 
 - `npm run check:memory-core-deps`（`scripts/check-memory-core-deps.mjs`，CI 的 `test` job）—— 静态检查
   上面三条，`package.json` / `vitest.config.ts` / `tsconfig*.json` 各有一类错误文案。
-- `npm run smoke:registry`（`scripts/registry-smoke.mjs`，CI 的 `registry-smoke` job）—— 把适配层打成
-  tarball 装进干净目录（依赖只从 registry 拉），断言解析到的 core 落在该目录内、版本满足声明的范围、
-  并能真读写。需要先 `npm run build -w memory-core -w dsh-memory`。未发布的适配层
+- `npm run smoke:workspace`（同一脚本带 `--workspace-core`，CI 的 `workspace-smoke` job）—— core 与适配层
+  都取仓内 tarball，在干净目录同时安装，验证仓内发布形态的实际解析；输出明确说 registry 路径未验证。
+- `npm run smoke:registry`（`scripts/registry-smoke.mjs`，CI 的 `registry-smoke` job，只在 main 上跑）——
+  把适配层打成 tarball 装进干净目录（依赖只从 registry 拉），断言解析到的 core 落在该目录内、版本满足
+  声明的范围、并能真读写。需要先 `npm run build -w memory-core -w dsh-memory`。未发布的适配层
   （`private: true`）在 registry 上找不到满足范围的 core 时只打 notice 跳过；去掉 `private` 后同一条件
   变成失败。
 
-CI 的 `test-dist` job 覆盖第三条：`MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到 **仓内** 的
-`memory-core/dist`。`registry-smoke` 补的是它管不到的那一段 —— 用户装到的 core 来自 registry。
+CI 的 `test-dist` job 覆盖仓内 dist：`MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到
+`memory-core/dist`。`workspace-smoke` 覆盖仓内 tarball 的安装解析，`registry-smoke` 再补用户从 registry
+装到 core 的最后一段；三者不互相冒充。
 
 ## 依赖自动更新
 

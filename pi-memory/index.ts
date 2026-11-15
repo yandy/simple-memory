@@ -1,33 +1,49 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionUIContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
-	LOCK_FILE,
-	type LockInfo,
-	MemoryStore,
-	TASKS,
 	buildIndexSection,
 	indexCapacity,
 	indexInjectionCapacity,
-	parseEntryIndex,
+	LOCK_FILE,
+	type LockInfo,
+	MemoryStore,
 	moduleStatusRows,
+	parseEntryIndex,
+	projectIdentity,
 	readLockStatus,
 	resolveMemoryDir,
 	runTask,
+	type SyncRoundResult,
 	scanEntries,
+	syncLockPath,
+	syncRootPath,
+	TASKS,
 	withFsRetry,
 } from "@yandy0725/memory-core";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { legacyMemoryRoot, loadConfig, modelConfigErrors, type LoadedConfig, type MemoryConfig } from "./src/config";
-import { readRecordedMemoryIndex } from "./src/index-source";
-import { detectLegacyMemoryDir } from "./src/legacy-hint";
-import { applyIndexSection, buildInjection } from "./src/inject-pi";
 import { createPiHeadlessAgent } from "./src/agent-runner";
+import { type LoadedConfig, legacyMemoryRoot, loadConfig, type MemoryConfig, modelConfigErrors } from "./src/config";
 import { createPiTranscript } from "./src/host-transcript";
-import { createMemoryTool, type MemoryToolDeps } from "./src/memory-tool";
+import { readRecordedMemoryIndex } from "./src/index-source";
+import { applyIndexSection, buildInjection } from "./src/inject-pi";
+import { detectLegacyMemoryDir } from "./src/legacy-hint";
+import { createMemoryTool, type MemoryToolDeps, type MemoryToolOptions } from "./src/memory-tool";
 import { resolveModel } from "./src/model-resolver";
 import { readDreamMeta, shouldNudge, writeDreamMeta } from "./src/nudge";
 import { searchSessions } from "./src/session-search";
+import {
+	createPiSyncRuntime,
+	type PiSyncRuntime,
+	renderSyncRound,
+	renderSyncStatus,
+	errorMessage as syncErrorMessage,
+} from "./src/sync";
 
 function extractAgentsMdBlocks(systemPrompt: string): string[] {
 	const blocks: string[] = [];
@@ -115,13 +131,12 @@ async function lockStatusLine(memoryDir: string): Promise<string> {
 	return `held by ${describeHolder(status.holder)}`;
 }
 
-/**
- * `/memory unlock`：崩溃遗留的 `.lock` 的**唯一**人工清除入口（spec §19 风险表）。
- * 必须显式 confirm，而且只删 `.lock` 本身 —— 删错了就是两个写入者同时持有锁。
- * confirm 正文在 `held` 时点名持有者：只有人能把「本机已死的进程」与「别的机器正在跑」区分开。
- */
-async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<void> {
-	const lockPath = join(memoryDir, LOCK_FILE);
+/** 两类人工锁恢复共用：显式确认、withFsRetry、ENOENT 幂等，并且只 unlink 目标文件。 */
+async function unlockFile(
+	lockPath: string,
+	ui: ExtensionUIContext,
+	copy: { title: string; noun: string; operation: string; removed: string; failure: string },
+): Promise<void> {
 	const status = await readLockStatus(lockPath);
 	if (status.kind === "absent") {
 		ui.notify("No lock present.", "info");
@@ -129,24 +144,48 @@ async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<
 	}
 	const question =
 		status.kind === "held"
-			? `Remove the memory lock file? It is held by ${describeHolder(status.holder)}. Only do this if no memory operation is running.`
-			: "Remove the memory lock file? Only do this if no memory operation is running.";
-	const ok = await ui.confirm("Memory lock", question);
+			? `Remove the ${copy.noun} file? It is held by ${describeHolder(status.holder)}. Only do this if no ${copy.operation} is running.`
+			: `Remove the ${copy.noun} file? Only do this if no ${copy.operation} is running.`;
+	const ok = await ui.confirm(copy.title, question);
 	if (!ok) return;
 	try {
-		// 恢复路径也要重试：用户正是因为一把可能被瞬时错误困住的锁才走到这里，而删除本身
-		// 同样会被杀软/索引器/同步客户端打断 —— 这里再报一次 EPERM 就是把用户困在原地。
-		// 幂等（删一个已不存在的文件走下面的 ENOENT 分支），重试无副作用。
+		// 恢复路径也要重试：删除本身同样会被杀软/索引器/同步客户端瞬时打断。
 		await withFsRetry(() => unlink(lockPath));
-		ui.notify("Memory lock removed.", "info");
+		ui.notify(copy.removed, "info");
 	} catch (e) {
-		// confirm 到 unlink 之间锁自己消失了：那正是想要的结果
+		// confirm 到 unlink 之间锁自己消失了：那正是想要的结果。
 		if ((e as NodeJS.ErrnoException).code === "ENOENT") {
 			ui.notify("No lock present.", "info");
 			return;
 		}
-		ui.notify(`Failed to remove memory lock: ${(e as Error).message}`, "error");
+		ui.notify(`${copy.failure}: ${(e as Error).message}`, "error");
 	}
+}
+
+/**
+ * `/memory unlock`：崩溃遗留的 `.lock` 的**唯一**人工清除入口（spec §19 风险表）。
+ * 文案与确认语义保持原样；共享 helper 只是让根锁恢复复用同一条安全边界。
+ */
+async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<void> {
+	await unlockFile(join(memoryDir, LOCK_FILE), ui, {
+		title: "Memory lock",
+		noun: "memory lock",
+		operation: "memory operation",
+		removed: "Memory lock removed.",
+		failure: "Failed to remove memory lock",
+	});
+}
+
+/** `/memory sync unlock` 只依赖配置根，不需要 store、device 或 engine。 */
+async function unlockMemorySync(config: MemoryConfig, ui: ExtensionUIContext): Promise<void> {
+	const lockPath = syncLockPath(syncRootPath(resolve(config.memoryDir)));
+	await unlockFile(lockPath, ui, {
+		title: "Memory sync lock",
+		noun: "memory sync lock",
+		operation: "memory sync operation",
+		removed: "Memory sync lock removed.",
+		failure: "Failed to remove memory sync lock",
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -156,6 +195,13 @@ export default function (pi: ExtensionAPI) {
 	let store: MemoryStore | null = null;
 	/** 配置错误态（模型校验失败或初始化失败）。/memory 重复显示它，直到用户改好配置并重启。 */
 	let configError: string | null = null;
+	/** 同步错误是独立的非致命通道：健康 store/tool/index 绝不被它清空。 */
+	let syncError: string | null = null;
+	let syncRuntime: PiSyncRuntime | null = null;
+	/** 每次 session_start 都使上一代的所有异步 continuation 失效。 */
+	let sessionGeneration = 0;
+	/** create 阶段仍成立的错误（如 origin 漂移）；手动恢复成功时只清瞬时错误，保留这些。 */
+	let syncPersistentErrors: string[] = [];
 	let indexSnapshot = "";
 	let toolRegistered = false;
 	let currentCwd = "";
@@ -170,23 +216,50 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const inFlight = new Set<Promise<unknown>>();
 
+	/** 每次 session_start 先收掉旧 runtime；init 阶段 engine 仍为空，也必须 abort。 */
+	function disposeSyncRuntime(target: PiSyncRuntime | null = syncRuntime): void {
+		try {
+			target?.dispose();
+		} catch {
+			/* 同步收摊不得影响新会话 */
+		} finally {
+			// shutdown 可能跨过一个新 session_start：只能清掉自己快照的那一代 runtime。
+			if (syncRuntime === target) syncRuntime = null;
+		}
+	}
+
 	/**
 	 * 清空本 session 的运行时状态。两条早退路径（配置错误 / 初始化失败）共用：
 	 * 残留上一 session 的 store 会让后续写入落到别的项目目录（Plan C ledger R51）。
 	 */
 	function resetSessionState(): void {
+		disposeSyncRuntime();
 		memoryDir = null;
 		store = null;
 		indexSnapshot = "";
 		injectedFiles.clear();
 	}
 
+	function setSyncError(errors: string[]): void {
+		const unique = [...new Set(errors.map((error) => error.trim()).filter((error) => error !== ""))];
+		syncError = unique.length > 0 ? unique.join("\n") : null;
+	}
+
+	function notifySync(ui: ExtensionUIContext | undefined, message: string, level: "info" | "error" = "error"): void {
+		try {
+			ui?.notify(message, level);
+		} catch {
+			/* session 在 await 期间 dispose：同步降级不能因此拖垮宿主 */
+		}
+	}
+
 	/** 统一的配置错误态：记录 → 清空运行时 → 通知。无 UI 时只记录（`/memory` 仍可读到）。 */
-	function failConfig(errors: string[], ctx: ExtensionContext): void {
+	function failConfig(errors: string[], ui: ExtensionUIContext | undefined): void {
 		configError = errors.join("\n");
+		syncError = null;
+		syncPersistentErrors = [];
 		resetSessionState();
-		if (!ctx.hasUI) return;
-		ctx.ui.notify(`pi-memory config error:\n${errors.map((e) => `- ${e}`).join("\n")}`, "error");
+		notifySync(ui, `pi-memory config error:\n${errors.map((e) => `- ${e}`).join("\n")}`);
 	}
 
 	/** 登记一个后台 promise，settle 后自动摘掉；返回同一个 promise 以便调用方继续链式处理。 */
@@ -194,6 +267,22 @@ export default function (pi: ExtensionAPI) {
 		inFlight.add(promise);
 		promise.catch(() => undefined).finally(() => inFlight.delete(promise));
 		return promise;
+	}
+
+	/** 同一个 lock.timeoutMs 有界等待；空闲时连兜底定时器都不创建。 */
+	async function waitForShutdownInFlight(timeoutMs: number): Promise<void> {
+		if (inFlight.size === 0) return;
+		// `Promise.race` 胜出后兜底定时器仍然挂在事件循环上：显式 clear + unref。
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const giveUp = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, timeoutMs);
+			timer.unref?.();
+		});
+		try {
+			await Promise.race([Promise.allSettled([...inFlight]), giveUp]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
 	}
 
 	/**
@@ -216,10 +305,21 @@ export default function (pi: ExtensionAPI) {
 	 * `headless` 每次现造：`ctx.modelRegistry` 来自事件上下文，不在工厂作用域里。
 	 */
 	const piTranscript = createPiTranscript();
-	const headlessFor = (ctx: ExtensionContext) =>
+	/** 主工具与所有 headless 工具共用：保留原回调语义，再通知当前这一代的 engine。 */
+	function buildMemoryTool(spec: MemoryToolOptions = {}): ToolDefinition {
+		return createMemoryTool(toolDeps, {
+			...spec,
+			onWrite: (info) => {
+				spec.onWrite?.(info);
+				syncRuntime?.engine?.noteWrite();
+			},
+		});
+	}
+
+	const headlessFor = (modelRegistry: ExtensionContext["modelRegistry"]) =>
 		createPiHeadlessAgent({
-			modelRegistry: ctx.modelRegistry,
-			buildMemoryTool: (spec) => createMemoryTool(toolDeps, spec),
+			modelRegistry,
+			buildMemoryTool,
 		});
 
 	/**
@@ -229,11 +329,20 @@ export default function (pi: ExtensionAPI) {
 	 * 抛错 = 初始化失败，由调用方转成配置错误态（`configError`）。
 	 * `reason` 只有 `session_start` 会传：resume / fork / reload 用 transcript 的录制值（D14）。
 	 */
-	async function initMemory(ctx: ExtensionContext, reason?: string): Promise<void> {
+	async function initMemory(
+		cwd: string,
+		sessionManager: ExtensionContext["sessionManager"],
+		reason: string | undefined,
+		syncUi: ExtensionUIContext | undefined,
+		generation: number,
+	): Promise<void> {
+		const isCurrent = () => generation === sessionGeneration;
+		if (!isCurrent()) return;
 		// biome-ignore lint/style/noNonNullAssertion: 调用方已通过模型校验
 		const cfg = config!;
-		currentCwd = ctx.cwd;
-		const dir = await resolveMemoryDir(cfg, ctx.cwd);
+		currentCwd = cwd;
+		const dir = await resolveMemoryDir(cfg, cwd);
+		if (!isCurrent()) return;
 		const activeStore = new MemoryStore({
 			memoryDir: dir,
 			indexMaxLines: cfg.memIndexMaxLines,
@@ -243,6 +352,66 @@ export default function (pi: ExtensionAPI) {
 		memoryDir = dir;
 		store = activeStore;
 
+		// 同步配置、init、传输都只是非致命降级。准备与启动收敛全部结束后才选择索引来源：
+		// startup/new 读到同步后的磁盘；resume/fork/reload 仍逐字冻结 transcript 的录制值。
+		const syncErrors: string[] = [];
+		let notifiedSyncErrors = 0;
+		const notifyPendingSyncErrors = (): void => {
+			const pending = syncErrors.slice(notifiedSyncErrors);
+			if (pending.length === 0) return;
+			setSyncError(syncErrors);
+			notifySync(syncUi, `pi-memory sync error:\n${pending.map((error) => `- ${error}`).join("\n")}`);
+			notifiedSyncErrors = syncErrors.length;
+		};
+		try {
+			const identity = await projectIdentity(cwd);
+			if (!isCurrent()) return;
+			const assembled = await createPiSyncRuntime({ config: cfg, store: activeStore, projectDir: dir, identity });
+			if (!isCurrent()) {
+				assembled.runtime?.dispose();
+				return;
+			}
+			syncRuntime = assembled.runtime;
+			syncPersistentErrors = [...assembled.errors];
+			syncErrors.push(...assembled.errors);
+			const activeRuntime = assembled.runtime;
+			if (activeRuntime) {
+				// 自动初始化与启动收敛共用一份预算；prepare 之外绝不再造一份完整网络预算。
+				const startupDeadline = Date.now() + cfg.sync.autoTimeoutMs;
+				const prepared = await activeRuntime.prepare(cfg.sync.autoTimeoutMs);
+				if (!isCurrent()) return;
+				if (!prepared.ok) {
+					syncErrors.push(prepared.reason);
+				} else {
+					if (prepared.warning) {
+						syncErrors.push(prepared.warning);
+						// 首次本地记忆的冲突预告必须发生在任何启动 push 之前，不能等副本已经落盘才说。
+						notifyPendingSyncErrors();
+					}
+					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
+					if (cfg.sync.pullOnStart === true) {
+						const remaining = startupDeadline - Date.now();
+						if (remaining <= 0) {
+							syncErrors.push(
+								`the automatic startup budget of ${cfg.sync.autoTimeoutMs}ms was exhausted during preparation; ` +
+									"startup push was skipped and will run on the next round",
+							);
+						} else {
+							const round = await activeRuntime.runActivity(() => prepared.engine.push(remaining));
+							if (!isCurrent()) return;
+							if (!round.ok) syncErrors.push(round.skipped?.reason ?? "memory sync startup round failed");
+						}
+					}
+				}
+			}
+		} catch (error) {
+			if (!isCurrent()) return;
+			syncErrors.push(error instanceof Error ? error.message : String(error));
+		}
+		if (!isCurrent()) return;
+		// prepare 之后新发生的传输错误按增量通知：早期预告不重复，后续失败也不漏报。
+		notifyPendingSyncErrors();
+
 		// D13 / D14：索引值在整个 session 内**冻结**。resume / fork / reload 必须用 transcript 里的
 		// 录制值 —— 否则被恢复会话的 system prompt 头部会被改写，而 memory_index 是头部的最后一段，
 		// 折叠路径下其后的整段对话全部失去缓存。录制值拿不到（更老的 session、旧 SDK 没有
@@ -250,20 +419,23 @@ export default function (pi: ExtensionAPI) {
 		// 录制值**不再 re-sanitize**：写入当年已经净化过，而 sanitizeForInjection 是幂等的 ——
 		// 保持字节恒等更利于缓存。
 		const useRecorded = reason === "resume" || reason === "fork" || reason === "reload";
-		const recorded = useRecorded ? readRecordedMemoryIndex(ctx.sessionManager) : null;
-		indexSnapshot =
+		const recorded = useRecorded ? readRecordedMemoryIndex(sessionManager) : null;
+		const nextIndex =
 			recorded ?? (await buildIndexSection(activeStore, cfg.memIndexInjectMaxLines, cfg.memIndexInjectMaxBytes));
+		if (!isCurrent()) return;
+		indexSnapshot = nextIndex;
 
 		// register memory tool once
 		if (!toolRegistered) {
 			pi.registerTool(
 				// biome-ignore lint/suspicious/noExplicitAny: pi registerTool type cast
-				createMemoryTool(toolDeps) as any,
+				buildMemoryTool() as any,
 			);
 			toolRegistered = true;
 		}
 	}
 	pi.on("session_start", async (event, ctx) => {
+		const generation = ++sessionGeneration;
 		// 复位必须在**任何可能抛错的调用之前**跑完：冷启动与配置错误会话都要有干净的一次失败通知
 		// 配额、干净的错误态，以及**清空的运行时**。loadConfig（里面的 getAgentDir）与下面的
 		// modelConfigErrors（宿主给的 registry 可能既没有 getAvailable 也没有 getAll）都属于宿主契约
@@ -273,7 +445,15 @@ export default function (pi: ExtensionAPI) {
 		// `configError = null` 是纯防御：所有把 store 置空的路径都会经 failConfig 覆写它，所以这次复位
 		// 本身不可观测 —— 没有测试钉它，删掉也不会让任何用例变红（2026-10-03 final review 的结论）。
 		configError = null;
+		syncError = null;
+		syncPersistentErrors = [];
 		resetSessionState();
+		// 同步段可能等待远端预算：所有宿主值都在其第一个 await 之前快照，之后绝不回读已 dispose 的 ctx。
+		const syncUi = ctx.hasUI ? ctx.ui : undefined;
+		const sessionCwd = ctx.cwd;
+		const sessionManager = ctx.sessionManager;
+		const modelRegistry = ctx.modelRegistry;
+		const startupHeadless = headlessFor(modelRegistry);
 		// `loadConfig` 抛错（`getAgentDir` / `isProjectTrusted` 属宿主契约）与初始化失败同一处理：
 		// 转成配置错误态，不把裸 reject 冒给宿主（spec §2.4）。用局部变量承接是为了让后面的收窄
 		// 不受 `config` 这个工厂作用域 let 影响。（nudge 块仍可能抛错，属既有暴露面，不在本次范围。）
@@ -281,35 +461,41 @@ export default function (pi: ExtensionAPI) {
 		try {
 			loaded = await loadConfig(ctx);
 		} catch (e) {
-			failConfig([`Failed to load memory config: ${e instanceof Error ? e.message : String(e)}`], ctx);
+			if (generation !== sessionGeneration) return;
+			failConfig([`Failed to load memory config: ${e instanceof Error ? e.message : String(e)}`], syncUi);
 			return;
 		}
+		if (generation !== sessionGeneration) return;
 		config = loaded.config;
 		try {
 			// 启动校验（spec §2.3）：模型键缺失 / 不可解析 → 本会话**完全不初始化**
 			//（不解析目录、不建 store、不注册工具），错误态由 `/memory` 重复显示。
 			// 校验本身抛错（registry 不合契约）也走同一个 catch：failConfig 自己会复位运行时。
-			const errors = modelConfigErrors(loaded.config, (value) => resolveModel(value, ctx.modelRegistry) !== undefined);
+			const errors = modelConfigErrors(loaded.config, (value) => resolveModel(value, modelRegistry) !== undefined);
 			if (errors.length > 0) {
-				failConfig(errors, ctx);
+				failConfig(errors, syncUi);
 				return;
 			}
-			await initMemory(ctx, (event as { reason?: string }).reason);
+			await initMemory(sessionCwd, sessionManager, (event as { reason?: string }).reason, syncUi, generation);
 		} catch (e) {
+			if (generation !== sessionGeneration) return;
 			// spec §2.4：初始化失败走同一个错误态，不冒泡给宿主（那只会变成一条裸报错）。
-			failConfig([`Failed to initialize memory: ${e instanceof Error ? e.message : String(e)}`], ctx);
+			failConfig([`Failed to initialize memory: ${e instanceof Error ? e.message : String(e)}`], syncUi);
 			return;
 		}
+		if (generation !== sessionGeneration) return;
 
 		// nudge
 		// 先拷到 const：initMemory 里赋的值，TS 在本函数的控制流里看不到收窄。
 		const nudgeDir = memoryDir;
-		if (ctx.hasUI && nudgeDir) {
+		if (syncUi && nudgeDir) {
 			// 同步段快照：shouldNudge / confirm 之后的 fire-and-forget 链不再碰 ctx（见 notifyDream）。
-			const ui = ctx.ui;
-			const { nudge, message, sessions } = await shouldNudge(nudgeDir, loaded.host, ctx.cwd);
+			const ui = syncUi;
+			const { nudge, message, sessions } = await shouldNudge(nudgeDir, loaded.host, sessionCwd);
+			if (generation !== sessionGeneration) return;
 			if (nudge) {
 				const ok = await ui.confirm("Memory Consolidation", `${message}\n\nConsolidate memory files now?`);
+				if (generation !== sessionGeneration) return;
 				// dream 需要 store（整轮逻辑锁 + 快照都挂在它上面）；这里必然非空，但 const 拷贝让 TS 也能看到。
 				const activeStore = store;
 				if (ok && activeStore) {
@@ -321,7 +507,7 @@ export default function (pi: ExtensionAPI) {
 					const dreamRun = runTask(
 						TASKS.dream,
 						{},
-						{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } },
+						{ cfg: config, cwd: dir, store: activeStore, ports: { headless: startupHeadless } },
 					);
 					ui.setStatus("dream", "Consolidating memory...");
 					// dream 的 7 个 action 只注入它自己的 headless 子会话；整轮持锁与进入时的
@@ -353,6 +539,7 @@ export default function (pi: ExtensionAPI) {
 		// 先拷到 const：`store` 是工厂作用域的 let，在异步回调里 TS 不会保留它的外层收窄。
 		const activeStore = store;
 		if (!config || !memoryDir || !activeStore) return;
+		const headless = headlessFor(ctx.modelRegistry);
 
 		// 索引 section：**每一轮无条件**写入冻结值（含 resume / fork / reload）。
 		// 省略这个键 = pi 的 diffSystemPromptSections 生成 { memory_index: null } = 把索引从
@@ -378,7 +565,7 @@ export default function (pi: ExtensionAPI) {
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
 						{ userPrompt: event.prompt.slice(0, 4000), injectedFiles, manifest },
-						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless: headlessFor(ctx) } },
+						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless } },
 					);
 					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
 					if (content !== "") {
@@ -414,21 +601,69 @@ export default function (pi: ExtensionAPI) {
 		indexSnapshot = await buildIndexSection(activeStore, config.memIndexInjectMaxLines, config.memIndexInjectMaxBytes);
 	});
 
-	// spec §10：退出前等在途写操作收尾（上限 lock.timeoutMs），避免留下 stale 锁。
-	pi.on("session_shutdown", async () => {
-		if (inFlight.size === 0) return;
-		// `Promise.race` 胜出后兜底定时器仍然挂在事件循环上（最长 lock.timeoutMs）：宿主从
-		// main() 返回后靠事件循环自然 drain 退出，漏一个定时器就把退出拖满超时。显式 clear +
-		// unref —— 这条路径必须不留下任何定时器。
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const giveUp = new Promise<void>((resolve) => {
-			timer = setTimeout(resolve, config?.lock.timeoutMs ?? 5000);
-			timer.unref?.();
-		});
+	// spec §10：所有 reason 共用同一条退出兜底；不按 quit/new/resume/fork/reload 分支。
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// 同步段快照：后续 await 之后绝不回读可能已 dispose 的 ExtensionContext。
+		const runtime = syncRuntime;
+		const engine = runtime?.engine ?? null;
+		const cfg = config;
+		const timeoutMs = cfg?.lock.timeoutMs ?? 5000;
+		let ui: ExtensionUIContext | undefined;
 		try {
-			await Promise.race([Promise.allSettled([...inFlight]), giveUp]);
-		} finally {
-			if (timer !== undefined) clearTimeout(timer);
+			ui = ctx.hasUI ? ctx.ui : undefined;
+		} catch {
+			/* session 已经 dispose：只走无 UI 收尾 */
+		}
+
+		// 先登记已有的同步轮，再启动 flush；两者都进入既有账本，并共享 lock.timeoutMs 上限。
+		const existing = engine?.inFlight;
+		if (existing) track(existing);
+		const hadWorkBeforeFlush = inFlight.size > 0;
+		let flushPromise: Promise<SyncRoundResult | null> | null = null;
+		let flushSettled = false;
+		let flushWarningShown = false;
+		const warnFlush = (reason: string): void => {
+			if (flushWarningShown) return;
+			flushWarningShown = true;
+			notifySync(ui, `Memory sync flush failed: ${reason}; local changes will be retried at the next session start.`);
+		};
+		if (engine && cfg && runtime) {
+			try {
+				flushPromise = runtime.runActivity(() => engine.flush(cfg.sync.autoTimeoutMs));
+			} catch (error) {
+				flushPromise = Promise.reject(error);
+			}
+			const activeFlush = flushPromise;
+			track(activeFlush);
+			// null 只表示没有可回报的结果；只有明确的 ok:false / rejection 才进入失败通知。
+			void activeFlush.then(
+				(result) => {
+					flushSettled = true;
+					if (result !== null && !result.ok) warnFlush(result.skipped?.reason ?? "unknown sync flush failure");
+				},
+				(error: unknown) => {
+					flushSettled = true;
+					warnFlush(error instanceof Error ? error.message : String(error));
+				},
+			);
+		}
+
+		if (hadWorkBeforeFlush) {
+			await waitForShutdownInFlight(timeoutMs);
+		} else if (flushPromise) {
+			// 干净 engine 的 flush 已 resolve：让 track 的清理链先跑完，不为空转创建一个 give-up timer。
+			await Promise.resolve();
+			await Promise.resolve();
+			await waitForShutdownInFlight(timeoutMs);
+		}
+		if (flushPromise && !flushSettled) warnFlush("shutdown timed out while waiting for memory sync");
+
+		// 中止超时残留；绝不能 dispose 新 session 的 runtime，也不能在 dispose 后再调用 flush。
+		disposeSyncRuntime(runtime);
+		const leftover = engine?.inFlight;
+		if (leftover) {
+			track(leftover);
+			await waitForShutdownInFlight(timeoutMs);
 		}
 	});
 
@@ -463,7 +698,12 @@ export default function (pi: ExtensionAPI) {
 					written += 1;
 				},
 			},
-			{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx), transcript: piTranscript } },
+			{
+				cfg: config,
+				cwd: dir,
+				store: activeStore,
+				ports: { headless: headlessFor(ctx.modelRegistry), transcript: piTranscript },
+			},
 		);
 		track(extractRun);
 		// 用两参 `.then`（而不是 `.then().catch()`）：成功通知自己抛错只会进它自己的分支，
@@ -493,9 +733,177 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
+	const SYNC_USAGE =
+		'Usage: /memory sync [status] | pull | push | remote <url> | unlock. Initialization is automatic; set "sync.enabled" and "sync.remote" in memory.json.';
+
+	function showSyncConfigError(ui: ExtensionUIContext): boolean {
+		if (!configError) return false;
+		notifySync(ui, `Memory sync unavailable:\n${configError}`, "info");
+		return true;
+	}
+
+	function showSyncUnavailable(ui: ExtensionUIContext): void {
+		if (showSyncConfigError(ui)) return;
+		notifySync(
+			ui,
+			syncError
+				? `Memory sync unavailable:\n${syncError}`
+				: 'Memory sync unavailable: sync is not enabled; set "sync.enabled" and "sync.remote" in memory.json.',
+			"info",
+		);
+	}
+
+	/** 严格 dry-run：engine 尚未准备时只读 ready/origin，绝不 prepare/init 或创建 device/manifest。 */
+	async function showMemorySyncStatus(ctx: ExtensionContext): Promise<void> {
+		const ui = ctx.ui;
+		const cfg = config;
+		const activeRuntime = syncRuntime;
+		if (!cfg || !activeRuntime) {
+			showSyncUnavailable(ui);
+			return;
+		}
+		try {
+			await activeRuntime.runActivity(async () => {
+				const engine = activeRuntime.engine;
+				if (!engine) {
+					const initialized = await activeRuntime.backend.ready();
+					if (!initialized) {
+						notifySync(
+							ui,
+							'Memory sync is not initialized: set "sync.remote" in memory.json; initialization runs at session start, or use /memory sync pull to retry.',
+							"info",
+						);
+						return;
+					}
+					const origin = await activeRuntime.backend.getRemote();
+					notifySync(
+						ui,
+						syncErrorMessage(
+							[
+								"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
+								`Origin: ${origin ?? "(not set)"}`,
+								`Configured remote: ${typeof cfg.sync.remote === "string" && cfg.sync.remote.trim() !== "" ? cfg.sync.remote : "(not set)"}`,
+							].join("\n"),
+						),
+						"info",
+					);
+					return;
+				}
+				const report = await engine.status(cfg.sync.timeoutMs);
+				notifySync(ui, renderSyncStatus(report, typeof cfg.sync.remote === "string" ? cfg.sync.remote : ""), "info");
+			});
+		} catch (error) {
+			notifySync(ui, `Memory sync status failed: ${syncErrorMessage(error)}`);
+		}
+	}
+
+	async function runMemorySyncRound(kind: "pull" | "push", ctx: ExtensionContext): Promise<void> {
+		const ui = ctx.ui;
+		const cfg = config;
+		const activeRuntime = syncRuntime;
+		if (!cfg || !activeRuntime) {
+			showSyncUnavailable(ui);
+			return;
+		}
+		try {
+			await activeRuntime.runActivity(async () => {
+				const prepared = await activeRuntime.prepare(cfg.sync.timeoutMs);
+				if (!prepared.ok) {
+					setSyncError([...syncPersistentErrors, prepared.reason]);
+					notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(prepared.reason)}`);
+					return;
+				}
+				if (prepared.warning) {
+					// 手动恢复也必须先让人看到预告，再执行会产生/发布副本的那一轮。
+					notifySync(ui, `Memory sync ${kind} preparation:\n${syncErrorMessage(prepared.warning)}`, "info");
+				}
+				const round = await prepared.engine[kind](cfg.sync.timeoutMs);
+				const errors = [...syncPersistentErrors];
+				if (prepared.warning) errors.push(prepared.warning);
+				if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
+				setSyncError(errors);
+				const rendered = renderSyncRound(round);
+				if (!round.ok) {
+					notifySync(
+						ui,
+						`Memory sync ${kind} failed: ${syncErrorMessage(round.skipped?.reason ?? "unknown sync failure")}\n${rendered}`,
+					);
+					return;
+				}
+				notifySync(ui, `Memory sync ${kind}:\n${rendered}`, "info");
+			});
+		} catch (error) {
+			const reason = syncErrorMessage(error);
+			setSyncError([...syncPersistentErrors, reason]);
+			notifySync(ui, `Memory sync ${kind} failed: ${reason}`);
+		}
+	}
+
+	async function changeMemorySyncRemote(remote: string, ctx: ExtensionContext): Promise<void> {
+		const ui = ctx.ui;
+		const cfg = config;
+		const activeRuntime = syncRuntime;
+		if (!cfg || !activeRuntime) {
+			showSyncUnavailable(ui);
+			return;
+		}
+		try {
+			const prepared = await activeRuntime.changeRemote(remote, cfg.sync.timeoutMs);
+			const errors = [...syncPersistentErrors];
+			if (prepared.ok && prepared.warning) errors.push(prepared.warning);
+			if (!prepared.ok) errors.push(prepared.reason);
+			setSyncError(errors);
+			if (!prepared.ok) {
+				notifySync(ui, `Memory sync remote failed: ${syncErrorMessage(prepared.reason)}`);
+				return;
+			}
+			if (prepared.warning) {
+				notifySync(ui, `Memory sync remote preparation:\n${syncErrorMessage(prepared.warning)}`, "info");
+			}
+			notifySync(
+				ui,
+				`Memory sync remote: ${syncErrorMessage(remote)}\nOrigin changed and this project's baseline was reset; memory.json was not modified.`,
+				"info",
+			);
+		} catch (error) {
+			const reason = syncErrorMessage(error);
+			setSyncError([...syncPersistentErrors, reason]);
+			notifySync(ui, `Memory sync remote failed: ${reason}`);
+		}
+	}
+
 	pi.registerCommand("memory", {
 		description: "Show memory status or remove a stale lock",
 		handler: async (args, ctx) => {
+			const parts = args.trim() === "" ? [] : args.trim().split(/\s+/);
+			if (parts[0] === "sync") {
+				const subcommand = parts[1] ?? "status";
+				// 根锁恢复只依赖配置根；模型错误绝不能把唯一人工恢复入口一并禁掉。
+				if (subcommand === "unlock" && parts.length === 2 && config) {
+					await unlockMemorySync(config, ctx.ui);
+					return;
+				}
+				// 其他 sync 命令必须先暴露真实配置错误，不能落成笼统的 not enabled。
+				if (showSyncConfigError(ctx.ui)) return;
+				if (!config) {
+					notifySync(ctx.ui, "Memory not initialized; start a session before using /memory sync.", "info");
+					return;
+				}
+				if (subcommand === "status" && parts.length <= 2) {
+					await showMemorySyncStatus(ctx);
+					return;
+				}
+				if ((subcommand === "pull" || subcommand === "push") && parts.length === 2) {
+					await runMemorySyncRound(subcommand, ctx);
+					return;
+				}
+				if (subcommand === "remote" && parts.length === 3) {
+					await changeMemorySyncRemote(parts[2], ctx);
+					return;
+				}
+				notifySync(ctx.ui, SYNC_USAGE, "info");
+				return;
+			}
 			// 配置都读不出来（`loadConfig` 抛错）时也要报真实原因，而不是笼统的「未初始化」——
 			// `/memory` 是重读错误态的唯一入口。首次会话就失败时 `config` 仍是 null，所以这里先看错误态。
 			if (!config) {
@@ -554,6 +962,11 @@ export default function (pi: ExtensionAPI) {
 				`Last dream: ${(await readDreamMeta(dir))?.lastDreamAt ?? "never"}`,
 				`Lock: ${await lockStatusLine(dir)}`,
 			];
+			// 默认未启用时保留既有 7 行状态；启用/降级后追加同步段，且不调用 engine.status/init。
+			if (syncRuntime || syncError) {
+				summaryLines.push(`Sync: ${syncRuntime?.engine ? "ready" : syncRuntime ? "not initialized" : "disabled"}`);
+				if (syncError) summaryLines.push(...syncError.split("\n").map((error) => `- ${error}`));
+			}
 			// 2.x 数据根的迁移提示：只提示、不动数据。探测失败不得让 `/memory` 报错 ——
 			// 状态块本身才是这个命令的交付物。
 			try {
@@ -585,16 +998,13 @@ export default function (pi: ExtensionAPI) {
 			// 完成回调里的 `SessionManager.list` 在 await 之后才读它（见 notifyDream 的说明）。
 			const ui = ctx.hasUI ? ctx.ui : undefined;
 			const cwd = ctx.cwd;
+			const headless = headlessFor(ctx.modelRegistry);
 			const ok = await ctx.ui.confirm("Dream", "Consolidate all memory files? This rewrites them in-place.");
 			if (!ok) return;
 			const dir = memoryDir;
 			// `runTask` 是 async：缺模型不在这里同步抛，而是作为 rejection 走下面的两参
 			// `.then` 失败分支（报「Dream failed」）；状态行由 `.finally` 兜底清除，不会残留。
-			const dreamRun = runTask(
-				TASKS.dream,
-				{},
-				{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } },
-			);
+			const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless } });
 			ui?.setStatus("dream", "Consolidating memory...");
 			track(dreamRun);
 			void dreamRun

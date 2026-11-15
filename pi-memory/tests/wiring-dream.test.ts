@@ -5,7 +5,7 @@
  */
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, flush, resetWiringMocks, runTaskMock, setupSession, shouldNudgeMock, uiCtx, waitFor, writeDreamMetaMock } from "./helpers/wiring-harness";
+import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, enableTestSync, flush, resetWiringMocks, runTaskMock, setupSession, shouldNudgeMock, syncEngines, uiCtx, waitFor, writeDreamMetaMock } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { DREAM_ACTIONS, TASKS } from "@yandy0725/memory-core";
 
@@ -20,6 +20,7 @@ describe("index wiring — dream", () => {
 	});
 
 	afterEach(async () => {
+		for (const engine of syncEngines) engine.dispose();
 		await s.cleanup();
 	});
 
@@ -287,8 +288,60 @@ describe("index wiring — dream", () => {
 			actions: DREAM_ACTIONS,
 			skipLogicalLock: true,
 			skipSnapshot: true,
+			onWrite: expect.any(Function),
 		});
 		// 与主 agent 注册用的是同一份 deps（否则 /memory 的状态与工具看到的 store 会分家）
 		expect(dreamCall?.[0]).toBe(createMemoryToolSpy.mock.calls[0][0]);
+	});
+
+	it("dream rename/rebuild compose the original onWrite before the current engine noteWrite", async () => {
+		await enableTestSync(s);
+		runTaskMock.mockImplementationOnce(() => new Promise(() => {}));
+		const { pi, commands, handlers, tools } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+		const engine = syncEngines.at(-1);
+		if (!engine) throw new Error("sync engine was not prepared");
+		const noteWrite = vi.spyOn(engine, "noteWrite");
+		await tools[0].execute(
+			"seed",
+			{ action: "add", name: "A", description: "d", content: "body" },
+			undefined,
+			undefined,
+			undefined,
+		);
+		noteWrite.mockClear();
+		createMemoryToolSpy.mockClear();
+
+		await commands["dream"].handler(
+			"",
+			s.uiCtx({ hasUI: true, ui: { notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } }),
+		);
+		const ports = runTaskMock.mock.calls[0][2].ports;
+		const originalOnWrite = vi.fn();
+		await expect(
+			ports.headless.run({
+				task: "t",
+				cwd: s.dir,
+				model: "nope/not-resolvable",
+				builtinTools: "none",
+				memoryTool: {
+					actions: DREAM_ACTIONS,
+					skipLogicalLock: true,
+					skipSnapshot: true,
+					onWrite: originalOnWrite,
+				},
+			}),
+		).rejects.toThrow(/not resolvable/);
+		const callIndex = createMemoryToolSpy.mock.calls.findIndex((c: any[]) => c[1]?.skipSnapshot === true);
+		const dreamTool = createMemoryToolSpy.mock.results[callIndex].value;
+
+		await dreamTool.execute("rename", { action: "rename", name: "A", new_name: "B" }, undefined, undefined);
+		await dreamTool.execute("rebuild", { action: "rebuild_index" }, undefined, undefined);
+
+		expect(originalOnWrite.mock.calls).toEqual([[{ action: "rename", name: "A" }], [{ action: "rebuild_index" }]]);
+		expect(noteWrite).toHaveBeenCalledTimes(2);
+		expect(originalOnWrite.mock.invocationCallOrder[0]).toBeLessThan(noteWrite.mock.invocationCallOrder[0]);
+		expect(originalOnWrite.mock.invocationCallOrder[1]).toBeLessThan(noteWrite.mock.invocationCallOrder[1]);
 	});
 });

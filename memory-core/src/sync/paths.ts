@@ -1,5 +1,6 @@
-import { join } from "node:path";
-import { projectDirName } from "../store/paths.js";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { normalizeRemoteUrl, projectDirName } from "../store/paths.js";
 
 /**
  * 远端的项目布局恒用 POSIX 命名规则，与宿主平台无关。
@@ -15,6 +16,30 @@ export function remoteProjectKey(identityKey: string): string {
 	// `NodeJS.Platform` 没有 `posix` 这个值，而 `projectDirName` 只在 win32 上分支 ——
 	// 取任一非 win32 值（与 `store/paths.ts` 的测试同用 `linux`）得到的就是 POSIX 规则。
 	return projectDirName(identityKey, { platform: "linux" });
+}
+
+/**
+ * 两个 remote 是否指向「同一个地方」。
+ *
+ * `normalizeRemoteUrl` 统一处理 http(s)/ssh/git 与 scp 写法；`file://` 与本地路径按 resolved 字节比较。
+ * 这是初始化共存检查与宿主配置漂移提示共用的唯一实现：两份比较器一旦漂移，一边会误拒初始化，
+ * 另一边却可能连提醒都不给。比不出来宁可归成「不同」（多一条 warning），不要拿猜测去拒绝用户。
+ */
+export function sameSyncRemote(left: string, right: string): boolean {
+	const key = (value: string): string => {
+		const normalized = normalizeRemoteUrl(value);
+		if (normalized !== null) return `url:${normalized}`;
+		const raw = value.trim();
+		if (/^file:\/\//i.test(raw)) {
+			try {
+				return `path:${resolve(fileURLToPath(raw))}`;
+			} catch {
+				return `path:${resolve(raw.replace(/^file:\/\//i, ""))}`;
+			}
+		}
+		return `path:${resolve(raw)}`;
+	};
+	return key(left) === key(right);
 }
 
 /**
@@ -58,17 +83,32 @@ export const SYNC_DIR_NAME = ".sync";
  *
  * **入参是记忆根，不是某个项目的记忆目录**，也就是 `config.memoryDir` / {@link defaultMemoryRoot}
  * 那一个（`resolveMemoryDir` 在它下面再派生出 `<kind>/<项目>` 两层）。这两者在代码里都叫过
- * 「memoryDir」，传错的后果不报错、只是静默变形：
+ * 「memoryDir」，传错**不会报错**，只会静默降级，而且**没有任何测试会红**（这正是它危险的地方）：
  *
  * - `.sync` 是**整棵树共享一份**的状态：设备身份（`<hostname>-<id>`）、基线 manifest、以及那一个
  *   git 克隆（远端按 `git/<项目 key>/` 前缀区分项目）。传项目目录的话，每个项目各自克隆一遍整个
- *   远端、各自生成一份设备身份 —— 同一台机器在 `git log` 里变成好几台设备，冲突副本的归属也就废了。
- * - 那份状态还会被算进项目目录的内容里（备份排除清单、`snapshotFiles` 扫的就是这一层）。
+ *   远端、各自生成一份设备身份、各自持一把根锁 —— 同一台机器在 `git log` 里变成好几台设备，
+ *   磁盘上多出 N 份整棵树大小的副本，而「一份 clone 服务全部项目」这个前提也没了。
+ * - 扫描器**看不见**它：`.sync` 以点开头，而 `#entryFiles` / `scanLocalEntries` / `snapshotFiles`
+ *   全都按「非点开头」过滤，所以没有任何扫描会把这份误放的状态报出来。别指望「跑一次测试或
+ *   看一次备份清单就能发现」。
  *
  * 所以参数名刻意不叫 `memoryDir`：调用点写出来必须看得出传的是根。
  */
 export function syncRootPath(memoryRoot: string): string {
 	return join(memoryRoot, SYNC_DIR_NAME);
+}
+
+/**
+ * 根级 sync 锁的路径：`<syncRoot>/sync.lock`。
+ *
+ * 引擎的传输段与发布段各取一次这把锁（两段之间放开），而适配层还需要一个「清除遗弃根锁」的
+ * 入口：`tryWithLock` 对遗弃锁是**抛错**而不是返回 null（刻意设计），所以一次崩溃会让此后每一轮
+ * 同步都失败，而那句 “delete the file to clear it” 没人够得着。两边必须算出**同一个文件** ——
+ * 各自拼字符串的话，那条命令删的是一个没人用的文件，而真正卡住的锁永远在那里。
+ */
+export function syncLockPath(syncRoot: string): string {
+	return join(syncRoot, "sync.lock");
 }
 
 /** 项目内某个文件在远端的路径。 */

@@ -240,10 +240,45 @@ describe("sync 配置", () => {
 		expect(DEFAULT_CONFIG.sync.remote).toBe("");
 	});
 
-	it("syncConfigErrors：enabled 而 remote 为空 → 一条可读错误", () => {
-		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true } }))).toEqual([
-			'sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"',
+	it("syncConfigErrors：enabled 而 remote 为空 → 一条指向 memory.json 的可读错误", () => {
+		const errors = syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true } }));
+		expect(errors).toEqual([
+			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
 		]);
+		// 初始化不是一条命令（它在启动路径上自动发生）：文案再把用户指向那条已移除的命令，
+		// 他敲下去只会得到「没有这个命令」，而真正该改的那个键一个字都没提到。
+		expect(errors[0]).not.toMatch(/sync init command/i);
+		expect(errors[0]).toContain("memory.json");
+	});
+
+	// 已初始化之后，origin 才是「同步到底去哪儿」的真相来源，配置里的 remote 只是「未初始化时的输入」。
+	it("★{ initialized: true } 只豁免空字符串 remote，其余键与非字符串 remote 照旧校验", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true, remote: "" } });
+		expect(syncConfigErrors(cfg, { initialized: true })).toEqual([]);
+		expect(syncConfigErrors(cfg, { initialized: false })).toHaveLength(1);
+		// 省略 options = 未初始化：既有调用点仍要求配置 remote
+		expect(syncConfigErrors(cfg)).toHaveLength(1);
+
+		// 放宽的只有 remote 这一条：branch 与三个时限键仍然照旧报（顺序也仍然固定）
+		const broken = mergeConfig(DEFAULT_CONFIG, {
+			sync: { enabled: true, remote: "", branch: "", pushDebounceMs: -1 },
+		});
+		const errors = syncConfigErrors(broken, { initialized: true });
+		expect(errors).toHaveLength(2);
+		expect(errors[0]).toContain('"sync.branch"');
+		expect(errors[1]).toContain('"sync.pushDebounceMs"');
+		expect(errors.join("\n")).not.toContain('"sync.remote"');
+
+		// 豁免只针对空字符串：非字符串仍是配置类型错误，不能因为已初始化就静默通过
+		expect(
+			syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true, remote: 42 } }), { initialized: true }),
+		).toEqual([
+			'sync is enabled but "sync.remote" must be a string (got 42) — set a remote URL or unset "sync.enabled"',
+		]);
+		// 开关本身仍然是无条件校验的：`initialized` 只放宽 remote，不放宽同意边界
+		expect(
+			syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: "false" } }), { initialized: true }),
+		).toHaveLength(1);
 	});
 
 	it("未启用 → 空数组（remote 为空也不报）", () => {
@@ -284,13 +319,13 @@ describe("sync 配置", () => {
 		]);
 	});
 
-	// 非字符串的远端同样按「空」报，而不是在 `.trim()` 上抛错。
-	it("remote 不是字符串时按空报错，不抛 TypeError", () => {
+	// 非字符串是类型错误，不是「空字符串」：报错要指出真实原因，同时不在 `.trim()` 上抛错。
+	it("remote 不是字符串时按类型报错，不抛 TypeError", () => {
 		const cfg = mergeConfig(DEFAULT_CONFIG, {
 			sync: { enabled: true, remote: 42, branch: "main" },
 		});
 		expect(syncConfigErrors(cfg)).toEqual([
-			'sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"',
+			'sync is enabled but "sync.remote" must be a string (got 42) — set a remote URL or unset "sync.enabled"',
 		]);
 	});
 
