@@ -2,7 +2,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { SyncConfig } from "../config.js";
 import { type ParsedEntryFile, parseEntryFile } from "../store/entry-file.js";
-import { isEntryFileName } from "../store/filename.js";
+import { isEntryFileNameForWrite } from "../store/filename.js";
 import { tryWithLock } from "../store/fs-lock.js";
 import { type ApplyChange, type ApplyResult, BACKUP_DIR, INDEX_FILE, type MemoryStore } from "../store/memory-store.js";
 import { createSnapshot } from "../store/snapshot.js";
@@ -82,8 +82,8 @@ export interface SyncRoundResult {
 	conflicts: Array<{ file: string; keptAsNew: string }>;
 	/** 被拒收的内容（远端那份解析不出、`modified` 形状不对、文件名碰撞……），带原因。
 	 *  原因词与 `applyEntryFiles` 同一口径：引擎自己判定的那几种是**稳定词汇**
-	 * （`unparsable frontmatter` / `invalid modified`），异常路径（读不到字节、冲突没收敛掉）
-	 * 则直接把底层错误拼进去 —— 那些不是词汇，是诊断信息。 */
+	 * （`unparsable frontmatter` / `invalid modified` / `unpublishable file name`），异常路径（读不到字节、
+	 * 冲突没收敛掉）则直接把底层错误拼进去 —— 那些不是词汇，是诊断信息。 */
 	rejected: Array<{ file: string; reason: string }>;
 	/** 本地解析不出/读不了的 `.md`：本轮不参与判定，但必须让用户知道它没同步。 */
 	unparsableLocal: string[];
@@ -197,6 +197,14 @@ function isIsoModified(value: string): boolean {
 function describeError(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
+
+/**
+ * 「这个名字在哪台设备上都写不下去」的稳定原因词（同 `unparsable frontmatter` / `invalid modified`）。
+ *
+ * 不把具体理由（哪个保留名、哪一类字符）拼进去：适配层要拿它分类，而拼进去的文案会把一个
+ * 本属于用户记忆名字的字串变成只能靠子串匹配的变量。
+ */
+const UNPUBLISHABLE_NAME = "unpublishable file name";
 
 /** 两份清单按 key 去重合并（同一个 key 保留后出现的那一份），顺序 = 出现顺序。 */
 function unionBy<T>(left: T[], right: T[], key: (item: T) => string): T[] {
@@ -472,10 +480,15 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// 范围外的路径原样报出去（远端根相对）：静默丢掉的话，用户永远不知道远端有内容没进同步
 		const outOfScope = [...locked.value.view.outOfScope];
 		for (const { path, hash } of locked.value.listed) {
-			// 与本地扫描共用同一份文件名口径（`isEntryFileName`）：口径一旦漂移，两侧就会拿不同
-			// 形态的 key 互相找不到。远端前缀里被人手工推上来的索引文件、点开头的文件、嵌套目录
-			// 都不是记忆 —— 报成范围外，而不是交给 `applyEntryFiles`（它会为畸形路径让整轮失败）。
-			if (!isEntryFileName(path, platform)) {
+			// 从网络进来的名字一律走**写方向**谓词（全平台最严的那一套），不是本地扫描那一套读方向：
+			// 这个名字的归宿是本地文件系统，而落盘前的整批断言（`applyEntryFiles`）问的正是写方向。
+			// 两边口径不一致的后果不是「少同步一条」：一个在 Linux 上合法、在 Windows 上开不了的
+			// 名字（例如 `con.md`）会先通过这里的过滤、再在落盘前让**整批**抛错 —— 应用段一个文件都
+			// 没写就失败，`-sync` 快照却已经拍了一份，而且下一轮一模一样：同步彻底停摆、status 不报错、
+			// 崩溃恢复用的快照名额每轮被白拍一份挤掉。
+			// 报成范围外而不是交给 `applyEntryFiles`：远端前缀里被人手工推上来的索引文件、点开头的
+			// 文件、嵌套目录同样走这一条（它们都不是记忆，也不得让整轮失败）。
+			if (!isEntryFileNameForWrite(path)) {
 				outOfScope.push(`${scope.prefix}/${path}`);
 				continue;
 			}
@@ -762,6 +775,14 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		const deletions: string[] = [];
 		for (const [file, info] of local) {
 			if (plan.excluded.has(file)) continue;
+			// 发布方向也要过一遍**写方向**谓词：本地扫描用的是读口径（Linux 上 `con.md` 是一条合法记忆），
+			// 而远端是全平台共享的。把一个在任何一台设备上都落不了地的名字推上去，等于往远端埋一条
+			// 永远同步不了的记录：它会在每一台的每一轮里被归成范围外，而新设备 onboarding 的第一轮就
+			// 撞上它。所以这里不发布、只报一行（原因词是稳定词汇，适配层可以据此分类）。
+			if (!isEntryFileNameForWrite(file)) {
+				rejected.push({ file, reason: UNPUBLISHABLE_NAME });
+				continue;
+			}
 			if (theirs.get(file)?.hash === info.hash) continue;
 			const raw = await readFile(join(memoryDir, file), "utf8").catch((err: unknown) => {
 				rejected.push({ file, reason: describeError(err) });
@@ -968,6 +989,12 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		report.ahead = [...diff.pushLocal, ...diff.deleteRemote].sort();
 		report.behind = [...diff.pullFromRemote, ...diff.deleteLocal].sort();
 		report.conflicts = diff.conflicts.map((conflict) => conflict.file);
+
+		// 与真跑的发布段同一口径：本地有、但在任何一台设备上都写不下去的名字永远发不出去。
+		// 不报的话 `ahead` 每轮都列着它、却永远推不上去，用户只看到「本地领先 1 条」而不知道原因。
+		for (const file of diff.pushLocal) {
+			if (!isEntryFileNameForWrite(file)) report.rejected.push({ file, reason: UNPUBLISHABLE_NAME });
+		}
 
 		// 会被拒收的远端内容也要报出来：用户看到的应该是「这条同步不了，因为……」，
 		// 而不是每轮拉取都静默失败。只读这一轮真要动的那些名字，不为报告把远端全读一遍。

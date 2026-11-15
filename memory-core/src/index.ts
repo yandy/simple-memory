@@ -23,7 +23,14 @@ export {
 } from "./store/entry-index.js";
 export type { IndexCapacity, IndexLineEntry, ParsedEntryIndex } from "./store/entry-index.js";
 
-export { ENTRY_EXT, entryFileName, foldFileName, isEntryFileName, resolveUniqueFileName } from "./store/filename.js";
+export {
+	ENTRY_EXT,
+	entryFileName,
+	foldFileName,
+	isEntryFileNameForRead,
+	isEntryFileNameForWrite,
+	resolveUniqueFileName,
+} from "./store/filename.js";
 
 // ── store/ 读写门面 ────────────────────────────────────────────────────────────
 export { BACKUP_DIR, INDEX_FILE, LOCK_FILE, MemoryStore } from "./store/memory-store.js";
@@ -168,7 +175,7 @@ export type {
 // ── sync/ 跨设备同步 ──────────────────────────────────────────────────────────
 // 适配层只从这里拿同步能力：装引擎（`createSyncEngine`）与写触发调度器、选或实现传输端口
 // （`SyncBackend` / `createGitSyncBackend`）、以及读同步状态要用的远端布局与 manifest 助手。
-// 文件名口径（`isEntryFileName` / `foldFileName`）与 `applyEntryFiles` 的入参类型
+// 文件名口径（读/写两个方向的 `isEntryFileNameFor*` 与 `foldFileName`）与 `applyEntryFiles` 的入参类型
 // （`ApplyChange` / `ApplyResult`）在 store 分区、配置子树（`SyncConfig` / `syncConfigErrors`）
 // 在配置分区：一个符号只导一次，分区跟拥有它的模块走。
 export { NonFastForwardError } from "./sync/backend.js";

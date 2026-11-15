@@ -1,7 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { parseEntryFile } from "../store/entry-file.js";
-import { isEntryFileName } from "../store/filename.js";
+import { isEntryFileNameForRead } from "../store/filename.js";
 import { sha256Hex } from "./hash.js";
 import type { SyncFileInfo, SyncFileSet } from "./types.js";
 
@@ -18,8 +18,10 @@ export interface LocalScan {
 /**
  * 扫描 memory 目录，产出每个 entry 的内容指纹、语义修改时间与字节数。
  *
- * 文件名过滤**只用** `isEntryFileName`，不在这里另抄一份判据：读路径（`MemoryStore` 的目录扫描）
- * 与同步扫描口径一旦漂移，就会出现「store 看得到、同步看不到」（或反过来）的记忆 —— 静默丢记忆。
+ * 文件名过滤**只用**读方向的谓词（`isEntryFileNameForRead`），不在这里另抄一份判据：读路径（`MemoryStore`
+ * 的目录扫描）与同步扫描口径一旦漂移，就会出现「store 看得到、同步看不到」（或反过来）的记忆 ——
+ * 静默丢记忆。注意方向：这里扫的是**本机已经存在的文件**，所以用读口径（保留名按平台分支）；
+ * 从网络进来的名字一律走写口径，理由写在引擎那一侧。
  * **调用方必须传 store 配置里的 platform（`store.cfg.platform`），不是宿主平台**：`MemoryStore` 按
  * `cfg.platform ?? process.platform` 解析，配置值没被透传时，保留设备名的口径会在两条路径上分叉。
  * 保留设备名在 win32 上必须剔除（按名打开会命中控制台），而在 Linux / macOS 上 `con.md` 是
@@ -60,7 +62,7 @@ export async function scanLocalEntries(
 
 	const entries: string[] = [];
 	for (const dirent of dirents) {
-		if (!isEntryFileName(dirent.name, platform)) continue;
+		if (!isEntryFileNameForRead(dirent.name, platform)) continue;
 		if (dirent.isSymbolicLink()) {
 			// store 的 stat 跟随链接：指向普通文件的符号链接在 store 眼里是合法 entry，扫描也必须看得见，
 			// 且只对符号链接多付一次 stat。

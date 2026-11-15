@@ -9,14 +9,21 @@ import {
 	serializeEntryFile,
 } from "./entry-file.js";
 import { formatIndexLine, indexCapacity, parseEntryIndex, removeIndexLine, upsertIndexLine } from "./entry-index.js";
-import { ENTRY_INDEX_FILE, entryFileName, foldFileName, isEntryFileName, resolveUniqueFileName } from "./filename.js";
+import {
+	ENTRY_INDEX_FILE,
+	entryFileName,
+	foldFileName,
+	isEntryFileNameForRead,
+	isEntryFileNameForWrite,
+	resolveUniqueFileName,
+} from "./filename.js";
 import { withLock } from "./fs-lock.js";
 import { withFsRetry } from "./fs-retry.js";
 import { withFileMutationQueue } from "./mutation-queue.js";
 import { isProcessLockActive, tryWithProcessLock, withProcessLock } from "./process-lock.js";
 import { createSnapshot } from "./snapshot.js";
 
-/** 索引文件名。字面值定义在 `filename.ts`（`isEntryFileName` 也要用它，反向 import 会成环），
+/** 索引文件名。字面值定义在 `filename.ts`（两个方向的文件名谓词也要用它，反向 import 会成环），
  *  这里保持既有的公开出口不变。 */
 export const INDEX_FILE = ENTRY_INDEX_FILE;
 export const LOCK_FILE = ".lock";
@@ -150,11 +157,18 @@ export class MemoryStore {
 
 	/** 读取路径与 `#savingQueue` 的 `mkdir` **刻意不重试**：读失败不改变磁盘状态，
 	 *  目录创建失败会在获取锁阶段就干净地报错（无残留）；重试只会拖慢 fail-closed。
-	 *  过滤口径住在 `filename.ts` 的 `isEntryFileName`：同步的目录扫描必须用同一份，
-	 *  两处漂移会造成「store 看得到、同步看不到」的记忆。 */
+	 *  过滤口径住在 `filename.ts` 的**读方向**谓词（`isEntryFileNameForRead`）：同步的本地扫描必须用同一份，
+	 *  两处漂移会造成「store 看得到、同步看不到」的记忆。
+	 *
+	 *  这里的 `readdir(...).catch(() => [])` 可以宽松，而同步扫描里同形状的那一句必须上抛 ——
+	 *  两者服务的是不同的东西：`#entryFiles` 只喂**读路径**（列条目、搜索、重建索引）与写路径的
+	 *  占用名集合，一次读不到的最坏表现是「少显示一条记忆」，下一次调用就恢复；而同步扫描的结果是
+	 *  三方合并的 **ours 一侧**，把「读不出来」压成「目录是空的」，差集就会读成「用户删光了全部记忆」
+	 *  并把删除传播到远端。所以这个不对称是**有意**的，别把两边「统一」成同一个失败口径 ——
+	 *  往宽松统一是丢数据，往严格统一会让一次目录抖动把 `listEntries()` 变成抛错。 */
 	async #entryFiles(): Promise<string[]> {
 		const names = await readdir(this.cfg.memoryDir).catch(() => []);
-		return names.filter((n) => isEntryFileName(n, this.#platform)).sort();
+		return names.filter((n) => isEntryFileNameForRead(n, this.#platform)).sort();
 	}
 
 	/** 已被占用的文件名：磁盘上的条目文件 + 索引文件本身。
@@ -507,14 +521,14 @@ export class MemoryStore {
 	/**
 	 * 写路径的文件名守卫：不合格就**整批抛错**（fail-closed），而不是把单份记进 `rejected`。
 	 *
-	 * 与 `#entryFiles` 的读口径刻意不同：保留设备名在这里**全平台**拒绝（因此把 platform 固定为
-	 * `win32` 的口径去问同一个谓词，而不是再抄一份条件）。读路径只在 win32 上剔除 `con.md`，因为
-	 * 在 Linux 上它是一条合法记忆，剔除等于静默丢记忆；写路径必须更严 —— 写下一个另一台设备读不
-	 * 出来的名字，就是把一条记忆推到对端的黑洞里（在 win32 上按名打开还会命中控制台而不是文件）。
+	 * 与 `#entryFiles` 的读口径刻意不同，因此这里问的是**写方向**谓词（`isEntryFileNameForWrite`，
+	 * 恒为全平台最严的那一套）：读路径只在 win32 上剔除 `con.md`，因为在 Linux 上它是一条合法记忆，
+	 * 剔除等于静默丢记忆；写路径必须更严 —— 写下一个另一台设备读不出来的名字，就是把一条记忆推到
+	 * 对端的黑洞里（在 win32 上按名打开还会命中控制台而不是文件）。
 	 * 抛错而不是拒收：畸形路径是远端清单坏了（越目录写入的尝试），该让整轮同步停下来报错。
 	 */
 	#assertEntryFileName(file: string): void {
-		if (!isEntryFileName(file, "win32")) {
+		if (!isEntryFileNameForWrite(file)) {
 			throw new Error(`Refusing to apply "${file}": not a single-level entry file name`);
 		}
 	}

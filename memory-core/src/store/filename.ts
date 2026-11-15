@@ -13,7 +13,7 @@ const STEM_MAX_BYTES = 100;
 export const ENTRY_EXT = ".md";
 
 /**
- * 索引文件的文件名。定义在这里而不是 `memory-store.ts`：`isEntryFileName` 要排除它，
+ * 索引文件的文件名。定义在这里而不是 `memory-store.ts`：两个方向的文件名谓词都要排除它，
  * 而从 store 那边 import 会造成循环依赖。`memory-store.ts` 的公开出口 `INDEX_FILE` 是它的别名，
  * 名字/类型/值都不变。
  */
@@ -35,24 +35,52 @@ export function foldFileName(name: string, platform: NodeJS.Platform = process.p
 }
 
 /**
- * 是不是一个「条目文件」的名字。`MemoryStore.#entryFiles()`（读路径）与同步的目录扫描共用这一份：
- * 两处口径一旦漂移，就会出现「store 看得到、同步看不到」（或反过来）的记忆 —— 那是静默丢记忆。
+ * 两个方向共用的**形状**判据：单层（不含路径分隔符）、`.md` 结尾、不是索引文件本身、
+ * 不以 `.` 开头（`.lock`、`.backups`、以及用户自己藏的临时文件都不是记忆）。
  *
- * 判据：单层（不含路径分隔符）、`.md` 结尾、不是索引文件本身、不以 `.` 开头（`.lock`、`.backups`、
- * 以及用户自己藏的临时文件都不是记忆）。
- *
- * 保留设备名**只在 win32 上**剔除：按名打开 `con.md` 在 win32 上会命中控制台（`readFile` 阻塞而不是
- * 返回内容），把它从清单里剔除的最坏表现是「该条记忆在本机不可见」；而在 Linux / macOS 上 `con.md`
- * 是一个普通文件、一条合法记忆，全平台剔除等于把它从 `listEntries()` 里静默抹掉。
- * 写路径的口径刻意更严（全平台拒绝保留名）—— 见 `MemoryStore.applyEntryFiles`。
+ * 它刻意不导出：外面只该看见两个带方向的谓词，一个没有方向的「是不是条目名」正是
+ * 曾经让读口径与写口径互相串味的那个形状（见下）。
  */
-export function isEntryFileName(name: string, platform: NodeJS.Platform = process.platform): boolean {
+function isEntryFileNameShape(name: string): boolean {
 	if (!name.endsWith(ENTRY_EXT)) return false;
 	if (name === ENTRY_INDEX_FILE) return false;
 	if (name.startsWith(".")) return false;
 	if (name.includes("/") || name.includes("\\")) return false;
-	if (platform === "win32" && isReservedWindowsName(name)) return false;
 	return true;
+}
+
+/**
+ * **读方向**：盘上（或索引里）已有的这个名字，算不算一条看得见的记忆。
+ *
+ * 消费者：`MemoryStore.#entryFiles()` 与同步的本地扫描 —— 两处必须共用这一份，口径一旦漂移
+ * 就会出现「store 看得到、同步看不到」（或反过来）的记忆，那是静默丢记忆。
+ *
+ * 保留设备名**只在 win32 上**剔除：按名打开 `con.md` 在 win32 上会命中控制台（`readFile` 阻塞而
+ * 不是返回内容），把它从清单里剔除的最坏表现是「该条记忆在本机不可见」；而在 Linux / macOS 上
+ * `con.md` 是一个普通文件、一条**合法**记忆，全平台剔除等于把它从 `listEntries()` 里静默抹掉。
+ *
+ * **绝不用它判「能不能写」**：写路径要的是全平台口径，见 `isEntryFileNameForWrite`。
+ */
+export function isEntryFileNameForRead(name: string, platform: NodeJS.Platform = process.platform): boolean {
+	if (!isEntryFileNameShape(name)) return false;
+	return platform !== "win32" || !isReservedWindowsName(name);
+}
+
+/**
+ * **写方向**：这个名字能不能被**写下去**（本地落盘，或发布到远端让另一台设备落盘）。
+ *
+ * 口径恒等于 win32（最严的那一个），**没有 platform 参数** —— 这不是疏忽而是它存在的全部理由：
+ * 写下去的文件名会成为跨设备的数据，只要有任何一台设备读不出来，它就是一个黑洞。在 Linux 上
+ * 写 `con.md` 完全合法，可它一旦同步到 Windows 那台机器就再也打不开（按名打开命中控制台），
+ * 而同步轮会在落盘前整批抛错 —— 一个名字让两台设备永久不同步。
+ *
+ * 消费者：`MemoryStore.applyEntryFiles` 的整批路径断言，以及**一切从网络进来的名字**
+ *（引擎在把远端清单交给差集之前先过它）。凡是「这个名字的归宿是某个文件系统」的判断都用它；
+ * 用读方向去判远端名字，就是把「本机读得懂」当成「每台设备都写得下」，那正是整批抛错的成因。
+ */
+export function isEntryFileNameForWrite(name: string): boolean {
+	if (!isEntryFileNameShape(name)) return false;
+	return !isReservedWindowsName(name);
 }
 
 function shortHash(input: string): string {

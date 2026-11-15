@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { entryFileName, foldFileName, isEntryFileName, resolveUniqueFileName } from "../src/store/filename.js";
+import {
+	entryFileName,
+	foldFileName,
+	isEntryFileNameForRead,
+	isEntryFileNameForWrite,
+	resolveUniqueFileName,
+} from "../src/store/filename.js";
 
 describe("entryFileName", () => {
 	it("keeps ASCII words and collapses whitespace to dashes", () => {
@@ -75,18 +81,39 @@ describe("foldFileName", () => {
 	});
 });
 
-describe("isEntryFileName", () => {
-	it("只认单层 .md、排除索引与点开头", () => {
-		expect(isEntryFileName("foo.md")).toBe(true);
-		for (const n of ["MEMORY.md", ".lock", ".hidden.md", "foo.txt", "foo", ""]) expect(isEntryFileName(n)).toBe(false);
+describe("isEntryFileNameForRead / isEntryFileNameForWrite", () => {
+	it("两个方向都只认单层 .md、排除索引与点开头", () => {
+		for (const isEntry of [isEntryFileNameForRead, isEntryFileNameForWrite]) {
+			expect(isEntry("foo.md")).toBe(true);
+			expect(isEntry("中文 文件名.md")).toBe(true);
+			for (const n of ["MEMORY.md", ".lock", ".hidden.md", "foo.txt", "foo", ""]) expect(isEntry(n)).toBe(false);
+			// 含路径分隔符的一律排除
+			expect(isEntry("sub/a.md")).toBe(false);
+			expect(isEntry("a\\b.md")).toBe(false);
+		}
 	});
-	it("保留设备名**只在 win32 上**排除：Linux 上 con.md 是一条合法记忆，重构后不得消失", () => {
-		expect(isEntryFileName("con.md", "win32")).toBe(false);
-		expect(isEntryFileName("con.md", "linux")).toBe(true);
-		expect(isEntryFileName("con.md", "darwin")).toBe(true);
+
+	it("读方向：保留设备名**只在 win32 上**排除 —— Linux 上 con.md 是一条合法记忆，不得消失", () => {
+		expect(isEntryFileNameForRead("con.md", "win32")).toBe(false);
+		expect(isEntryFileNameForRead("con.md", "linux")).toBe(true);
+		expect(isEntryFileNameForRead("con.md", "darwin")).toBe(true);
 	});
-	it("含路径分隔符的一律排除", () => {
-		expect(isEntryFileName("sub/a.md")).toBe(false);
-		expect(isEntryFileName("a\\b.md")).toBe(false);
+
+	it("写方向：保留设备名**全平台**排除，而且没有 platform 形参可以把口径放宽", () => {
+		for (const n of ["con.md", "CON.md", "nul.md", "com1.md", "lpt9.md"]) expect(isEntryFileNameForWrite(n)).toBe(false);
+		// 只有一个形参：调用方拿不到「按本机平台放宽」的逗口，而写下去的名字要在**每台**设备上能读
+		expect(isEntryFileNameForWrite.length).toBe(1);
+	});
+
+	it("写方向恒不宽于读方向：读口径认不下的名字，写口径也一定认不下", () => {
+		const names = ["foo.md", "con.md", "nul.md", "com1.md", "MEMORY.md", ".hidden.md", "sub/a.md", "a\\b.md", "foo"];
+		for (const platform of ["linux", "darwin", "win32"] as NodeJS.Platform[]) {
+			for (const name of names) {
+				if (!isEntryFileNameForRead(name, platform)) expect(isEntryFileNameForWrite(name)).toBe(false);
+			}
+		}
+		// 反过来不成立（这正是两个谓词必须分开的原因）：Linux 上 `con.md` 读得到、写不得
+		expect(isEntryFileNameForRead("con.md", "linux")).toBe(true);
+		expect(isEntryFileNameForWrite("con.md")).toBe(false);
 	});
 });

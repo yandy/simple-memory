@@ -4,7 +4,7 @@ import { conflictSuffix, resolveConflict } from "../src/sync/conflict.js";
 import type { ConflictSide } from "../src/sync/conflict.js";
 import { sha256Hex } from "../src/sync/hash.js";
 import { parseEntryFile, serializeEntryFile } from "../src/store/entry-file.js";
-import { ENTRY_EXT, isEntryFileName } from "../src/store/filename.js";
+import { ENTRY_EXT, isEntryFileNameForWrite } from "../src/store/filename.js";
 
 /**
  * 冲突收敛的判据只许来自**冲突双方的内容**：两台设备各自解同一次冲突，必须算出逐字节相同的
@@ -160,6 +160,11 @@ describe("resolveConflict", () => {
 		// 三、名字的来源只有一个：原 name + 由这份内容算出的后缀。
 		expect(kept.name).toBe(`A${conflictSuffix(ours.raw)}`);
 		expect(kept.file.endsWith(`${fpOf(ours.raw)}${ENTRY_EXT}`)).toBe(true);
+		// 完整字面值也钉死：只断言「以指纹结尾」抓不住指纹泄漏到 stem 中段、
+		// 或用原路径名（`a.md`）而不是 entry 的 name 造 stem。指纹取自**败者原始字节**
+		//（ours），不是重序列化之后的那一份 —— 与用户在 name 后缀里看到的指纹同源。
+		expect(kept.file).toBe("A-(冲突-2026-11-09)-224c38.md");
+		expect(kept.name).toBe("A (冲突 2026-11-09 224c38)");
 	});
 
 	it("★确定性（续）：占用清单里带 hash 的无关条目、原路径名本身，都不得影响产物", () => {
@@ -233,7 +238,8 @@ describe("resolveConflict", () => {
 		expect(again.file.startsWith(base.file.slice(0, -ENTRY_EXT.length))).toBe(true);
 		expect(again.file.endsWith(`-${fp}${ENTRY_EXT}`)).toBe(true);
 		expect(again.file).not.toMatch(/-2\.md$/);
-		expect(isEntryFileName(again.file)).toBe(true);
+		// 派生名的归宿是文件系统，所以问**写方向**谓词（全平台口径）
+		expect(isEntryFileNameForWrite(again.file)).toBe(true);
 		// name 与字节不随占用情况改变：变的只有落到哪个文件名
 		expect(again.name).toBe(base.name);
 		expect(again.raw).toBe(base.raw);
@@ -254,7 +260,7 @@ describe("resolveConflict", () => {
 			const file = out!.loserEntry!.file;
 			// 指纹在最后：截断只保留前缀，指纹留在中间就会被整段切掉
 			expect(file.endsWith(`${fpOf(ours.raw)}${ENTRY_EXT}`)).toBe(true);
-			expect(isEntryFileName(file)).toBe(true);
+			expect(isEntryFileNameForWrite(file)).toBe(true);
 			// entryFileName 的 stem 上限是 100 字节：截断确实发生了
 			expect(Buffer.byteLength(file.slice(0, -ENTRY_EXT.length), "utf8")).toBeLessThanOrEqual(100);
 			// 长度只约束**文件名**；entry 自己的 name 仍带完整后缀

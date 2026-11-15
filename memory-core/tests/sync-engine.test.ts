@@ -257,13 +257,17 @@ let projectKey: string;
 let prefix: string;
 
 /** 一台设备 = 一个记忆根（自己的 .sync 与项目目录）+ 一个引擎，全部指向同一个假远端。 */
-async function makeDevice(name: string, identityKey = "example.com/org/proj"): Promise<Device> {
+async function makeDevice(
+	name: string,
+	identityKey = "example.com/org/proj",
+	storeOver: Partial<StoreConfig> = {},
+): Promise<Device> {
 	const root = join(dir, name);
 	const sync = join(root, ".sync");
 	const project = join(root, "git", "proj");
 	await mkdir(sync, { recursive: true });
 	await mkdir(project, { recursive: true });
-	const memoryStore = new MemoryStore(CFG(project));
+	const memoryStore = new MemoryStore(CFG(project, storeOver));
 	const key = remoteProjectKey(identityKey);
 	return {
 		root,
@@ -548,6 +552,61 @@ describe("sync engine（假 backend）", () => {
 		expect(await remote.read(prefix, "sub/nested.md")).toBe(raw("N"));
 		expect(remote.publishes.at(-1)?.deletions).toEqual([]);
 		expect(remote.publishes.at(-1)?.writes.map((w) => w.path)).toEqual(["A.md"]);
+	});
+
+	it("★远端有 win32 保留名 + 一条合法记忆：合法的落地，保留名报成范围外，整轮不失败", async () => {
+		// 平台固定成 linux：保留名的**读**口径在 Linux 上是宽松的（`con.md` 是一条合法记忆），
+		// 所以这里能钉住「远端名字走的是写口径」—— 若跟着本机平台走，win32 runner 上这条会恒真。
+		const dev = await makeDevice("reserved", "example.com/org/reserved", { platform: "linux" });
+		await remote.write(dev.prefix, "con.md", raw("CON 设备名"));
+		await remote.write(dev.prefix, "a.md", raw("A"));
+
+		const res = await dev.engine.pull();
+		// 载重：整轮不得失败。保留名若进了差集，`applyEntryFiles` 会在落盘前为它整批抛错 ——
+		// 合法那条也一起不落盘，而且下一轮一模一样：同步彻底停摆。
+		expect(res).toMatchObject({ ok: true, pulled: ["a.md"] });
+		expect(res.skipped).toBeUndefined();
+		expect(res.outOfScopeRemote).toEqual([`${dev.prefix}/con.md`]);
+		expect(await readFile(join(dev.projectDir, "a.md"), "utf8")).toBe(raw("A"));
+		expect(await readdir(dev.projectDir)).not.toContain("con.md");
+		expect(await dev.store.readIndex()).toContain("- [A](a.md)");
+
+		// 快照只为**真落盘的那一批**拍一份；下一轮什么都没改，不得再白拍（否则用户用于崩溃
+		// 恢复的 keep 名额会被一个永远修不好的名字每轮挤掉一个）。
+		const snapshots = await backupNames(dev.projectDir, "sync");
+		expect(snapshots).toHaveLength(1);
+		const again = await dev.engine.pull();
+		expect(again).toMatchObject({ ok: true, pulled: [], outOfScopeRemote: [`${dev.prefix}/con.md`] });
+		expect(await backupNames(dev.projectDir, "sync")).toEqual(snapshots);
+
+		// status 也得报它：用户要能看见「远端有东西没被同步」，而不是只看到每轮都少一条
+		const report = await dev.engine.status();
+		expect(report.outOfScopeRemote).toEqual([`${dev.prefix}/con.md`]);
+		expect(report.errors).toEqual([]);
+		expect(report.behind).toEqual([]);
+	});
+
+	it("★本地有在任何设备上都写不下去的名字：不发布，只报一行（不得把它埋进远端）", async () => {
+		const dev = await makeDevice("reserved-local", "example.com/org/reserved-local", { platform: "linux" });
+		// store 自己永远造不出这个名字（`entryFileName` 会给保留名加 `_` 前缀），只能手工落一个：
+		// 读口径在 Linux 上看得见它，所以它会进扫描、进差集的 pushLocal。
+		await writeFile(join(dev.projectDir, "con.md"), raw("CON 设备名"), "utf8");
+		await dev.store.addEntry({ name: "A", body: "a" });
+
+		const res = await dev.engine.push();
+		expect(res.ok).toBe(true);
+		// 合法那条照常发布，那个名字只报一行（原因词是稳定词汇）
+		expect(res.pushed).toEqual(["A.md"]);
+		expect(res.rejected).toEqual([{ file: "con.md", reason: "unpublishable file name" }]);
+		expect(await remote.names(dev.prefix)).toEqual(["A.md"]);
+		// 本地那份原样留着（只是不同步），并且每轮都报：用户改名字之前不会静默消失
+		expect(await readFile(join(dev.projectDir, "con.md"), "utf8")).toBe(raw("CON 设备名"));
+		expect((await dev.engine.push()).rejected).toEqual([{ file: "con.md", reason: "unpublishable file name" }]);
+
+		// status 同一口径：`ahead` 里列着它，就得同时说清楚它为什么永远推不上去
+		const report = await dev.engine.status();
+		expect(report.ahead).toEqual(["con.md"]);
+		expect(report.rejected).toEqual([{ file: "con.md", reason: "unpublishable file name" }]);
 	});
 
 	it("远端前缀里的 MEMORY.md / 点开头的文件不算条目：报成范围外，不让整轮失败", async () => {
