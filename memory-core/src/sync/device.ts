@@ -57,6 +57,7 @@ const MAX_IDENTITY_FIELD_LENGTH = 128;
  * C0（含 `\n`、`\r`、`\t`、`ESC`）与 DEL、C1 控制字符：逐字写出去的 `ESC[31m` 会在终端里
  * 把状态报告染色（或更糟，清屏），换行会把一行报告、一行提交头拆成两行。
  */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally matching C0/C1 control characters — this id ends up in a git commit author and in status output
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 
 /**
