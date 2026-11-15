@@ -1,16 +1,31 @@
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { deriveDescription, type EntryType, parseEntryFile, serializeEntryFile } from "./entry-file.js";
+import {
+	deriveDescription,
+	type EntryMeta,
+	type EntryType,
+	isEntryType,
+	parseEntryFile,
+	serializeEntryFile,
+} from "./entry-file.js";
 import { formatIndexLine, indexCapacity, parseEntryIndex, removeIndexLine, upsertIndexLine } from "./entry-index.js";
-import { entryFileName, resolveUniqueFileName } from "./filename.js";
+import {
+	ENTRY_INDEX_FILE,
+	entryFileName,
+	foldFileName,
+	isEntryFileNameForRead,
+	isEntryFileNameForWrite,
+	resolveUniqueFileName,
+} from "./filename.js";
 import { withLock } from "./fs-lock.js";
 import { withFsRetry } from "./fs-retry.js";
 import { withFileMutationQueue } from "./mutation-queue.js";
 import { isProcessLockActive, tryWithProcessLock, withProcessLock } from "./process-lock.js";
 import { createSnapshot } from "./snapshot.js";
-import { isReservedWindowsName } from "./windows-names.js";
 
-export const INDEX_FILE = "MEMORY.md";
+/** 索引文件名。字面值定义在 `filename.ts`（两个方向的文件名谓词也要用它，反向 import 会成环），
+ *  这里保持既有的公开出口不变。 */
+export const INDEX_FILE = ENTRY_INDEX_FILE;
 export const LOCK_FILE = ".lock";
 export const BACKUP_DIR = ".backups";
 
@@ -56,6 +71,22 @@ export async function sameFile(a: string, b: string): Promise<boolean> {
 export interface WriteOptions {
 	skipLogicalLock?: boolean;
 	skipSnapshot?: boolean;
+}
+
+/** `applyEntryFiles` 的一项写入：`file` 是 memory 目录内的**单层**文件名，`raw` 是逐字落盘的全部内容。 */
+export interface ApplyChange {
+	file: string;
+	raw: string;
+}
+
+/**
+ * `applyEntryFiles` 的结果清单。`rejected` 带原因词（稳定词汇，调用方拿去写 status），
+ * 因为「跳过一份远端文件」必须可见：静默跳过就是静默丢记忆。
+ */
+export interface ApplyResult {
+	written: string[];
+	deleted: string[];
+	rejected: Array<{ file: string; reason: string }>;
 }
 
 export interface StoreConfig {
@@ -125,18 +156,19 @@ export class MemoryStore {
 	constructor(readonly cfg: StoreConfig) {}
 
 	/** 读取路径与 `#savingQueue` 的 `mkdir` **刻意不重试**：读失败不改变磁盘状态，
-	 *  目录创建失败会在获取锁阶段就干净地报错（无残留）；重试只会拖慢 fail-closed。 */
+	 *  目录创建失败会在获取锁阶段就干净地报错（无残留）；重试只会拖慢 fail-closed。
+	 *  过滤口径住在 `filename.ts` 的**读方向**谓词（`isEntryFileNameForRead`）：同步的本地扫描必须用同一份，
+	 *  两处漂移会造成「store 看得到、同步看不到」的记忆。
+	 *
+	 *  这里的 `readdir(...).catch(() => [])` 可以宽松，而同步扫描里同形状的那一句必须上抛 ——
+	 *  两者服务的是不同的东西：`#entryFiles` 只喂**读路径**（列条目、搜索、重建索引）与写路径的
+	 *  占用名集合，一次读不到的最坏表现是「少显示一条记忆」，下一次调用就恢复；而同步扫描的结果是
+	 *  三方合并的 **ours 一侧**，把「读不出来」压成「目录是空的」，差集就会读成「用户删光了全部记忆」
+	 *  并把删除传播到远端。所以这个不对称是**有意**的，别把两边「统一」成同一个失败口径 ——
+	 *  往宽松统一是丢数据，往严格统一会让一次目录抖动把 `listEntries()` 变成抛错。 */
 	async #entryFiles(): Promise<string[]> {
 		const names = await readdir(this.cfg.memoryDir).catch(() => []);
-		return (
-			names
-				.filter((n) => n.endsWith(".md") && n !== INDEX_FILE && !n.startsWith("."))
-				// win32：按名打开保留设备名文件会命中设备（CON 等），`readFile` 会阻塞在控制台而不是
-				// 返回内容。修复前的版本或外部工具可能留下过这种文件，这里把它从清单里剔除 ——
-				// 最坏表现是「该条记忆在本机不可见」，而不是卡住整个扫描。
-				.filter((n) => !(this.#platform === "win32" && isReservedWindowsName(n)))
-				.sort()
-		);
+		return names.filter((n) => isEntryFileNameForRead(n, this.#platform)).sort();
 	}
 
 	/** 已被占用的文件名：磁盘上的条目文件 + 索引文件本身。
@@ -484,6 +516,160 @@ export class MemoryStore {
 	async renameEntry(ref: string, newName: string, options?: WriteOptions): Promise<{ file: string }> {
 		const { file } = await this.replaceEntry(ref, { name: newName }, options);
 		return { file };
+	}
+
+	/**
+	 * 写路径的文件名守卫：不合格就**整批抛错**（fail-closed），而不是把单份记进 `rejected`。
+	 *
+	 * 与 `#entryFiles` 的读口径刻意不同，因此这里问的是**写方向**谓词（`isEntryFileNameForWrite`，
+	 * 恒为全平台最严的那一套）：读路径只在 win32 上剔除 `con.md`，因为在 Linux 上它是一条合法记忆，
+	 * 剔除等于静默丢记忆；写路径必须更严 —— 写下一个另一台设备读不出来的名字，就是把一条记忆推到
+	 * 对端的黑洞里（在 win32 上按名打开还会命中控制台而不是文件）。
+	 * 抛错而不是拒收：畸形路径是远端清单坏了（越目录写入的尝试），该让整轮同步停下来报错。
+	 */
+	#assertEntryFileName(file: string): void {
+		if (!isEntryFileNameForWrite(file)) {
+			throw new Error(`Refusing to apply "${file}": not a single-level entry file name`);
+		}
+	}
+
+	/**
+	 * frontmatter 能解析 ≠ 能落盘：name / created / type 还要过既有校验器。返回拒收原因（undefined = 通过）。
+	 *
+	 * 校验必须搬进这条原语：逐字写入绕过了 `addEntry`，而一个 `name` 里含 `](` 的远端条目落盘后
+	 * 经 `rebuildIndex()` 会直接伪造索引行（`removeIndexLine` 删错行、真条目变孤儿）—— 那正是
+	 * `#validateName` 存在的唯一后果。非法 `created` 同样致命：写出去会让 `parseEntryFile` 返回 null，
+	 * 整条记忆对 store 静默不可见。
+	 */
+	#rejectReason(meta: EntryMeta): string | undefined {
+		try {
+			this.#validateName(meta.name);
+		} catch {
+			return "invalid name";
+		}
+		try {
+			this.#validateCreated(meta.created);
+		} catch {
+			return "invalid created";
+		}
+		// 纵深防御：`parseEntryFile` 已经要求 type ∈ ENTRY_TYPES，认不出来直接返回 null（原因落在
+		// "unparsable frontmatter"）。若哪天解析口径放宽，这一层拦住「写下一份类型不认识的文件」。
+		if (!isEntryType(meta.type)) return "invalid type";
+		return undefined;
+	}
+
+	/**
+	 * 名字折叠碰撞：返回这一批里必须**跳过**的文件名。两层判据，缺一不可：
+	 *
+	 * - **折叠 key**（`foldFileName`，跟平台）：`Foo.md` 与 `foo.md` 在 APFS / NTFS 上是同一个名字，
+	 *   按名逐字直写会让后写的那份穿掉先写的那份 —— 远端两条记忆在本机只剩一条，而且不报错。
+	 *   在 Linux 上它们是两条合法记忆，因此这一层按平台分支（与读口径同源）。
+	 * - **inode 探测**（`sameFile`）：字符串折叠不知道本地卷的真实语义（casefold 挂载、硬链接别名、
+	 *   会做规范化的文件系统）。名字不同但指向同一个 inode 时，写下去就是写穿别人的文件 —— 以磁盘为准。
+	 *
+	 * 与既有文件**同名**（字符串相等）不算碰撞：那是更新，正是这条原语的常规用法。
+	 */
+	async #collidingWrites(writes: ApplyChange[]): Promise<Set<string>> {
+		const skipped = new Set<string>();
+		const inBatch = new Set<string>();
+		for (const { file } of writes) {
+			const key = foldFileName(file, this.#platform);
+			// 批内撞车 → 后出现的那份跳过（不静默地后者覆盖前者，而是报出去让调用方进 status）。
+			if (inBatch.has(key)) skipped.add(file);
+			else inBatch.add(key);
+		}
+
+		const existing = await this.#entryFiles();
+		const byFold = new Map(existing.map((name) => [foldFileName(name, this.#platform), name]));
+		// `win32` 口径（NFC + 小写）与宿主平台无关，这里只拿它**挑探测候选**：真判据是紧随其后的
+		// `sameFile`。候选集通常为空，因此探测的 stat 开销只在真存在大小写别名时才付。
+		const byCaseFold = new Map<string, string[]>();
+		for (const name of existing) {
+			const key = foldFileName(name, "win32");
+			byCaseFold.set(key, [...(byCaseFold.get(key) ?? []), name]);
+		}
+
+		for (const { file } of writes) {
+			if (skipped.has(file)) continue;
+			const alias = byFold.get(foldFileName(file, this.#platform));
+			if (alias !== undefined && alias !== file) {
+				skipped.add(file);
+				continue;
+			}
+			for (const name of byCaseFold.get(foldFileName(file, "win32")) ?? []) {
+				if (name === file) continue;
+				if (await sameFile(join(this.cfg.memoryDir, file), join(this.cfg.memoryDir, name))) {
+					skipped.add(file);
+					break;
+				}
+			}
+		}
+		return skipped;
+	}
+
+	/**
+	 * 逐字落盘一批 entry 文件 + 删除一批 entry 文件：**不**重新派生 description、**不**改
+	 * created / modified、**不**碰 MEMORY.md（调用方之后自己 `rebuildIndex()`）。
+	 *
+	 * 为什么不能用 `addEntry` / `replaceEntry`：两者都会把 `modified` 重打成 `now`，而 `modified` 是跨设备
+	 * 唯一的排序 / 冲突键 —— 重打一次就把远端的旧版本抬成「刚刚改过」，下次同步会把它反推回去
+	 * 盖掉真正较新的那一份。因此需要一条不重新盖章的写入原语，而不是让同步引擎绕开 store 直接
+	 * `writeFile`：`MemoryStore` 是 memory 目录的唯一写入通道，绕开它就同时绕开了锁、mutation 队列、
+	 * 快照与重试。
+	 *
+	 * 逐字不等于不校验：每份落盘前过 `parseEntryFile` 与既有校验器，不合格的那份进 `rejected`（带原因）
+	 * 而不落盘；路径不合格则**整批抛错**（畸形路径不得逃出目录）。走同一条 `#pipeline`，因此与所有
+	 * 既有写入互斥。
+	 */
+	async applyEntryFiles(
+		changes: { writes: ApplyChange[]; deletes: string[] },
+		options?: WriteOptions,
+	): Promise<ApplyResult> {
+		return this.#pipeline("apply", options, async () => {
+			// 路径校验在快照与任何写入之前：不合格就一个文件都不写、也不留快照。
+			for (const { file } of changes.writes) this.#assertEntryFileName(file);
+			for (const file of changes.deletes) this.#assertEntryFileName(file);
+
+			const skipped = await this.#collidingWrites(changes.writes);
+			const rejected: ApplyResult["rejected"] = [];
+			for (const { file } of changes.writes) {
+				if (skipped.has(file)) rejected.push({ file, reason: "filename collision" });
+			}
+
+			await this.#maybeSnapshot(options, "apply", [INDEX_FILE, ...changes.writes.map((w) => w.file), ...changes.deletes]);
+
+			const written: string[] = [];
+			for (const { file, raw } of changes.writes) {
+				if (skipped.has(file)) continue;
+				const parsed = parseEntryFile(raw);
+				if (!parsed) {
+					rejected.push({ file, reason: "unparsable frontmatter" });
+					continue;
+				}
+				const reason = this.#rejectReason(parsed.meta);
+				if (reason) {
+					rejected.push({ file, reason });
+					continue;
+				}
+				// 写 `raw` 本身，不重新 serialize：serializeEntryFile 会改行尾、trim 正文、丢掉未知字段，
+				// 而那些字节正是内容 hash 与对端比对的基准。
+				await this.#retry(() => writeFile(join(this.cfg.memoryDir, file), raw, "utf8"));
+				written.push(file);
+			}
+
+			const deleted: string[] = [];
+			for (const file of changes.deletes) {
+				// `unlinkStrict`：ENOENT 视为已删（远端说它没了、本机也没了 = 目标已达成），其余错误上抛。
+				await this.#retry(() => unlinkStrict(join(this.cfg.memoryDir, file)));
+				deleted.push(file);
+			}
+
+			// 被写 / 被删 / 被拒的文件都要失效缓存：auto-surfacing 的注入清单来自这个 mtime 缓存，
+			// 漏掉会让本会话继续用旧正文（被拒的那份也可能曾在盘上）。
+			for (const file of [...written, ...deleted, ...rejected.map((r) => r.file)]) this.#cache.delete(file);
+
+			return { written, deleted, rejected };
+		});
 	}
 
 	/** 从磁盘全量重建索引；保留第一条索引行之前的手写块，其余无法识别行丢弃。 */

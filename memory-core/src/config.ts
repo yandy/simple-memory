@@ -52,6 +52,48 @@ export interface ExtractMemoriesConfig {
 	maxAssistantChars: number;
 }
 
+/**
+ * 跨设备同步的配置子树。
+ *
+ * 这里**只**收两个宿主共有的语义（core 的配置契约不收单宿主策略键，同 `dream` 的触发策略归宿主）：
+ * 凡是只有一侧能可靠挂上的接线细节（比如退出时再推一次）就**不设键**，而不是设一个「配了不生效」的键。
+ *
+ * 本节不触碰文件系统：core 只给默认值与合并语义，配置由适配层从自己的配置源读出后交给 `mergeConfig`。
+ */
+export interface SyncConfig {
+	/**
+	 * opt-in：自动往远端写数据必须由用户显式承担（同 `extractMemories`）。
+	 *
+	 * **必须是布尔值**，而且消费方一律按 `=== true` 判定：这是一道**同意边界**，不是类型洁癖。
+	 * 配置从宿主的 JSON 直接合并进来（`mergeConfig` 不校验类型），而 `"false"` 这种字符串在 JS 里
+	 * 是真值 —— 按真值判定就会把用户明写的「关」读成「开」，记忆继续往远端推，而校验出口还报「没问题」。
+	 * 不为 `true` 时其余键一律不校验（见 `syncConfigErrors`）。
+	 */
+	enabled: boolean;
+	/** git 远端 URL：只供首次初始化用；初始化之后的真相来源是暂存 clone 的 origin。 */
+	remote: string;
+	/** 远端的跟踪分支名。 */
+	branch: string;
+	/** 会话开始时自动拉取远端变更。同样是 `=== true` 才算开（见 `enabled`）。 */
+	pullOnStart: boolean;
+	/** 写入后去抖自动发布。同样是 `=== true` 才算开（见 `enabled`）。 */
+	pushOnWrite: boolean;
+	/**
+	 * 写入触发的静默期：静默期内的多条写入合并成一次推送（一轮 dream 写十几个文件 → 一次推送）。
+	 * 它是**两个宿主共有**的语义（两边的写触发都按它去抖），所以属于 core；退出兜底那种只有一侧
+	 * 能可靠挂上的接线细节则不设键。
+	 */
+	pushDebounceMs: number;
+	/**
+	 * 自动路径（会话开始的拉取、退出兜底的推）每次 git 子进程的时间上限。
+	 * 与 `timeoutMs` 分两档是刻意的：自动路径被 await 在会话启动路径上，离线 / 连不上远端时若按
+	 * 手动档计时，每开一次会话都要白等满 20s（一轮至少两次子进程）。自动档取短。
+	 */
+	autoTimeoutMs: number;
+	/** 手动命令（用户正在等结果）每次 git 子进程的时间上限，比自动档宽。 */
+	timeoutMs: number;
+}
+
 export interface MemoryConfig {
 	/** Shared defaults for model and sessionPersistence. Per-task configs override. */
 	defaults?: DefaultsConfig;
@@ -92,6 +134,11 @@ export interface MemoryConfig {
 	extractMemories: ExtractMemoriesConfig & {
 		sessionPersistence?: SessionPersistenceConfig;
 	};
+	/**
+	 * 跨设备同步。校验出口是 `syncConfigErrors`，**非** `modelConfigErrors`：后者被消费成
+	 * 「整个记忆层不可用」，少写一个远端 URL 不该有这个代价（同设计里的降级铁律）。
+	 */
+	sync: SyncConfig;
 }
 
 export const DEFAULT_CONFIG: MemoryConfig = {
@@ -122,6 +169,20 @@ export const DEFAULT_CONFIG: MemoryConfig = {
 		maxContextTokens: 2000,
 		maxToolResultChars: 500,
 		maxAssistantChars: 2000,
+	},
+	sync: {
+		// 自动往远端写数据必须由用户显式承担：默认关闭（同 extractMemories）。
+		enabled: false,
+		// 空 remote 只在 enabled 为真时才算错（见 syncConfigErrors）：默认关闭时它只是占位。
+		remote: "",
+		branch: "main",
+		pullOnStart: true,
+		pushOnWrite: true,
+		// 一轮 dream 写十几个文件 → 去抖后只推送一次。
+		pushDebounceMs: 5000,
+		// 自动档 5s / 手动档 20s：自动路径在会话启动上被 await，不能让离线把每次启动拖满。
+		autoTimeoutMs: 5000,
+		timeoutMs: 20000,
 	},
 };
 
@@ -181,6 +242,57 @@ export function modelConfigErrors(
 			errors.push(`no model for ${task} — set "${task}.model" or "defaults.model" in memory.json`);
 		} else if (!resolve(value)) {
 			errors.push(`model "${value}" for ${task} is not resolvable (unknown id or missing credentials)`);
+		}
+	}
+	return errors;
+}
+
+/**
+ * 同步配置的校验出口，**非致命**（形状仿 `modelConfigErrors`，但刻意是另一个函数）。
+ *
+ * 为什么不并进 `modelConfigErrors`：那条路的唯一消费者会把配置错误当成「整个记忆层不可用」——
+ * 不解析目录、不建 store、不注册工具、没有索引段。少写一个远端 URL 不该让用户丢掉全部记忆功能，
+ * 所以收到非空列表的适配层只需把同步当成未启用并报出来，其余记忆功能照常。
+ *
+ * 三个布尔键**无条件**校验类型（它们就是开关本身，包括 `enabled`）；其余键只在 `enabled === true`
+ * 时才检查：关掉的开关不该逼用户先去修它管辖的键。
+ * 顺序固定：enabled → pullOnStart → pushOnWrite → remote → branch → pushDebounceMs → autoTimeoutMs
+ * → timeoutMs；每条消息都点名键，便于直接改配置。
+ */
+export function syncConfigErrors(cfg: MemoryConfig): string[] {
+	const sync = cfg.sync;
+	// 读不懂的子树（`deepMerge` 会把用户写的 `"sync": null`、甚至一个字符串原样带进来）按「未启用」
+	// 处理，一条都不报：没有键可校验，也没有开关可开。不抛 TypeError 是底线。
+	if (typeof sync !== "object" || sync === null) return [];
+
+	const errors: string[] = [];
+	// 三个布尔键按**类型**校验，不按真值：`"enabled": "false"` 在 JS 里是真值，
+	// 只判真值的话用户明写的「关」会被当成「开」，而这个函数还返回空数组（= 配置没问题）。
+	// 自动往远端推数据必须由用户显式承担，所以「不是明确的 true」一律按关处理并报出来。
+	for (const key of ["enabled", "pullOnStart", "pushOnWrite"] as const) {
+		const value: unknown = sync[key];
+		if (typeof value !== "boolean") {
+			const shown = typeof value === "string" ? JSON.stringify(value) : String(value);
+			errors.push(`sync is disabled because "sync.${key}" must be true or false (got ${shown})`);
+		}
+	}
+	// 不是明确的 true 就到此为止：开关没开，它管辖的键不必逼用户先修（与消费方 `=== true` 同口径）。
+	if (sync.enabled !== true) return errors;
+
+	// 非字符串也算空：`mergeConfig` 不校验类型，这里一 `.trim()` 就把非致命校验变成一次崩溃。
+	if (typeof sync.remote !== "string" || sync.remote.trim() === "") {
+		errors.push('sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"');
+	}
+	if (typeof sync.branch !== "string" || sync.branch.trim() === "") {
+		errors.push('sync is enabled but "sync.branch" is empty — set a branch name or unset "sync.enabled"');
+	}
+	for (const key of ["pushDebounceMs", "autoTimeoutMs", "timeoutMs"] as const) {
+		const value: unknown = sync[key];
+		// 类型也在这里查：`mergeConfig` 不校验类型，手写的配置里 `"5000"` 会一路传到定时器 /
+		// 子进程的 budget 上，那时是一句看不懂的失败而不是一条可读错误。
+		if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+			const shown = typeof value === "string" ? JSON.stringify(value) : String(value);
+			errors.push(`sync is enabled but "sync.${key}" must be a positive number of milliseconds (got ${shown})`);
 		}
 	}
 	return errors;

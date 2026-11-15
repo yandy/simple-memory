@@ -23,11 +23,25 @@ export {
 } from "./store/entry-index.js";
 export type { IndexCapacity, IndexLineEntry, ParsedEntryIndex } from "./store/entry-index.js";
 
-export { ENTRY_EXT, entryFileName, resolveUniqueFileName } from "./store/filename.js";
+export {
+	ENTRY_EXT,
+	entryFileName,
+	foldFileName,
+	isEntryFileNameForRead,
+	isEntryFileNameForWrite,
+	resolveUniqueFileName,
+} from "./store/filename.js";
 
 // ── store/ 读写门面 ────────────────────────────────────────────────────────────
-export { BACKUP_DIR, LOCK_FILE, MemoryStore } from "./store/memory-store.js";
-export type { Entry, EntrySummary, StoreConfig, WriteOptions } from "./store/memory-store.js";
+export { BACKUP_DIR, INDEX_FILE, LOCK_FILE, MemoryStore } from "./store/memory-store.js";
+export type {
+	ApplyChange,
+	ApplyResult,
+	Entry,
+	EntrySummary,
+	StoreConfig,
+	WriteOptions,
+} from "./store/memory-store.js";
 
 // ── store/ 并发与容错 ──────────────────────────────────────────────────────────
 export { MemoryLockedError, readLockStatus, tryWithLock, withLock } from "./store/fs-lock.js";
@@ -72,6 +86,7 @@ export {
 	modelConfigErrors,
 	requiredModel,
 	requiredModels,
+	syncConfigErrors,
 	taskModel,
 } from "./config.js";
 export type {
@@ -82,6 +97,7 @@ export type {
 	MemoryConfig,
 	ModelTask,
 	SessionPersistenceConfig,
+	SyncConfig,
 	ThinkLevel,
 } from "./config.js";
 
@@ -155,3 +171,53 @@ export type {
 	MemoryHandlerDeps,
 	MemoryHandlerOptions,
 } from "./tool/handler.js";
+
+// ── sync/ 跨设备同步 ──────────────────────────────────────────────────────────
+// 适配层只从这里拿同步能力：装引擎（`createSyncEngine`）与写触发调度器、选或实现传输端口
+// （`SyncBackend` / `createGitSyncBackend`）、以及读同步状态要用的远端布局与 manifest 助手。
+// 文件名口径（读/写两个方向的 `isEntryFileNameFor*` 与 `foldFileName`）与 `applyEntryFiles` 的入参类型
+// （`ApplyChange` / `ApplyResult`）在 store 分区、配置子树（`SyncConfig` / `syncConfigErrors`）
+// 在配置分区：一个符号只导一次，分区跟拥有它的模块走。
+export { NonFastForwardError } from "./sync/backend.js";
+export type { RemoteView, SyncBackend, SyncPublishChanges, SyncRunOptions, SyncScope } from "./sync/backend.js";
+
+export { createGitSyncBackend, gitAvailable } from "./sync/backend-git.js";
+export type { GitSyncBackendOptions } from "./sync/backend-git.js";
+
+export { conflictSuffix, resolveConflict } from "./sync/conflict.js";
+export type { ConflictInput, ConflictOutcome, ConflictSide } from "./sync/conflict.js";
+
+export { devicePath, loadOrCreateDevice } from "./sync/device.js";
+export type { DeviceIdentity } from "./sync/device.js";
+
+export { diffThreeWay, isEmptyDiff } from "./sync/diff.js";
+export type { SyncConflict, SyncDiff } from "./sync/diff.js";
+
+export { createSyncEngine } from "./sync/engine.js";
+export type { SyncEngine, SyncEngineOptions, SyncRoundResult, SyncStatusReport } from "./sync/engine.js";
+
+export { sha256Hex } from "./sync/hash.js";
+
+export { MANIFEST_VERSION, emptyManifest, manifestPath, readManifest, writeManifest } from "./sync/manifest.js";
+export type { SyncManifest } from "./sync/manifest.js";
+
+// 远端布局的单一来源：适配层渲染「这条记忆在远端哪里」一律调这两个，不要就地拼 `git/` 字面量。
+// `remotePrefix` 收**身份 key**（在这里派生成项目 key），`remotePrefixFromKey` 收已经派生好的
+// **项目 key**（适配层算 status 时手上往往就是它）；拿错一个是二次转义，不报错，只是远端多一个谁也不认的目录。
+export {
+	SYNC_DIR_NAME,
+	remoteEntryPath,
+	remotePrefix,
+	remotePrefixFromKey,
+	remoteProjectKey,
+	syncRootPath,
+} from "./sync/paths.js";
+
+export { scanLocalEntries } from "./sync/scan.js";
+export type { LocalScan } from "./sync/scan.js";
+
+// 调度器是泛型：`T` 是「一轮推送的结果」，引擎那一侧代入 `SyncRoundResult` 就不必在公开边界上转型。
+export { createSyncScheduler } from "./sync/scheduler.js";
+export type { SyncScheduler, SyncSchedulerOptions } from "./sync/scheduler.js";
+
+export type { SyncFileInfo, SyncFileSet } from "./sync/types.js";
