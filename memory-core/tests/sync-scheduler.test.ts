@@ -102,8 +102,11 @@ describe("createSyncScheduler", () => {
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(scheduler.inFlight).toBeNull();
 
-		// 失败之后没有残留的定时器：再等几个静默期也不会自己重跑（重试是下一次写入的事）
-		expect(scheduler.dirty).toBe(false);
+		// 失败的那一轮**不算发布**：内容仍然只在本地，对外必须还是「有待发布」，
+		// 否则宿主退出前问一句「还有没有没推出去的」会得到「没有」
+		expect(scheduler.dirty).toBe(true);
+		// 但失败之后没有残留的定时器：再等几个静默期也不会自己重跑
+		// （重试只有两个入口：下一次写入、宿主显式 flush）
 		await vi.advanceTimersByTimeAsync(5 * DEBOUNCE);
 		expect(run).toHaveBeenCalledTimes(1);
 
@@ -121,6 +124,8 @@ describe("createSyncScheduler", () => {
 		expect(await failing.flush()).toBeNull();
 		expect(alwaysFails).toHaveBeenCalledTimes(1);
 		expect(failing.inFlight).toBeNull();
+		expect(failing.dirty).toBe(true); // flush 自己那一轮也失败了 → 仍然不算干净
+		failing.dispose();
 	});
 
 	it("run 进行中再 noteWrite → 结束后再推一次（不并发跑两个 run）", async () => {
@@ -178,6 +183,188 @@ describe("createSyncScheduler", () => {
 		expect(await scheduler.flush(1234)).toBe("pushed");
 		expect(run).toHaveBeenLastCalledWith(1234);
 		expect(run).toHaveBeenCalledTimes(2);
+	});
+
+	it("★ run 返回 null（本轮被跳过/失败）→ 对外仍算「有待发布」，flush 会再跑一次", async () => {
+		// 钉住的是「退出兜底不得谎报干净」：撞上锁而被跳过的一轮，内容一个字节都没出去，
+		// 它必须在 flush 时被重试，而不是被算成「已经推过了」
+		let publishes = false;
+		const run = vi.fn(async (_timeoutMs: number): Promise<unknown> => (publishes ? "pushed" : null));
+		const { scheduler } = setup({ run });
+
+		scheduler.noteWrite();
+		await vi.advanceTimersByTimeAsync(DEBOUNCE);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(scheduler.dirty).toBe(true); // 白跑一轮 ≠ 干净
+		expect(scheduler.inFlight).toBeNull();
+
+		// 但**不因未发布而自动重排**：远端持续不可达时，自动重排就是每 debounceMs 一次的重试风暴
+		await vi.advanceTimersByTimeAsync(5 * DEBOUNCE);
+		expect(run).toHaveBeenCalledTimes(1);
+
+		// 补推的第一个入口：宿主显式 flush（退出兜底 / 下次会话补推）
+		expect(await scheduler.flush()).toBeNull(); // 这一次仍然没发布成功
+		expect(run).toHaveBeenCalledTimes(2);
+		expect(scheduler.dirty).toBe(true); // 还是没推出去，读数不许变
+		await vi.advanceTimersByTimeAsync(5 * DEBOUNCE);
+		expect(run).toHaveBeenCalledTimes(2); // 依然不自动重排
+
+		// 真发布成功之后才算干净
+		publishes = true;
+		expect(await scheduler.flush()).toBe("pushed");
+		expect(run).toHaveBeenCalledTimes(3);
+		expect(scheduler.dirty).toBe(false);
+		expect(await scheduler.flush()).toBeNull(); // 干净了 → 连 run 都不调
+		expect(run).toHaveBeenCalledTimes(3);
+
+		// 收摊把「没发布成功」这个标记一起丢掉：宿主已经明说不再等了
+		publishes = false;
+		scheduler.noteWrite();
+		await vi.advanceTimersByTimeAsync(DEBOUNCE);
+		expect(scheduler.dirty).toBe(true);
+		scheduler.dispose();
+		expect(scheduler.dirty).toBe(false);
+		expect(await scheduler.flush()).toBeNull();
+	});
+
+	it("★ run 失败（reject）与返回 null 同义：置起未发布标记，且不产生未处理拒绝", async () => {
+		const onUnhandled = vi.fn();
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			let fails = true;
+			const run = vi.fn(async (_timeoutMs: number): Promise<unknown> => {
+				if (fails) throw new Error("publish failed: simulated transport error");
+				return "pushed";
+			});
+			const { scheduler } = setup({ run });
+
+			scheduler.noteWrite();
+			await vi.advanceTimersByTimeAsync(DEBOUNCE);
+			expect(run).toHaveBeenCalledTimes(1);
+			expect(scheduler.dirty).toBe(true); // reject 也不算发布
+			expect(scheduler.inFlight).toBeNull();
+			await vi.advanceTimersByTimeAsync(5 * DEBOUNCE);
+			expect(run).toHaveBeenCalledTimes(1); // 同样不自动重排
+
+			fails = false;
+			expect(await scheduler.flush()).toBe("pushed"); // 退出兜底把它补上
+			expect(scheduler.dirty).toBe(false);
+
+			// 未处理拒绝要等一个**真的**事件循环回合才会露出来，假定时器不给这一回合
+			vi.useRealTimers();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(onUnhandled).not.toHaveBeenCalled();
+			scheduler.dispose();
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			vi.useRealTimers();
+		}
+	});
+
+	it("flush 不把「调用时恰好在途的那一轮」的结果当成自己的返回值", async () => {
+		const held = gate();
+		const run = vi.fn(async (_timeoutMs: number): Promise<unknown> => {
+			await held.promise;
+			return "in-flight-round";
+		});
+		const { scheduler } = setup({ run });
+		scheduler.noteWrite();
+		await vi.advanceTimersByTimeAsync(DEBOUNCE);
+		expect(scheduler.inFlight).not.toBeNull();
+
+		// 宿主问的是「我还有没有没推出去的」：拿一个它没要求过的轮次的结果回答，
+		// 等于把「那一轮成功了」冒充成「现在干净了」
+		const flushed = scheduler.flush();
+		held.open();
+		expect(await flushed).toBeNull();
+		expect(run).toHaveBeenCalledTimes(1); // 等它收尾，但绝不并发起第二轮
+		expect(scheduler.dirty).toBe(false); // 那一轮确实发布了，所以现在真干净
+	});
+
+	it("flush 等在途那一轮收尾后，若它没发布成功则接着补一轮，并报自己那一轮的结果", async () => {
+		const held = gate();
+		let skipNext = true;
+		const run = vi.fn(async (_timeoutMs: number): Promise<unknown> => {
+			if (skipNext) {
+				skipNext = false;
+				await held.promise;
+				return null; // 撞上锁被跳过
+			}
+			return "flush-round";
+		});
+		const { scheduler } = setup({ run });
+		scheduler.noteWrite();
+		await vi.advanceTimersByTimeAsync(DEBOUNCE);
+
+		const flushed = scheduler.flush();
+		held.open();
+		// 报出去的是 flush 自己那一轮，不是被跳过的那一轮（那一轮的结果是 null）
+		expect(await flushed).toBe("flush-round");
+		expect(run).toHaveBeenCalledTimes(2);
+		expect(scheduler.dirty).toBe(false);
+	});
+
+	it("泛型：flush 的返回值就是 run 的结果类型，调用方不必向下转型", async () => {
+		interface Round {
+			readonly pushed: string[];
+		}
+		const run = vi.fn(async (_timeoutMs: number): Promise<Round | null> => ({ pushed: ["A.md"] }));
+		const scheduler = createSyncScheduler<Round>({ debounceMs: DEBOUNCE, timeoutMs: TIMEOUT, run });
+		scheduler.noteWrite();
+		// 这两行能编译过就是断言本身：`result` 是 `Round | null`，不是 `unknown`
+		const result = await scheduler.flush();
+		expect(result?.pushed).toEqual(["A.md"]);
+		expect(run).toHaveBeenCalledWith(TIMEOUT);
+		// 在途的那一份同样带类型（宿主只等它，不读它）
+		expect(scheduler.inFlight satisfies Promise<Round | null> | null).toBeNull();
+		scheduler.dispose();
+	});
+
+	it("收尾里重排定时器抛错也不产生未处理拒绝（收尾整个包在 try 里）", async () => {
+		// 用真定时器：要观察的是「异常从被 void 掉的 promise 里逃出去」这种真事件循环行为
+		vi.useRealTimers();
+		const realSetTimeout = globalThis.setTimeout;
+		const wait = (ms: number): Promise<void> => new Promise((resolve) => realSetTimeout(resolve, ms));
+		const onUnhandled = vi.fn();
+		process.on("unhandledRejection", onUnhandled);
+		/** 只在「放行在途那一轮之后」开闸：那之后的排定时器只可能来自收尾 */
+		let boom = false;
+		let threw = false;
+		try {
+			const held = gate();
+			const run = vi.fn(async (_timeoutMs: number): Promise<unknown> => {
+				await held.promise;
+				return "pushed";
+			});
+			vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+				if (boom) {
+					threw = true;
+					throw new Error("setTimeout unavailable: simulated");
+				}
+				return realSetTimeout(fn, ms);
+			}) as typeof setTimeout);
+
+			const { scheduler } = setup({ run, debounceMs: 5 });
+			scheduler.noteWrite();
+			scheduler.noteWrite(); // 定时器还在 → 不重排
+			await wait(20);
+			expect(run).toHaveBeenCalledTimes(1);
+			scheduler.noteWrite(); // 在途期间又写了一次 → 脏标记留给收尾去重排
+			await wait(20); // 让那一次排的定时器到点空转（在途未完 → 不起第二轮，timer 归 null）
+			boom = true; // 从此以后任何排定时器都炸：收尾那一次必然撞上
+			held.open();
+			await wait(20);
+
+			expect(threw).toBe(true); // 变异验证的自检：确实走到了「收尾里排定时器抛错」这条路
+			expect(run).toHaveBeenCalledTimes(1); // 重排没成 → 没有第二次推送，但绝不掀掉宿主进程
+			await wait(5);
+			expect(onUnhandled).not.toHaveBeenCalled();
+			scheduler.dispose();
+		} finally {
+			vi.restoreAllMocks();
+			process.off("unhandledRejection", onUnhandled);
+			vi.useRealTimers();
+		}
 	});
 
 	it("dispose 取消待跑的推送，且 inFlight 归 null", async () => {

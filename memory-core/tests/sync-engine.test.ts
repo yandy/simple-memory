@@ -1249,4 +1249,34 @@ describe("sync engine（假 backend）", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	it("自动推送撞上锁被跳过 → 引擎不谎报干净，flush 把这一推补上", async () => {
+		// 用户写了几条记忆就退出，而这一刻整理轮正持着项目的逻辑锁（或另一个项目持着根锁）：
+		// 到点的那一推被跳过，一个字节都没发出去。少了「跳过 → 仍未发布」这一层，宿主退出前问
+		// flush 会得到「没有待发布内容」，那几条记忆就只能等下一次写入或下一次会话的补推
+		await store.addEntry({ name: "A", body: "a" });
+		vi.useFakeTimers();
+		try {
+			await tryWithLock(join(syncRoot, "sync.lock"), "test", { timeoutMs: 0 }, async () => {
+				engine.noteWrite();
+				await vi.advanceTimersByTimeAsync(SYNC_CONFIG.pushDebounceMs);
+				const skipped = engine.inFlight;
+				expect(skipped).not.toBeNull();
+				await skipped; // 轮里有真 I/O，假定时器不等它
+				expect(await remote.names(prefix)).toEqual([]); // 锁没拿到 → 什么都没推出去
+				expect(remote.fetches).toBe(0); // 跳过的那一轮根本走不到 backend
+			});
+			expect(engine.inFlight).toBeNull();
+
+			// 锁放开之后由 flush 补推：这正是宿主退出兜底走的那条路
+			expect(await engine.flush()).toMatchObject({ ok: true, pushed: ["A.md"] });
+			expect(await remote.names(prefix)).toEqual(["A.md"]);
+			expect(remote.fetches).toBe(1);
+			expect(await engine.flush()).toBeNull(); // 补推成功之后才真的干净
+			expect(remote.fetches).toBe(1);
+		} finally {
+			engine.dispose();
+			vi.useRealTimers();
+		}
+	});
 });

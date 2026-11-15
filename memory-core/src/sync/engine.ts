@@ -122,7 +122,11 @@ export interface SyncEngine {
 	status(timeoutMs?: number): Promise<SyncStatusReport>;
 	/** 记下「本地刚写过」，由写触发调度器接线（去抖之后调 `flush`）。 */
 	noteWrite(): void;
-	/** 立刻跑一次去抖中的推送；没有在途/待推的工作则返回 `null`。 */
+	/**
+	 * 立刻跑一次去抖中的推送；没有尚未发布的内容则返回 `null`。
+	 * 「尚未发布」包括上一次自动推送被跳过/失败的那一份：撞上锁而白跑的一轮不算干净，
+	 * 宿主退出前调它就能把那一推补上。
+	 */
 	flush(timeoutMs?: number): Promise<SyncRoundResult | null>;
 	/** 释放调度器持有的资源。绝不抛错。 */
 	dispose(): void;
@@ -138,7 +142,7 @@ export interface SyncEngine {
  *
  * 这样调用点（每次写入之后那一行）不必到处判 `config.pushOnWrite` —— 分支只在这里出现一次。
  */
-const NOOP_SCHEDULER: SyncScheduler = {
+const NOOP_SCHEDULER: SyncScheduler<SyncRoundResult> = {
 	noteWrite(): void {},
 	flush(): Promise<null> {
 		return Promise.resolve(null);
@@ -977,12 +981,19 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 推送与手动 `push()` 走同一条 `runRound`：锁、快照、冲突收敛、基线全都不变，
 	 * 唯一区别是它由写入触发而不是用户敲命令。
 	 */
-	const scheduler: SyncScheduler = config.pushOnWrite
-		? createSyncScheduler({
+	const scheduler: SyncScheduler<SyncRoundResult> = config.pushOnWrite
+		? createSyncScheduler<SyncRoundResult>({
 				debounceMs: config.pushDebounceMs,
 				timeoutMs: config.autoTimeoutMs,
-				run: (timeoutMs) => runRound("push", timeoutMs),
-				now: () => now().getTime(),
+				/*
+				 * 「没发布成功的一轮」必须映射成 `null`。`runRound` 永远 resolve 出一个结果对象 ——
+				 * 锁忙是 `SyncSkip`、传输失败是 `failedRound`，都包在 `ok: false` 里，从不 reject ——
+				 * 原样交过去的话调度器看到的是「永远成功」，退出兜底就会谎报干净。
+				 */
+				run: async (timeoutMs) => {
+					const result = await runRound("push", timeoutMs);
+					return result.ok ? result : null;
+				},
 			})
 		: NOOP_SCHEDULER;
 
@@ -998,7 +1009,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			}),
 		// 写触发推送的三个出口：记下写入、退出/补推时立刻跑一次、收摊。全部转发给调度器。
 		noteWrite: () => scheduler.noteWrite(),
-		flush: (timeoutMs?: number) => scheduler.flush(timeoutMs) as Promise<SyncRoundResult | null>,
+		flush: (timeoutMs?: number) => scheduler.flush(timeoutMs),
 		dispose: () => scheduler.dispose(),
 		get inFlight(): Promise<unknown> | null {
 			return scheduler.inFlight;
