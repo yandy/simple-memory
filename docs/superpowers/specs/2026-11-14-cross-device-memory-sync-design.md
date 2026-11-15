@@ -361,8 +361,9 @@ export interface SyncRunOptions {
 
 - 全部走 `execFile("git", [...])`（不是 shell），带 `timeoutMs`、`cwd: <root>/.sync/repo`、
   可选 `signal`；沿用 `store/paths.ts` 的口径（`promisify(execFile)` + catch）。
-- `fetch()`：`git fetch --quiet origin <branch>`；`list()` 用 `git ls-tree -r --name-only FETCH_HEAD`
-  （**整棵树**）再分类：在 `<scope.prefix>/` 下且去掉前缀后不再含 `/` 的 → 进 scope，其余 →
+- `fetch()`：`git fetch --quiet origin <branch>`；`list()` 用 `git ls-tree -r --name-only -z FETCH_HEAD`
+  （**整棵树**，且**必须带 `-z`** —— 不加时 git 会把非 ASCII 路径 C-quote 成八进制转义形式，中文文件名
+  会全部落到 `outOfScope`，一条都同步不了且不报错）再分类：在 `<scope.prefix>/` 下且去掉前缀后不再含 `/` 的 → 进 scope，其余 →
   进 `outOfScope`；再用**一次** `git cat-file --batch` 读出范围内全部 blob 并逐个算 sha256
   （`ls-tree` 给的是 blob sha1，与端口契约的 sha256 不同源；记忆文本量小，一次批量读比维护两套
   hash 语义简单）。
