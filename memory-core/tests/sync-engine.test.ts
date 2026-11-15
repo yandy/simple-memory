@@ -96,6 +96,8 @@ interface FakeRemote extends SyncBackend {
 	write(prefix: string, path: string, content: string): Promise<void>;
 	/** 模拟有人手工往远端根推了一个范围外路径。 */
 	writeRaw(path: string, content: string): Promise<void>;
+	/** 模拟另一台设备删掉了某个前缀下的文件（远端删除，revision 同样要前进）。 */
+	remove(prefix: string, path: string): Promise<void>;
 	read(prefix: string, path: string): Promise<string>;
 	names(prefix: string): Promise<string[]>;
 }
@@ -209,6 +211,12 @@ function createFakeRemote(): FakeRemote {
 		},
 		async writeRaw(path: string, content: string) {
 			loose.set(path, content);
+			remote.revision = `rev-${(counter += 1)}`;
+		},
+		async remove(prefix: string, path: string) {
+			const own = scopes.get(prefix) ?? new Map<string, string>();
+			own.delete(path);
+			scopes.set(prefix, own);
 			remote.revision = `rev-${(counter += 1)}`;
 		},
 		async read(prefix: string, path: string) {
@@ -489,6 +497,36 @@ describe("sync engine（假 backend）", () => {
 		expect(await remote.names(prefix)).toEqual([res.conflicts[0].keptAsNew]);
 	});
 
+	it("删除 vs 修改之后连着两轮 pull：第二轮不再造副本，删除一轮就收敛", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		await engine.push();
+		await store.removeEntry("A"); // 本地删了
+		await remote.write(prefix, "A.md", raw("A", "2099-01-01T00:00:00.000Z", "远端改过的版本")); // 远端改了
+		const copies = async () => (await readdir(projectDir)).filter((name) => name.includes("冲突")).sort();
+
+		const first = await engine.pull();
+		expect(first.conflicts).toHaveLength(1);
+		expect(await copies()).toHaveLength(1);
+		// 载重：收敛之后基线记的是「远端此刻那份」（= 两侧上一次达成一致的状态），而不是沿用
+		// 冲突前的旧条目。沿用旧条目会让第二轮再判成同一场删改冲突 —— 每拉一次就多一份副本，
+		// 而删除永远推不出去。
+		const manifest = await readManifest(manifestPath(syncRoot, projectKey));
+		expect(manifest?.files["A.md"].hash).toBe(sha256Hex(await remote.read(prefix, "A.md")));
+
+		const second = await engine.pull();
+		expect(second.conflicts).toEqual([]); // 同一场冲突不会重演
+		expect(await copies()).toHaveLength(1); // 副本数不增长
+		// 基线里它就是远端那份 → 「base 有 / ours 无 / theirs 未动」= 本地删了 → 删除待发布
+		expect(second.deletedRemote).toEqual(["A.md"]);
+		expect(await readdir(projectDir)).not.toContain("A.md");
+
+		const third = await engine.push();
+		expect(third.deletedRemote).toEqual(["A.md"]);
+		// 删除真的到了远端，幸存的那份内容也推上去了，两份都在
+		expect(await remote.names(prefix)).toEqual([first.conflicts[0].keptAsNew]);
+		expect(await remote.read(prefix, first.conflicts[0].keptAsNew)).toContain("远端改过的版本");
+	});
+
 	it("远端范围外路径被忽略并记进 outOfScopeRemote", async () => {
 		await remote.writeRaw("MEMORY.md", "# 手推的索引");
 		await remote.writeRaw("local/x.md", raw("X"));
@@ -553,6 +591,33 @@ describe("sync engine（假 backend）", () => {
 		const after = await readManifest(manifestPath(syncRoot, projectKey));
 		expect(after?.base.revision).toBe(remote.revision);
 		expect(after?.files["A.md"].hash).toBe(sha256Hex(await readFile(join(projectDir, "A.md"), "utf8")));
+	});
+
+	it("pull 轮绝不把本地未发布的内容记进基线：下一轮仍判成本地领先，而不是把它删掉", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		await engine.push(); // 先对齐
+		await store.addEntry({ name: "B", body: "b" }); // 本地领先，还没推出去
+		await remote.write(prefix, "c.md", raw("C")); // 远端也领先
+
+		const pulled = await engine.pull();
+		expect(pulled.pulled).toEqual(["c.md"]);
+		expect(pulled.pushed).toEqual([]);
+		// 载重：基线只记「两侧达成一致的状态」。pull 轮不发布，所以本轮产生的本地内容
+		// （B.md）绝不能进基线 —— 否则下一轮就是「base 有 / ours 有 / theirs 无」= 远端删了它
+		// → deleteLocal → 用户自己还没推出去的记忆被从本地删掉。
+		const manifest = await readManifest(manifestPath(syncRoot, projectKey));
+		expect(manifest?.files["B.md"]).toBeUndefined();
+		expect(manifest?.files["c.md"].hash).toBe(sha256Hex(raw("C")));
+
+		// 下一轮：它仍然是「待发布」，文件也还在盘上
+		const report = await engine.status();
+		expect(report.ahead).toEqual(["B.md"]);
+		expect(report.behind).toEqual([]);
+		expect(await readFile(join(projectDir, "B.md"), "utf8")).toContain("name: B");
+
+		const pushed = await engine.push();
+		expect(pushed.pushed).toEqual(["B.md"]);
+		expect(await remote.read(prefix, "B.md")).toContain("name: B");
 	});
 
 	it("NonFastForward：整轮重跑一次后成功；两次都失败则 ok:false", async () => {
@@ -725,7 +790,8 @@ describe("sync engine（假 backend）", () => {
 		expect(remote.publishes.at(-1)?.deletions ?? []).toEqual([]);
 		expect(await remote.read(prefix, "A.md")).toContain("name: A"); // 远端副本还在
 		expect(await readFile(join(projectDir, "A.md"), "utf8")).toBe("没有 frontmatter 了"); // 本地那份也还在
-		// 基线里它仍按远端那份记着，所以下一轮不会把远端副本重新拉下来盖掉本地坏文件
+		// 本地这一份读不出 → 本轮既不动它、也不拿它当删除；基线冻结在上一次一致的那份
+		// （此刻与远端那份逐字相同），所以下一轮也不会把远端副本拉下来盖掉本地坏文件
 		const manifest = await readManifest(manifestPath(syncRoot, projectKey));
 		expect(manifest?.files["A.md"].hash).toBe(sha256Hex(await remote.read(prefix, "A.md")));
 
@@ -735,6 +801,69 @@ describe("sync engine（假 backend）", () => {
 		expect(healed.ok).toBe(true);
 		expect(healed.unparsableLocal).toEqual([]);
 		expect(await remote.read(prefix, "A.md")).toBe(raw("A"));
+	});
+
+	it("本地读不出的文件 + 远端改了同名文件 → 本地字节不动、不造副本，只进 unparsableLocal", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		await engine.push();
+		const broken = "name: A\n正文还在，只是 frontmatter 被手改坏了";
+		await writeFile(join(projectDir, "A.md"), broken, "utf8");
+		await remote.write(prefix, "A.md", raw("A", "2099-01-01T00:00:00.000Z", "远端改过的版本"));
+		const copies = async () => (await readdir(projectDir)).filter((name) => name.includes("冲突"));
+
+		const pulled = await engine.pull();
+		const pushed = await engine.push();
+		for (const round of [pulled, pushed]) {
+			expect(round.ok).toBe(true);
+			expect(round.unparsableLocal).toEqual(["A.md"]); // 每轮都报，直到用户自己处理
+			// 载重：读不出的那份绝不被远端的版本盖掉，也不被当成「已删除的一侧」另存副本
+			expect(round.conflicts).toEqual([]);
+			expect(round.deletedLocal).toEqual([]);
+			expect(round.deletedRemote).toEqual([]);
+			expect(round.pulled).toEqual([]);
+			expect(await copies()).toEqual([]);
+			expect(await readFile(join(projectDir, "A.md"), "utf8")).toBe(broken);
+		}
+		// 远端那份也原样留着：收不下 ≠ 替对端决定它那份该没了
+		expect(await remote.read(prefix, "A.md")).toContain("远端改过的版本");
+		expect(remote.publishes.at(-1)?.deletions ?? []).toEqual([]);
+
+		// 修好之后：基线冻结在上一次一致的那份，所以两侧算「都改过」→ 冲突 → 两份都留，
+		// 而不是「只本地改过」→ 拿修好的旧内容盖掉对端的新版本
+		await writeFile(join(projectDir, "A.md"), raw("A", "2026-11-10T00:00:00.000Z", "本地修好的版本"), "utf8");
+		const healed = await engine.push();
+		expect(healed.unparsableLocal).toEqual([]);
+		expect(healed.conflicts).toHaveLength(1);
+		// 远端那份 modified 更新 → 逐字留在原路径；修好的那份作为新 entry 留下
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("远端改过的版本");
+		expect(await readFile(join(projectDir, healed.conflicts[0].keptAsNew), "utf8")).toContain("本地修好的版本");
+		expect(await remote.read(prefix, healed.conflicts[0].keptAsNew)).toContain("本地修好的版本");
+	});
+
+	it("本地读不出的文件 + 远端删了它 → 本地那份还在，两个方向的删除都不提它", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		await engine.push();
+		const broken = "没有 frontmatter 了";
+		await writeFile(join(projectDir, "A.md"), broken, "utf8");
+		await remote.remove(prefix, "A.md");
+
+		const pulled = await engine.pull();
+		const pushed = await engine.push();
+		for (const round of [pulled, pushed]) {
+			expect(round.ok).toBe(true);
+			expect(round.unparsableLocal).toEqual(["A.md"]);
+			expect(round.deletedLocal).toEqual([]);
+			expect(round.deletedRemote).toEqual([]);
+			expect(round.conflicts).toEqual([]);
+			expect(await readFile(join(projectDir, "A.md"), "utf8")).toBe(broken);
+		}
+		expect(await remote.names(prefix)).toEqual([]);
+
+		// 用户自己删掉它之后，同步不再报它，也不会把它从远端拉回来（那会让删除永远完不成）
+		await rm(join(projectDir, "A.md"));
+		const after = await engine.push();
+		expect(after.unparsableLocal).toEqual([]);
+		expect(await readdir(projectDir)).not.toContain("A.md");
 	});
 
 	it(
@@ -879,8 +1008,8 @@ describe("sync engine（假 backend）", () => {
 		expect((await store.listEntries()).some((e) => e.name.startsWith("A (冲突 "))).toBe(true);
 	});
 
-	it("同一场冲突连着解两次：副本名字被复用，不会每轮多一份", async () => {
-		// 本地这一侧 modified 更新（本地胜）+ pull 轮不发布 → 下一轮仍是同一场冲突
+	it("基线丢了（读不懂 → 当空基线）之后同一场冲突重解一次：副本名字被复用，不会多一份", async () => {
+		// 本地这一侧 modified 更新（本地胜）→ 副本装的是远端那份
 		await store.addEntry({ name: "A", body: "最早的版本" });
 		await engine.push();
 		await store.replaceEntry("A", { body: "台式机的版本" });
@@ -888,10 +1017,15 @@ describe("sync engine（假 backend）", () => {
 
 		const first = await engine.pull();
 		expect(first.conflicts).toHaveLength(1);
+		// 收敛之后基线已经前进，同一场冲突不会每轮重演（否则副本会越同步越多）；
+		// 但基线丢失是设计里明确允许的降级（读不懂 → 当空基线），那时它会再被解一次
+		expect((await engine.pull()).conflicts).toEqual([]);
+		await writeFile(manifestPath(syncRoot, projectKey), "{{{", "utf8");
+
 		const second = await engine.pull();
 		expect(second.conflicts).toHaveLength(1);
 		// 载重：占用清单带着 hash 传下去，「同内容即复用」那一支才会生效；
-		// 只给名字会一律走确定性追加，同一条记忆每轮多出一份副本，永不收敛
+		// 只给名字会一律走确定性追加，同一条记忆每重解一次就多出一份副本
 		expect(second.conflicts[0].keptAsNew).toBe(first.conflicts[0].keptAsNew);
 		expect((await store.listEntries()).filter((e) => e.name.includes("(冲突 "))).toHaveLength(1);
 		expect(await readdir(projectDir).then((n) => n.filter((x) => x.includes("冲突")))).toHaveLength(1);

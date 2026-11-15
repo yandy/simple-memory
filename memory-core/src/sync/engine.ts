@@ -15,7 +15,7 @@ import {
 } from "./backend.js";
 import { type ConflictOutcome, type ConflictSide, resolveConflict } from "./conflict.js";
 import type { DeviceIdentity } from "./device.js";
-import { diffThreeWay, type SyncConflict } from "./diff.js";
+import { type SyncConflict, diffThreeWay, type SyncDiff } from "./diff.js";
 import { sha256Hex } from "./hash.js";
 import { emptyManifest, MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "./manifest.js";
 import { type LocalScan, scanLocalEntries } from "./scan.js";
@@ -40,8 +40,9 @@ import type { SyncFileInfo, SyncFileSet } from "./types.js";
  *
  * **铁律：任何同步失败都不得阻塞会话、不得损坏本地记忆，最坏结果永远是「退回手动」。**
  * 因此这里没有一处会把异常抛给调用方：所有失败都变成 `ok: false` + 一句可读的原因。
- * 四条数据安全线（`unparsable` 不是删除、远端 `modified` 必须先验形状、冲突收敛抛错只跳过该条、
- * 根级 sync 锁真的存在）各自在实现处写了「为什么不能删掉这段」。
+ * 五条数据安全线（基线只记「两侧达成一致的状态」、读不出的本地文件既不是删除也不是可覆盖的
+ * 旧版本、远端 `modified` 必须先验形状、冲突收敛抛错只跳过该条、根级 sync 锁真的存在）
+ * 各自在实现处写了「为什么不能删掉这段」。
  */
 
 /** 引擎的装配参数。全部由适配层算好交进来：core 不读配置文件，也不猜项目身份。 */
@@ -184,53 +185,95 @@ function asFileRecord(files: SyncFileSet): Record<string, SyncFileInfo> {
 }
 
 /**
- * 算出这一轮之后该记进基线的文件集。
+ * 算出这一轮之后该记进基线的文件集：**这一轮的 `theirs`**，再按两类例外修正（本轮没收下的
+ * 名字剔掉，本地读不出的名字冻结在上一次一致的那份）。
  *
- * 基线是三方合并里的「共同祖先」，所以它只能记**两边真的一致**的那些名字。把「只有本地有」
- * 的内容记进基线是本功能最危险的一个错误：下一轮的差集会读成「base 有 / ours 有 / theirs 无」
- * = 远端删了它 → 引擎把用户自己的记忆从本地删掉。而「发布失败」与「pull 轮不发布」两种情况
- * 恰恰都会留下只有一边有的内容，所以这里逐名字判一致，不一致的一律沿用上一次基线。
+ * 基线是三方合并里的「共同祖先」，它的语义是「两侧上一次真正达成一致的状态」，
+ * **不是**「我盘上现在有什么」。所以它的形状只能从远端这一侧长出来：远端此刻持有的就是
+ * 两侧都看得见的那份状态，而本地独有的内容要等**发布成功**之后才算达成一致（见 `publishPhase`，
+ * 那里用发布出去的增量覆盖/删除对应条目）。
  *
- * @param local 应用之后重新扫出来的本地文件集
- * @param remote 这一刻远端持有的文件集（发布段成功之后传「发布后的远端」）
- * @param previous 上一次的基线
- * @param deletedLocally 本轮在本地删掉、但远端还留着的名字（删除还没发布出去）
+ * `unagreed` 是本轮**没能收下**远端那份内容的名字（解析不出、`modified` 形状不对、store 拒收、
+ * 冲突没收敛掉）。把它们记进基线等于宣布「我们已经接受了这份内容」，而下一轮的差集会照这句话办事：
+ * - 本地没有它 → 「base 有 / ours 无 / theirs 未动」= 用户删了 → 把对端那份删掉；
+ * - 本地有自己的版本 → 「base 有（= 对端那份）/ ours 改了 / theirs 未动」= 本地胜 →
+ *   拿本地那份盖掉对端那份，静默丢掉我们明确拒收过的内容。
+ * 两种都是替对端做决定。留在基线之外，下一轮才会照旧判成「远端有、我们收不下」→ 再报一次。
+ *
+ * 注意本地读不出的文件（`unparsable`）**不在** `unagreed` 里，它们走另一条路：基线**冻结**在
+ * 上一次一致的那份（`untouched`）。因为本地这一份本轮根本不参与判定，也就无从达成一致，
+ * 此时跟着 `theirs` 前进会把「对端的新版本」误记成「我们已经接受过的共同祖先」：
+ * 用户把本地文件修好之后（修好的往往是自己那份旧内容），下一轮就成了「只本地改过」→
+ * 拿修好的那份盖掉对端的新版本，对端的内容两边一起丢。冻结在上一次一致的那份，
+ * 修好之后就是「两侧都改过」→ 冲突 → 两份都留；用户自己删掉它之后，删除也能正常传到对端。
+ *
+ * @param theirs 这一轮取到的远端文件集
+ * @param localAfter 应用之后重新扫出来的本地文件集
+ * @param previousBase 上一次的基线（只用于冻结 `untouched` 里的名字）
+ * @param untouched 本地读不出的名字：本轮一律不动，基线也不得前进
+ * @param unagreed 本轮没收下远端那份内容的名字
  */
-function nextBaseFiles(
-	local: SyncFileSet,
-	remote: SyncFileSet,
-	previous: SyncFileSet,
-	deletedLocally: ReadonlySet<string>,
-): Record<string, SyncFileInfo> {
-	const agreed = new Map<string, SyncFileInfo>();
-
-	for (const [file, info] of local) {
-		const there = remote.get(file);
-		if (there !== undefined && there.hash === info.hash) agreed.set(file, info);
-		else {
-			// 还没达成一致（本轮没发布、发布失败、或被拒收）：沿用上一次基线，
-			// 于是下一轮仍然判得出「本地改了、远端没改」→ 继续推。
-			const carried = previous.get(file);
-			if (carried !== undefined) agreed.set(file, carried);
+function agreedBaseFiles(
+	theirs: SyncFileSet,
+	localAfter: SyncFileSet,
+	previousBase: SyncFileSet,
+	untouched: ReadonlySet<string>,
+	unagreed: ReadonlySet<string>,
+): Map<string, SyncFileInfo> {
+	const base = new Map<string, SyncFileInfo>();
+	for (const file of new Set([...theirs.keys(), ...untouched])) {
+		if (unagreed.has(file)) continue;
+		if (untouched.has(file)) {
+			// 从没达成过一致（例如一上来就读不出、远端也从来没推成功过）→ 干脆不记：
+			// 记一个假祖先比不记更危险，它会让下一轮把两侧的内容当成「其中一侧改过」。
+			const frozen = previousBase.get(file);
+			if (frozen !== undefined) base.set(file, frozen);
+			continue;
 		}
+		const remote = theirs.get(file);
+		if (remote === undefined) continue;
+		const mine = localAfter.get(file);
+		// 本地此刻就是同一份字节时用本地扫出的指纹：远端清单只给得出 hash，`modified`/`bytes`
+		// 是占位值（见 `readRemoteSnapshot`），能给出真值就不要在基线里留占位。
+		base.set(file, mine !== undefined && mine.hash === remote.hash ? mine : remote);
 	}
-	// 本地已经没有、远端还留着的名字：只有「远端那份与基线一致」时才保留基线条目 ——
-	// 那说明本地删除还没发布成功，下一轮要接着推这次删除。发布成功之后远端也没有它了，
-	// 这里自然就把它丢掉，基线不会留一条永远不会兑现的账。
-	for (const [file, info] of previous) {
-		if (agreed.has(file) || local.has(file)) continue;
-		const there = remote.get(file);
-		if (there !== undefined && there.hash === info.hash) agreed.set(file, info);
-	}
-	// 「删除 vs 修改」的冲突里原路径被删掉，而远端那一份与基线并不相同（对端改过）：
-	// 按远端此刻的指纹记进基线，下一轮才会仍然判成「本地删了、远端没动」→ 把删除推出去，
-	// 而不是把远端那份重新拉回来（那会让「删除照办」在下一轮被自己撤销）。
-	for (const file of deletedLocally) {
-		if (agreed.has(file) || local.has(file)) continue;
-		const there = remote.get(file);
-		if (there !== undefined) agreed.set(file, there);
-	}
-	return asFileRecord(agreed);
+	return base;
+}
+
+/**
+ * 解析不出/读不了的本地文件本轮**一律不动**：从差集产出的每一张动作清单里剔除。
+ *
+ * 扫描把这种文件放进 `unparsable` 而不是 `files`，于是差集看到「base 有 / ours 无」，
+ * 按标准三方语义会有三种结论，每一种都会动到这份读不出的文件：
+ * - 远端未动 → 判成**用户删除** → 删除被推到远端：一个坏文件（手滑编辑、半截写入、权限抖动）
+ *   就能把两台设备上的同一条记忆一起删掉，而本地那份还躺在盘上；
+ * - 远端改过 → 判成**删除 vs 修改** → 每轮多出一份副本，本地那份仍然没人管；
+ * - 远端改过而本地按基线算没动 → 判成**远端胜** → 用远端那份盖掉本地这份读不出的文件。
+ *
+ * 第三种尤其拦不得：frontmatter 被手改坏的文件，正文往往正是用户最在乎的内容，用远端的旧版本
+ * 盖掉它违反本设计的铁律「任何同步失败都不得损坏本地记忆」，而 `.backups/<ts>-sync/` 只保留
+ * 5 份快照，不足以当作覆盖的补偿。所以这里连 `conflicts` 一起剔：这份文件既不被覆盖、也不被删除、
+ * 更不触发对端删除，只出现在 `unparsableLocal` 报告里，每轮都报，直到用户自己修好或自己删掉它。
+ *
+ * 剔完之后**不需要**再把这些名字按基线补回 `ours`：补回只能压掉第一种（`deleteRemote`），
+ * 压不住第二、第三种；而两套机制并存会让「差集的结论」与「实际执行的动作」长期不一致，
+ * 后来人再也看不出哪一套算数。
+ */
+function withoutUnparsable(diff: SyncDiff, untouched: ReadonlySet<string>): SyncDiff {
+	if (untouched.size === 0) return diff;
+	return {
+		pullFromRemote: diff.pullFromRemote.filter((file) => !untouched.has(file)),
+		pushLocal: diff.pushLocal.filter((file) => !untouched.has(file)),
+		deleteLocal: diff.deleteLocal.filter((file) => !untouched.has(file)),
+		deleteRemote: diff.deleteRemote.filter((file) => !untouched.has(file)),
+		conflicts: diff.conflicts.filter((conflict) => !untouched.has(conflict.file)),
+	};
+}
+
+/** 本轮**没收下**远端这份内容：既不发布（两个方向都不动），也绝不进基线（见 `agreedBaseFiles`）。 */
+function markUnagreed(plan: ApplyPlan, file: string): void {
+	plan.excluded.add(file);
+	plan.unagreed.add(file);
 }
 
 /** 一次远端快照里引擎要用的部分：内容按名字取，`theirs` 只有 hash 是真的（见 `readRemoteSnapshot`）。 */
@@ -241,12 +284,10 @@ interface RemoteSnapshot {
 	outOfScope: string[];
 }
 
-/** 应用段的产物：交给发布段的增量，以及推进基线所需的三份文件集。 */
+/** 应用段的产物：交给发布段的增量，以及发布成功之后基线该记的那份文件集。 */
 interface AppliedRound {
 	delta: SyncPublishChanges;
-	localAfter: SyncFileSet;
-	previousBase: SyncFileSet;
-	/** 发布成功之后远端应有的样子（用它推进基线，才不会把没发布的内容记成已一致）。 */
+	/** 发布成功之后远端应有的样子（= 本轮基线 + 发布出去的增量）。没发布成功就不许用它前进基线。 */
 	remoteAfterPublish: SyncFileSet;
 }
 
@@ -263,6 +304,14 @@ interface ApplyPlan {
 	 * 算成删除更糟 —— 那是「我们收不下对端那份，于是把对端那份删了」。
 	 */
 	excluded: Set<string>;
+	/**
+	 * 本轮**没收下远端那份内容**的名字（`excluded` 的子集，见 `markUnagreed`）：不得进基线。
+	 *
+	 * 与 `excluded` 分开是因为两者不重合：本地读不出的文件在 `excluded` 里（不发布），
+	 * 但它不算「没收下」—— 本地这一份本轮压根没参与判定，基线走的是另一条路（冻结在上一次
+	 * 一致的那份，见 `agreedBaseFiles` 的 `untouched`）。
+	 */
+	unagreed: Set<string>;
 }
 
 export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
@@ -399,16 +448,16 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			return null;
 		});
 		if (raw === null) {
-			plan.excluded.add(file);
+			markUnagreed(plan, file);
 			return null;
 		}
 		const parsed = parseEntryFile(raw);
 		if (parsed === null) {
-			// 正常走不到这里：解析不出的本地文件会被扫描归进 `unparsable`，并按基线的指纹补回
-			// `ours`（= 没改过），差集因此不会把它判成冲突。真撞上只可能是它在扫描之后才坏掉，
-			// 处置与上面一致：这一条不动，两侧内容都原样留着。
+			// 正常走不到这里：解析不出的本地文件会被扫描归进 `unparsable`，而那一类名字本轮
+			// 已从差集的每一张清单里剔除（见 `withoutUnparsable`），根本不会被当成冲突送进来。
+			// 真撞上只可能是它在扫描之后才坏掉，处置与上面一致：这一条不动，两侧内容都原样留着。
 			rejected.push({ file, reason: "unparsable frontmatter" });
-			plan.excluded.add(file);
+			markUnagreed(plan, file);
 			return null;
 		}
 		// 指纹按**这一刻读到的字节**重算：`ConflictSide` 的 raw 与 info 必须描述同一份内容
@@ -424,7 +473,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	): Promise<ConflictSide | null> {
 		const accepted = await acceptRemote(view, file, rejected);
 		if (accepted === null) {
-			plan.excluded.add(file);
+			markUnagreed(plan, file);
 			return null;
 		}
 		return {
@@ -463,7 +512,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			outcome = resolveConflict({ file, ours, theirs }, plan.taken);
 		} catch (err) {
 			result.rejected.push({ file, reason: `conflict not resolved: ${describeError(err)}` });
-			plan.excluded.add(file);
+			markUnagreed(plan, file);
 			return;
 		}
 		// null = 两侧字节其实相同：差集按 hash 判定，正常走不到这里
@@ -508,24 +557,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		const manifest = (await readManifest(manifestFile)) ?? emptyManifest();
 		const previousBase = asFileSet(manifest.files);
 
-		/**
-		 * 解析不出/读不了的本地文件**不是删除**。
-		 *
-		 * 扫描把它放进 `unparsable` 而不是 `files`，于是差集看到「base 有 / ours 无 / theirs 未动」
-		 * = 用户删了它 → 删除被推到远端 → 一个坏文件（手滑编辑、半截写入、权限抖动）就能把
-		 * 两台设备上的同一条记忆一起删掉，而本地那份还躺在盘上。所以这里按基线的指纹把它补回
-		 * `ours`，等于宣告「本地这一份本轮不参与判定」；名字仍然进 `unparsableLocal` 报告。
-		 *
-		 * 补回之后它仍可能被差集判成「远端胜」（对端改了或删了，而本地这一份按基线算没动），
-		 * 那是三方合并的正常结论，不是本段要拦的：字节已经进了本轮的 `-sync` 快照，而拿远端
-		 * 一份能读的内容替掉本地一份读不出的内容，正是收敛。真正要拦的是「拿它当本地删除」，
-		 * 以及「把它发布出去」（见 `ApplyPlan.excluded`）。
-		 */
+		// 解析不出/读不了的本地文件不进 `ours`，也不按基线补回：它们本轮一律不动，
+		// 由下面的 `withoutUnparsable` 从每一张动作清单里剔除（理由写在那里）。
 		const ours: SyncFileSet = new Map(scan.files);
-		for (const file of scan.unparsable) {
-			const known = previousBase.get(file);
-			if (known !== undefined) ours.set(file, known);
-		}
+		const untouched = new Set(scan.unparsable);
 		result.unparsableLocal = [...scan.unparsable];
 
 		const plan: ApplyPlan = {
@@ -537,17 +572,22 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 				...[...scan.files].map(([file, info]) => ({ file, hash: info.hash })),
 				...scan.unparsable.map((file) => ({ file })),
 			],
+			// 读不出的本地文件两个方向都不发布（发布删除 = 一个坏文件删掉两台设备上的同一条记忆），
+			// 但它不算 `unagreed`：本轮根本没读到它，谈不上「收不收得下远端那份」，
+			// 基线因此冻结在上一次一致的那份（见 `agreedBaseFiles`）。
 			excluded: new Set(scan.unparsable),
+			unagreed: new Set(),
 		};
-		const diff = diffThreeWay(previousBase, ours, theirs);
+		const diff = withoutUnparsable(diffThreeWay(previousBase, ours, theirs), untouched);
 		// pull 轮不发布，但「本地删了、远端还留着」这个判定要报出来，否则用户无从知道删除还没生效
 		result.deletedRemote = [...diff.deleteRemote];
 
 		for (const file of diff.pullFromRemote) {
 			const accepted = await acceptRemote(view, file, result.rejected);
 			if (accepted === null) {
-				// 拒收的内容既不落盘、也绝不发布出去（发布 = 替对端决定它那份该没了）
-				plan.excluded.add(file);
+				// 拒收的内容既不落盘、也绝不发布出去（发布 = 替对端决定它那份该没了），
+				// 更不进基线（进了基线 = 下一轮拿它当「已达成一致」，见 `agreedBaseFiles`）
+				markUnagreed(plan, file);
 				continue;
 			}
 			plan.writes.push({ file, raw: accepted.raw });
@@ -574,7 +614,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			);
 			for (const item of applied.rejected) {
 				result.rejected.push(item);
-				plan.excluded.add(item.file);
+				// store 收不下的字节（名字会伪造索引行、碰撞、类型不认识）同样算「没收下」：
+				// 进基线就会在下一轮变成「本地删了它」或「本地要盖掉对端」
+				markUnagreed(plan, item.file);
 			}
 			await store.rebuildIndex({ skipLogicalLock: true, skipSnapshot: true });
 		}
@@ -583,23 +625,42 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		result.pulled = diff.pullFromRemote.filter((file) => written.has(file));
 		result.deletedLocal = [...(applied?.deleted ?? [])];
 
-		// 基线里的文件集**重新扫一遍**而不是推算：推算会把「被拒收的」「碰撞跳过的」也算成已一致
+		// 基线里的本地一侧**重新扫一遍**而不是推算：推算会把「被拒收的」「碰撞跳过的」也算成已落盘
 		const localAfter: SyncFileSet = changesLocal ? (await scanLocalEntries(memoryDir, platform)).files : scan.files;
 		const delta = await publishDelta(localAfter, theirs, plan, result.rejected);
+		/**
+		 * 基线 = 「两侧上一次真正达成一致的状态」，**不是**「我盘上现在有什么」。
+		 *
+		 * 所以 `base.revision` 是本轮合并所依据的那个远端版本（发布成功之后才前进到发布返回的新版本，
+		 * 见 `publishPhase`），而 `base.files` 是**这一轮的 theirs**（去掉本轮没收下的那些名字）。
+		 * 发布成功时 merged == theirs'，此时它恰好等于应用后的扫描结果 —— 那只是推论，不是定义。
+		 *
+		 * 写成「应用后的扫描结果」会丢用户数据：pull 轮与发布失败都会留下本轮产生、却根本没发布
+		 * 出去的本地内容（新写的记忆、冲突副本），一旦进了基线，下一轮的差集就是「base 有 / ours 有 /
+		 * theirs 无」= 远端删了它 → `deleteLocal` → 用户自己还没推出去的记忆被从本地删掉。
+		 *
+		 * 写成「逐名字判一致，不一致就沿用**上一次**的基线条目」也不对：「删除 vs 修改」收敛之后，
+		 * 原路径在本地已经没了、而远端那份是被改过的内容，沿用旧条目会让下一轮（只拉取时）再判成
+		 * 同一场删改冲突 —— 每拉一次就多出一份副本，永不收敛；按 theirs 此刻的指纹记，下一轮就是
+		 * 「base 有 / ours 无 / theirs 未动」→ 把删除推出去，一轮收敛。
+		 */
+		const baseFiles = agreedBaseFiles(theirs, localAfter, previousBase, untouched, plan.unagreed);
 		await writeManifest(manifestFile, {
 			version: MANIFEST_VERSION,
 			base: { revision: snapshot.revision, syncedAt: now().toISOString() },
-			files: nextBaseFiles(localAfter, theirs, previousBase, new Set(applied?.deleted ?? [])),
+			files: asFileRecord(baseFiles),
 		});
 
-		const remoteAfterPublish: SyncFileSet = new Map(theirs);
+		// 发布成功之后远端应有的样子 = 本轮基线 + 发布出去的增量。只在发布真成功之后用它前进基线：
+		// 没发布出去的本地内容一律不在里面，所以下一轮仍然判得出「本地领先」→ 接着推。
+		const remoteAfterPublish: SyncFileSet = new Map(baseFiles);
 		for (const { path } of delta.writes) {
 			const info = localAfter.get(path);
 			if (info !== undefined) remoteAfterPublish.set(path, info);
 		}
 		for (const path of delta.deletions) remoteAfterPublish.delete(path);
 
-		return { delta, localAfter, previousBase, remoteAfterPublish };
+		return { delta, remoteAfterPublish };
 	}
 
 	/**
@@ -625,6 +686,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 				return null;
 			});
 			if (raw === null) {
+				// 只是这一刻读不到字节（内容本身是收下了的）：不算 `unagreed`，基线照 theirs 记，
+				// 下一轮仍然判得出「本地领先」→ 重试发布。算成 unagreed 反而会把这个名字剔出基线，
+				// 下一轮就成了「两侧各有一份新增」→ 凭空多出一份冲突副本。
 				plan.excluded.add(file);
 				continue;
 			}
@@ -642,8 +706,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	/**
 	 * ③ 发布段（只有 push 轮）：再取一次根锁，把增量推上去，成功之后才把基线推到新的 revision。
 	 *
-	 * 基线**只在成功之后**前进：发布失败时上面那次写入已经把「两边一致的那些」记进去了，
-	 * 而没发布出去的内容一律没进基线，所以下一轮仍然判得出「本地领先」→ 接着推。
+	 * 基线**只在成功之后**前进：发布失败时应用段那次写入记下的仍然是「本轮合并所依据的那个远端
+	 * 版本 + 它的文件集」，本轮产生而没发布出去的内容一律没进基线，所以下一轮仍然判得出
+	 * 「本地领先」→ 接着推，而不是读成「远端删了它」。
 	 */
 	async function publishPhase(
 		snapshot: RemoteSnapshot,
@@ -672,10 +737,11 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		result.pushed = delta.writes.map((item) => item.path);
 		result.deletedRemote = [...delta.deletions];
 		result.revision = revision;
+		// 发布成功：两侧真达成一致了，基线才前进到新的 revision，并把发布出去的增量记进去。
 		await writeManifest(manifestFile, {
 			version: MANIFEST_VERSION,
 			base: { revision, syncedAt: now().toISOString() },
-			files: nextBaseFiles(applied.localAfter, applied.remoteAfterPublish, applied.previousBase, new Set()),
+			files: asFileRecord(applied.remoteAfterPublish),
 		});
 		return result;
 	}
@@ -813,11 +879,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 
 		const previousBase = asFileSet(manifest?.files ?? {});
 		const ours: SyncFileSet = new Map(scan.files);
-		for (const file of scan.unparsable) {
-			const known = previousBase.get(file);
-			if (known !== undefined) ours.set(file, known);
-		}
-		const diff = diffThreeWay(previousBase, ours, snapshot.theirs);
+		// 与真跑的同步轮同一套口径：读不出的本地文件本轮一律不动，所以既不会出现在
+		// ahead/behind，也不会出现在 conflicts 里 —— 否则报告会把一个永远不会执行的动作说给用户听。
+		const diff = withoutUnparsable(diffThreeWay(previousBase, ours, snapshot.theirs), new Set(scan.unparsable));
 		report.ahead = [...diff.pushLocal, ...diff.deleteRemote].sort();
 		report.behind = [...diff.pullFromRemote, ...diff.deleteLocal].sort();
 		report.conflicts = diff.conflicts.map((conflict) => conflict.file);
