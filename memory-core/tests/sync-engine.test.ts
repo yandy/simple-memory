@@ -313,6 +313,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await rm(dir, { recursive: true, force: true });
+	vi.useRealTimers(); // 某条用例中途失败时也别把假定时器留给后面的文件
 	vi.restoreAllMocks();
 });
 
@@ -1171,16 +1172,81 @@ describe("sync engine（假 backend）", () => {
 		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("台式机的版本");
 	});
 
-	it("写触发调度接线之前：noteWrite / flush / dispose 是安全的空操作", async () => {
-		engine.noteWrite();
-		expect(await engine.flush()).toBeNull();
-		engine.dispose();
-		expect(remote.fetches).toBe(0); // 绝不偷偷跑一轮
+	it("写触发推送关闭（pushOnWrite: false）时，noteWrite 一个字节都不推", async () => {
+		const quiet = createSyncEngine({
+			syncRoot,
+			projectDir,
+			projectKey,
+			store,
+			backend: remote,
+			device: DEVICE,
+			config: { ...SYNC_CONFIG, pushOnWrite: false },
+			now: NOW,
+		});
+		// 先把条目写好，再换假定时器：store 的写入要拿进程内锁，那里重试会睡真实时间，
+		// 只为被测的推送开假定时器就够了
+		await store.addEntry({ name: "B", body: "b" });
+		vi.useFakeTimers();
+		try {
+			quiet.noteWrite();
+			await vi.advanceTimersByTimeAsync(3 * SYNC_CONFIG.pushDebounceMs);
 
-		await remote.write(prefix, "a.md", raw("A"));
-		expect((await engine.pull()).pulled).toEqual(["a.md"]); // 引擎仍然可用
-		engine.noteWrite();
-		expect(await engine.flush(1000)).toBeNull();
-		engine.dispose();
+			expect(quiet.inFlight).toBeNull();
+			expect(await quiet.flush()).toBeNull(); // 空转版本连 flush 都不跑一轮
+			expect(remote.fetches).toBe(0);
+			expect(await remote.names(prefix)).toEqual([]); // 一条都没推出去
+		} finally {
+			quiet.dispose();
+			vi.useRealTimers();
+		}
+	});
+
+	it("noteWrite 之后经过 pushDebounceMs 会自动推一次（在途的那一份对宿主可见）", async () => {
+		// 同上：条目先落地，假定时器只覆盖推送本身
+		await store.addEntry({ name: "A", body: "a" });
+		vi.useFakeTimers();
+		let pushing: Promise<unknown> | null = null;
+		try {
+			// 探针：传输段真的开始了 → 这一刻这一推一定还在途，inFlight 断言因此是确定的
+			const started = new Promise<void>((resolve) => {
+				remote.hooks.onFetch = () => resolve();
+			});
+			engine.noteWrite();
+			expect(remote.fetches).toBe(0); // 静默期没到，一轮都不跑
+			await vi.advanceTimersByTimeAsync(SYNC_CONFIG.pushDebounceMs - 1);
+			expect(remote.fetches).toBe(0);
+
+			await vi.advanceTimersByTimeAsync(1);
+			await started;
+			pushing = engine.inFlight;
+			expect(pushing).not.toBeNull(); // 宿主退出前等的就是这一份
+			await pushing; // 推送里有真 I/O，假定时器不等它，得自己等
+
+			expect(await remote.names(prefix)).toEqual(["A.md"]);
+			expect(engine.inFlight).toBeNull();
+			// 推完之后静下来：不会自己再推第二次（脏标记只由写入置位）
+			await vi.advanceTimersByTimeAsync(5 * SYNC_CONFIG.pushDebounceMs);
+			expect(remote.fetches).toBe(1);
+
+			// flush 转发给调度器：立刻推一次，不等去抖（退出兜底 / 手动补推走的就是这条路）
+			await store.addEntry({ name: "B", body: "b" });
+			engine.noteWrite(); // 写入之后由宿主通知引擎（引擎不自己去挂 store）
+			expect(await engine.flush()).toMatchObject({ ok: true, pushed: ["B.md"] });
+			expect(await remote.names(prefix)).toEqual(["A.md", "B.md"]);
+			expect(remote.fetches).toBe(2);
+			expect(await engine.flush()).toBeNull(); // 没脏的东西了 → 不再跑一轮
+			expect(remote.fetches).toBe(2);
+
+			// dispose 转发给调度器：收摊之后的写入不再自动推
+			engine.dispose();
+			engine.noteWrite();
+			await vi.advanceTimersByTimeAsync(5 * SYNC_CONFIG.pushDebounceMs);
+			expect(remote.fetches).toBe(2);
+		} finally {
+			remote.hooks.onFetch = undefined;
+			await pushing?.catch(() => null);
+			engine.dispose();
+			vi.useRealTimers();
+		}
 	});
 });

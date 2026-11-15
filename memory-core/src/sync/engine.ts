@@ -19,6 +19,7 @@ import { type SyncConflict, diffThreeWay, type SyncDiff } from "./diff.js";
 import { sha256Hex } from "./hash.js";
 import { emptyManifest, MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "./manifest.js";
 import { type LocalScan, scanLocalEntries } from "./scan.js";
+import { createSyncScheduler, type SyncScheduler } from "./scheduler.js";
 import type { SyncFileInfo, SyncFileSet } from "./types.js";
 
 /**
@@ -125,7 +126,27 @@ export interface SyncEngine {
 	flush(timeoutMs?: number): Promise<SyncRoundResult | null>;
 	/** 释放调度器持有的资源。绝不抛错。 */
 	dispose(): void;
+	/**
+	 * 在途的那一次自动推送（没有则 `null`）。宿主把它挂进自己的「退出前等在途写」账本：
+	 * 看不到它，退出时正好跑着的一次推送就会被静默截断。
+	 */
+	readonly inFlight: Promise<unknown> | null;
 }
+
+/**
+ * 关闭写触发推送时装上的空转调度器：同一个接口，`noteWrite` 静默空转。
+ *
+ * 这样调用点（每次写入之后那一行）不必到处判 `config.pushOnWrite` —— 分支只在这里出现一次。
+ */
+const NOOP_SCHEDULER: SyncScheduler = {
+	noteWrite(): void {},
+	flush(): Promise<null> {
+		return Promise.resolve(null);
+	},
+	dispose(): void {},
+	inFlight: null,
+	dirty: false,
+};
 
 /** 「本轮跳过」内部控制流：与真异常走同一条出口（都变成 `ok: false` + 可读原因）。 */
 class SyncSkip extends Error {
@@ -950,6 +971,21 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		return report;
 	}
 
+	/**
+	 * 写触发推送：去抖之后跑一次 push 轮。`pushOnWrite` 关闭时用空转版本。
+	 *
+	 * 推送与手动 `push()` 走同一条 `runRound`：锁、快照、冲突收敛、基线全都不变，
+	 * 唯一区别是它由写入触发而不是用户敲命令。
+	 */
+	const scheduler: SyncScheduler = config.pushOnWrite
+		? createSyncScheduler({
+				debounceMs: config.pushDebounceMs,
+				timeoutMs: config.autoTimeoutMs,
+				run: (timeoutMs) => runRound("push", timeoutMs),
+				now: () => now().getTime(),
+			})
+		: NOOP_SCHEDULER;
+
 	return {
 		pull: (timeoutMs?: number) => runRound("pull", timeoutMs ?? config.autoTimeoutMs),
 		push: (timeoutMs?: number) => runRound("push", timeoutMs ?? config.autoTimeoutMs),
@@ -960,11 +996,12 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 				fallback.errors.push(describeError(err));
 				return fallback;
 			}),
-		// 以下三个由写触发调度器接线（去抖、退出兜底、在途账本）；在那之前是安全的空操作。
-		noteWrite(): void {},
-		flush(): Promise<null> {
-			return Promise.resolve(null);
+		// 写触发推送的三个出口：记下写入、退出/补推时立刻跑一次、收摊。全部转发给调度器。
+		noteWrite: () => scheduler.noteWrite(),
+		flush: (timeoutMs?: number) => scheduler.flush(timeoutMs) as Promise<SyncRoundResult | null>,
+		dispose: () => scheduler.dispose(),
+		get inFlight(): Promise<unknown> | null {
+			return scheduler.inFlight;
 		},
-		dispose(): void {},
 	};
 }
