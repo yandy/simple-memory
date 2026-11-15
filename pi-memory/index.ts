@@ -197,6 +197,12 @@ export default function (pi: ExtensionAPI) {
 	let configError: string | null = null;
 	/** 同步错误是独立的非致命通道：健康 store/tool/index 绝不被它清空。 */
 	let syncError: string | null = null;
+	/**
+	 * 同步预告（**不是故障**）：首个基线「同名条目会留成确定性副本」、启动预算用尽导致本轮跳过等。
+	 * 刻意与 `syncError` 分开两套通道 —— 混进错误态会让 `/memory` 把「第一次同步会留副本」显示成同步坏了，
+	 * 而通知侧 `notifySync` 默认 level 是 error，会把它渲染成红色 `Error:`。
+	 */
+	let syncNotice: string | null = null;
 	let syncRuntime: PiSyncRuntime | null = null;
 	/** 每次 session_start 都使上一代的所有异步 continuation 失效。 */
 	let sessionGeneration = 0;
@@ -245,6 +251,11 @@ export default function (pi: ExtensionAPI) {
 		syncError = unique.length > 0 ? unique.join("\n") : null;
 	}
 
+	function setSyncNotice(notices: string[]): void {
+		const unique = [...new Set(notices.map((notice) => notice.trim()).filter((notice) => notice !== ""))];
+		syncNotice = unique.length > 0 ? unique.join("\n") : null;
+	}
+
 	function notifySync(ui: ExtensionUIContext | undefined, message: string, level: "info" | "error" = "error"): void {
 		try {
 			ui?.notify(message, level);
@@ -257,6 +268,7 @@ export default function (pi: ExtensionAPI) {
 	function failConfig(errors: string[], ui: ExtensionUIContext | undefined): void {
 		configError = errors.join("\n");
 		syncError = null;
+		syncNotice = null;
 		syncPersistentErrors = [];
 		resetSessionState();
 		notifySync(ui, `pi-memory config error:\n${errors.map((e) => `- ${e}`).join("\n")}`);
@@ -355,7 +367,17 @@ export default function (pi: ExtensionAPI) {
 		// 同步配置、init、传输都只是非致命降级。准备与启动收敛全部结束后才选择索引来源：
 		// startup/new 读到同步后的磁盘；resume/fork/reload 仍逐字冻结 transcript 的录制值。
 		const syncErrors: string[] = [];
+		// 预告与失败分两个通道：`prepared.warning` 是「首次基线可能留副本」这类**预告**，不是失败。
+		const syncNotices: string[] = [];
 		let notifiedSyncErrors = 0;
+		let notifiedSyncNotices = 0;
+		const notifyPendingSyncNotices = (): void => {
+			const pending = syncNotices.slice(notifiedSyncNotices);
+			if (pending.length === 0) return;
+			setSyncNotice(syncNotices);
+			notifySync(syncUi, `pi-memory sync notice:\n${pending.map((notice) => `- ${notice}`).join("\n")}`, "info");
+			notifiedSyncNotices = syncNotices.length;
+		};
 		const notifyPendingSyncErrors = (): void => {
 			const pending = syncErrors.slice(notifiedSyncErrors);
 			if (pending.length === 0) return;
@@ -384,15 +406,16 @@ export default function (pi: ExtensionAPI) {
 					syncErrors.push(prepared.reason);
 				} else {
 					if (prepared.warning) {
-						syncErrors.push(prepared.warning);
+						syncNotices.push(prepared.warning);
 						// 首次本地记忆的冲突预告必须发生在任何启动 push 之前，不能等副本已经落盘才说。
-						notifyPendingSyncErrors();
+						notifyPendingSyncNotices();
 					}
 					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
 					if (cfg.sync.pullOnStart === true) {
 						const remaining = startupDeadline - Date.now();
 						if (remaining <= 0) {
-							syncErrors.push(
+							// 预算用尽是「本轮跳过、下一轮再推」，不是失败：走预告通道，别染红启动日志。
+							syncNotices.push(
 								`the automatic startup budget of ${cfg.sync.autoTimeoutMs}ms was exhausted during preparation; ` +
 									"startup push was skipped and will run on the next round",
 							);
@@ -409,7 +432,8 @@ export default function (pi: ExtensionAPI) {
 			syncErrors.push(error instanceof Error ? error.message : String(error));
 		}
 		if (!isCurrent()) return;
-		// prepare 之后新发生的传输错误按增量通知：早期预告不重复，后续失败也不漏报。
+		// prepare 之后新发生的预告/传输错误按增量通知：早期预告不重复，后续失败也不漏报。
+		notifyPendingSyncNotices();
 		notifyPendingSyncErrors();
 
 		// D13 / D14：索引值在整个 session 内**冻结**。resume / fork / reload 必须用 transcript 里的
@@ -446,6 +470,7 @@ export default function (pi: ExtensionAPI) {
 		// 本身不可观测 —— 没有测试钉它，删掉也不会让任何用例变红（2026-10-03 final review 的结论）。
 		configError = null;
 		syncError = null;
+		syncNotice = null;
 		syncPersistentErrors = [];
 		resetSessionState();
 		// 同步段可能等待远端预算：所有宿主值都在其第一个 await 之前快照，之后绝不回读已 dispose 的 ctx。
@@ -819,9 +844,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				const round = await prepared.engine[kind](cfg.sync.timeoutMs);
 				const errors = [...syncPersistentErrors];
-				if (prepared.warning) errors.push(prepared.warning);
 				if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
 				setSyncError(errors);
+				setSyncNotice(prepared.warning ? [prepared.warning] : []);
 				const rendered = renderSyncRound(round);
 				if (!round.ok) {
 					notifySync(
@@ -850,9 +875,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const prepared = await activeRuntime.changeRemote(remote, cfg.sync.timeoutMs);
 			const errors = [...syncPersistentErrors];
-			if (prepared.ok && prepared.warning) errors.push(prepared.warning);
 			if (!prepared.ok) errors.push(prepared.reason);
 			setSyncError(errors);
+			setSyncNotice(prepared.ok && prepared.warning ? [prepared.warning] : []);
 			if (!prepared.ok) {
 				notifySync(ui, `Memory sync remote failed: ${syncErrorMessage(prepared.reason)}`);
 				return;
@@ -963,8 +988,12 @@ export default function (pi: ExtensionAPI) {
 				`Lock: ${await lockStatusLine(dir)}`,
 			];
 			// 默认未启用时保留既有 7 行状态；启用/降级后追加同步段，且不调用 engine.status/init。
-			if (syncRuntime || syncError) {
+			if (syncRuntime || syncError || syncNotice) {
 				summaryLines.push(`Sync: ${syncRuntime?.engine ? "ready" : syncRuntime ? "not initialized" : "disabled"}`);
+				// 预告与错误分区显示：预告不是故障，混在错误行里会让人以为同步坏了。
+				if (syncNotice) {
+					summaryLines.push("Sync notice:", ...syncNotice.split("\n").map((notice) => `- ${notice}`));
+				}
 				if (syncError) summaryLines.push(...syncError.split("\n").map((error) => `- ${error}`));
 			}
 			// 2.x 数据根的迁移提示：只提示、不动数据。探测失败不得让 `/memory` 报错 ——

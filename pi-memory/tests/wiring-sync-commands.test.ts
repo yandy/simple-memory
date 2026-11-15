@@ -336,6 +336,27 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect(await readFile(join(s.agentDir, "memory.json"), "utf8")).toBe(before.config);
 	});
 
+	it("shows the first-baseline conflict preview as a notice, not as a sync error", async () => {
+		// 本地记忆先于首次初始化存在：这是唯一会产出「同名条目可能留成副本」预告的情形，也是用户实际看到的场景。
+		const config = memoryConfig();
+		await newStore(config).addEntry({ name: "Local before sync", description: "seed", body: "keep me" });
+		await enableSync();
+		const notify = vi.fn();
+		const { pi, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+
+		expect(notify.mock.calls[0]?.[1]).toBe("info");
+		expect(notify.mock.calls[0]?.[0]).toContain("pi-memory sync notice:");
+		expect(notify.mock.calls[0]?.[0]).not.toContain("pi-memory sync error:");
+
+		notify.mockClear();
+		await commands["memory"].handler("", s.uiCtx(uiWith(notify)));
+		const rendered = notify.mock.calls[0]?.[0] as string;
+		expect(rendered).toContain("Sync: ready");
+		expect(rendered).toContain("Sync notice:\n- Memory sync initialized with 1 local entry");
+	});
+
 	it("redacts a credentialed origin in not-ready status without repairing initialization", async () => {
 		await enableSync();
 		const config = memoryConfig();
