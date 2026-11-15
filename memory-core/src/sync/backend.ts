@@ -49,7 +49,17 @@ export interface RemoteView {
 	 */
 	list(): Promise<Array<{ path: string; hash: string }>>;
 
-	/** 取内容。只会被 `list()` 报出的路径调用。 */
+	/**
+	 * 取内容。只会被 `list()` 报出的路径调用。
+	 *
+	 * **可能在根锁释放之后才被调用**：引擎只在真要落到本地时才读内容，那时这一轮已经不在
+	 * `fetch`/`publish` 的串行段里了（下面 `SyncBackend` 那条并发假设只盖住这两个调用）。
+	 * 所以这里读的必须是 `fetch` 那一刻就已经固定下来的快照（内容已缓存，或按当时那个
+	 * revision 取对象），**不能**对着共享的传输状态现取 —— 另一个项目的 `fetch`/`publish`
+	 * 会同时跑：前者会移动引用（`git fetch` 改掉 `FETCH_HEAD` 与远程跟踪分支），后者会把
+	 * 工作树 `reset --hard` + `clean -fd`。把 `read()` 写成对着共享暂存 clone 现跑一次
+	 * `git show`、或直接读暂存工作树，读到的就可能是别的项目的内容、更旧的内容，或直接报错。
+	 */
 	read(path: string): Promise<string>;
 
 	/**

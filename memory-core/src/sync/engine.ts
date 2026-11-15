@@ -138,6 +138,13 @@ class SyncSkip extends Error {
 /** 发布段撞上非快进：要求整轮重跑（重新取远端、重算差集），不是只重试一次 publish。 */
 interface RetryRound {
 	retry: string;
+	/**
+	 * 这一次尝试**已经落到本地**的那部分结果。
+	 *
+	 * 非快进是在发布段抛的，而应用段早就跑完了：拉下来的内容、冲突副本、`-sync` 快照、写好的
+	 * 基线都已经在盘上。重跑不会撤销它们，所以这份部分结果必须跟着带出去（见 `runRound`）。
+	 */
+	partial: SyncRoundResult;
 }
 
 type RoundOutcome = SyncRoundResult | RetryRound;
@@ -164,6 +171,37 @@ function isIsoModified(value: string): boolean {
 
 function describeError(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+/** 两份清单按 key 去重合并（同一个 key 保留后出现的那一份），顺序 = 出现顺序。 */
+function unionBy<T>(left: T[], right: T[], key: (item: T) => string): T[] {
+	const seen = new Map<string, T>();
+	for (const item of [...left, ...right]) seen.set(key(item), item);
+	return [...seen.values()];
+}
+
+/**
+ * 把两次尝试各自**已经落到本地**的那部分合成一份报告。
+ *
+ * 重跑不会撤销上一次的落盘，而上一次拉下来的内容在新基线里已经是「两侧一致」的了 ——
+ * 第二次尝试的报告里不会再提它。只报后一次，用户看到的仍然是「本轮什么都没拉」，
+ * 而盘上明明多了文件 —— 正是这一版失败报告要修掉的那句假话。
+ */
+function mergePartials(previous: SyncRoundResult | undefined, latest: SyncRoundResult): SyncRoundResult {
+	if (previous === undefined) return latest;
+	const byName = (file: string): string => file;
+	return {
+		...latest,
+		pulled: unionBy(previous.pulled, latest.pulled, byName),
+		pushed: unionBy(previous.pushed, latest.pushed, byName),
+		deletedLocal: unionBy(previous.deletedLocal, latest.deletedLocal, byName),
+		deletedRemote: unionBy(previous.deletedRemote, latest.deletedRemote, byName),
+		unparsableLocal: unionBy(previous.unparsableLocal, latest.unparsableLocal, byName),
+		outOfScopeRemote: unionBy(previous.outOfScopeRemote, latest.outOfScopeRemote, byName),
+		conflicts: unionBy(previous.conflicts, latest.conflicts, (item) => item.file),
+		// 同一个文件因为同一个原因被拒收两次只报一次；原因不同则两条都留着（那是两次不同的拒收）
+		rejected: unionBy(previous.rejected, latest.rejected, (item) => `${item.file}\n${item.reason}`),
+	};
 }
 
 /**
@@ -198,7 +236,10 @@ function asFileRecord(files: SyncFileSet): Record<string, SyncFileInfo> {
  * - 本地没有它 → 「base 有 / ours 无 / theirs 未动」= 用户删了 → 把对端那份删掉；
  * - 本地有自己的版本 → 「base 有（= 对端那份）/ ours 改了 / theirs 未动」= 本地胜 →
  *   拿本地那份盖掉对端那份，静默丢掉我们明确拒收过的内容。
- * 两种都是替对端做决定。留在基线之外，下一轮才会照旧判成「远端有、我们收不下」→ 再报一次。
+ * 两种都是替对端做决定。所以这类名字**不跟着 `theirs` 前进**，而是退回上一次真正达成一致的
+ * 那一份（`previousBase`，没有就不记），下一轮才会照旧判成「远端改了 / 我们收不下」→ 再报一次。
+ * 干脆从基线里剔掉也保得住数据，但报告会变脏：基线里没有它，下一轮就把这件事读成
+ * 「两侧各新增了一份」→ 冲突，于是 `status` 在拒收旁边永久多出一条并不存在的冲突。
  *
  * 注意本地读不出的文件（`unparsable`）**不在** `unagreed` 里，它们走另一条路：基线**冻结**在
  * 上一次一致的那份（`untouched`）。因为本地这一份本轮根本不参与判定，也就无从达成一致，
@@ -222,7 +263,13 @@ function agreedBaseFiles(
 ): Map<string, SyncFileInfo> {
 	const base = new Map<string, SyncFileInfo>();
 	for (const file of new Set([...theirs.keys(), ...untouched])) {
-		if (unagreed.has(file)) continue;
+		if (unagreed.has(file)) {
+			// 退回上一次**真的一致过**的那份（没有就不记）。别干脆剔掉：基线里没有它，
+			// 下一轮就把「远端改了、我们收不下」读成「两侧各新增了一份」→ 凭空多出一条冲突。
+			const agreed = previousBase.get(file);
+			if (agreed !== undefined) base.set(file, agreed);
+			continue;
+		}
 		if (untouched.has(file)) {
 			// 从没达成过一致（例如一上来就读不出、远端也从来没推成功过）→ 干脆不记：
 			// 记一个假祖先比不记更危险，它会让下一轮把两侧的内容当成「其中一侧改过」。
@@ -380,6 +427,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 而内容只在真要落到本地时才读（`view.read`）。所以 `theirs` 里只有 hash 是真的，
 	 * `modified`/`bytes` 是占位值：**任何消费者都不得读它们**，需要时按读到的字节重算
 	 * （见 `remoteSide`）。远端可能上千条记忆，为一轮里通常一两条变更把全部内容读一遍不值得。
+	 *
+	 * 也就是说 `view.read()` 会在根锁**释放之后**（应用段里）才被调用：`RemoteView` 必须是一份
+	 * 自足的快照，读内容不能推迟到共享的传输状态上。同一句话也写在端口注释里（backend 实现方
+	 * 看的是那一份）：两边都得说，否则独立包实现的 backend 会把 `read()` 写成对着共享状态现取。
 	 */
 	async function readRemoteSnapshot(timeoutMs: number): Promise<RemoteSnapshot> {
 		const locked = await withRootLock(async () => {
@@ -579,8 +630,6 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			unagreed: new Set(),
 		};
 		const diff = withoutUnparsable(diffThreeWay(previousBase, ours, theirs), untouched);
-		// pull 轮不发布，但「本地删了、远端还留着」这个判定要报出来，否则用户无从知道删除还没生效
-		result.deletedRemote = [...diff.deleteRemote];
 
 		for (const file of diff.pullFromRemote) {
 			const accepted = await acceptRemote(view, file, result.rejected);
@@ -628,6 +677,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// 基线里的本地一侧**重新扫一遍**而不是推算：推算会把「被拒收的」「碰撞跳过的」也算成已落盘
 		const localAfter: SyncFileSet = changesLocal ? (await scanLocalEntries(memoryDir, platform)).files : scan.files;
 		const delta = await publishDelta(localAfter, theirs, plan, result.rejected);
+		// pull 轮不发布，但「远端那份要被删掉」这个判定必须报出来，否则用户无从知道自己的删除还没生效。
+		// 发布增量里的删除要并进来：「删除 vs 修改」里照办的那次删除是冲突收敛判的，差集只把那个
+		// 名字报成冲突（不在 `deleteRemote` 里），漏掉它用户要等到下一轮才看见自己刚删掉的那条。
+		result.deletedRemote = [...new Set([...diff.deleteRemote, ...delta.deletions])].sort();
 		/**
 		 * 基线 = 「两侧上一次真正达成一致的状态」，**不是**「我盘上现在有什么」。
 		 *
@@ -768,22 +821,31 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		const snapshot = await readRemoteSnapshot(timeoutMs); // ① 出段即释放根锁
 		const result = emptyResult();
 		result.outOfScopeRemote = [...snapshot.outOfScope];
-		result.revision = snapshot.revision;
-
-		const applied = await applyPhase(snapshot, result); // ② 逻辑锁之内
-		if (mode === "pull") return result;
 
 		try {
+			const applied = await applyPhase(snapshot, result); // ② 逻辑锁之内
+			// 基线是应用段写下的，所以 `revision` 也只能在那之后报：失败的那一份部分结果同样会交到
+			// 用户手上，报一个根本没写进基线的 revision，等于让他们对着一个不存在的状态去排查
+			result.revision = snapshot.revision;
+			if (mode === "pull") return result;
 			return await publishPhase(snapshot, applied, result, timeoutMs); // ③ 再取一次根锁
 		} catch (err) {
-			// 远端在这轮之间又前进了：整轮重跑一次（重新取远端、重算差集），而不是原地重试一次 publish
-			if (err instanceof NonFastForwardError) return { retry: describeError(err) };
-			throw err;
+			// 远端在这轮之间又前进了：整轮重跑一次（重新取远端、重算差集），而不是原地重试一次 publish。
+			// 这一次尝试已经落盘的改动不会被重跑撤销，所以连同部分结果一起交出去。
+			if (err instanceof NonFastForwardError) return { retry: describeError(err), partial: result };
+			// 到了这里，本地很可能**已经改过了**：拉下来的内容、冲突副本、`-sync` 快照、写好的基线，
+			// 以及「盘上已落盘、只差记账」的写基线失败。只回一句原因的话，用户看到的 `pulled` /
+			// `conflicts` 全是空的，而盘上明明多了文件 —— 所以失败原因必须与部分结果一起出去。
+			return failedRound(describeError(err), result);
 		}
 	}
 
 	async function runRound(mode: Mode, timeoutMs: number): Promise<SyncRoundResult> {
 		let lastRetry = "";
+		// 到目前为止本轮**已经落到本地**的那部分。失败报告必须带着它：失败可能发生在应用段之后
+		// （非快进重跑、发布时的传输错误、写基线失败），那时本地早就改过了，而「同步到底动没动
+		// 我的记忆」正是这个功能被评判的那个问题。
+		let lastPartial: SyncRoundResult | undefined;
 		// 重跑的是**整轮**（重新取远端 → 重算差集 → 重新应用 → 重新发布）：非快进意味着远端变了，
 		// 上一轮算出来的差集已经作废，原地重试 publish 只会再撞一次。落盘与副本命名都是幂等的
 		// （同一份内容派生同一个名字），代价只是可能多拍一份 `-sync` 快照。
@@ -792,13 +854,19 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 				const outcome = await runOnce(mode, timeoutMs);
 				if (!("retry" in outcome)) return outcome;
 				lastRetry = outcome.retry;
+				// 合并而不是覆盖：重跑不撤销上一次的落盘（理由写在 `mergePartials`）
+				lastPartial = mergePartials(lastPartial, outcome.partial);
 			} catch (err) {
-				// 一次同步失败绝不允许打断会话：所有异常都在这里变成一句可读的原因
-				return failedRound(describeError(err));
+				// 一次同步失败绝不允许打断会话：所有异常都在这里变成一句可读的原因。
+				// 走到这里的只剩下传输段（及它之前）的失败：本轮一个字都没动时 `lastPartial` 为空，
+				// 重跑那一轮的 fetch 失败时它带着上一次尝试已经落盘的那部分。
+				return failedRound(describeError(err), lastPartial);
 			}
 		}
 		return failedRound(
-			`${lastRetry} — gave up after ${MAX_ROUND_ATTEMPTS} attempts; local memory is untouched and the next round will retry`,
+			`${lastRetry} — gave up after ${MAX_ROUND_ATTEMPTS} attempts; nothing was published this round, ` +
+				"but it may already have changed local memory (see pulled/conflicts in this result); the next round will retry",
+			lastPartial,
 		);
 	}
 
@@ -826,23 +894,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	/** 算一份报告。**dry-run**：全程只读，盘上一个字都不改。 */
 	async function computeStatus(timeoutMs: number): Promise<SyncStatusReport> {
 		const manifest = await readManifest(manifestFile);
-		const report: SyncStatusReport = {
-			configured: isConfigured(),
-			initialized: false,
-			remote: typeof config.remote === "string" ? config.remote : "",
-			branch: config.branch,
-			device,
-			projectDir,
-			projectKey,
-			base: manifest?.base ?? null,
-			ahead: [],
-			behind: [],
-			conflicts: [],
-			rejected: [],
-			unparsableLocal: [],
-			outOfScopeRemote: [],
-			errors: [],
-		};
+		// 初值只有一份（`emptyStatusReport`）：字段清单写两遍，加字段时必然漏掉一边
+		const report = emptyStatusReport();
+		report.base = manifest?.base ?? null;
 		if (!report.configured) {
 			report.errors.push(NOT_CONFIGURED);
 			return report;

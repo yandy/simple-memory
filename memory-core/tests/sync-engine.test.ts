@@ -91,7 +91,8 @@ interface FakeRemote extends SyncBackend {
 	/** 每次成功发布收到的增量（断言「发布的是增量而不是全量」用）。 */
 	publishes: SyncPublishChanges[];
 	revision: string;
-	hooks: { onFetch?: () => void; onPublish?: () => void };
+	/** 探针：在假远端真开始一次 `fetch` / `publish` 之前跑（可以是异步的：模拟对端同时推东西）。 */
+	hooks: { onFetch?: () => void | Promise<void>; onPublish?: () => void | Promise<void> };
 	/** 模拟另一台设备往某个前缀推了一个文件。 */
 	write(prefix: string, path: string, content: string): Promise<void>;
 	/** 模拟有人手工往远端根推了一个范围外路径。 */
@@ -134,7 +135,7 @@ function createFakeRemote(): FakeRemote {
 
 		async fetch(scope: SyncScope): Promise<RemoteView> {
 			remote.fetches += 1;
-			remote.hooks.onFetch?.();
+			await remote.hooks.onFetch?.();
 			if (remote.failNext === "fetch") {
 				remote.failNext = null;
 				throw new Error("fetch failed: simulated transport error");
@@ -169,7 +170,7 @@ function createFakeRemote(): FakeRemote {
 
 		async publish(scope: SyncScope, changes: SyncPublishChanges, base: { revision: string }): Promise<string> {
 			remote.publishAttempts += 1;
-			remote.hooks.onPublish?.();
+			await remote.hooks.onPublish?.();
 			if (remote.failNext === "publish") {
 				remote.failNext = null;
 				throw new Error("publish failed: simulated transport error");
@@ -479,6 +480,9 @@ describe("sync engine（假 backend）", () => {
 		const res = await engine.pull();
 		expect(res.conflicts).toHaveLength(1);
 		expect(res.deletedLocal).toEqual(["A.md"]); // 删除照办
+		// 「删除照办」是这一轮就判定并落盘的（收敛把原路径放进了发布增量），所以当轮就要报：
+		// 等到下一轮才报，用户会以为自己的删除还没被同步接受
+		expect(res.deletedRemote).toEqual(["A.md"]);
 		expect(await readdir(projectDir)).not.toContain("A.md");
 
 		const kept = (await store.listEntries()).find((e) => e.name.startsWith("A (冲突 "));
@@ -593,6 +597,29 @@ describe("sync engine（假 backend）", () => {
 		expect(after?.files["A.md"].hash).toBe(sha256Hex(await readFile(join(projectDir, "A.md"), "utf8")));
 	});
 
+	it("发布时的传输错误（不重跑）：本轮已经拉到本地的内容仍在失败结果里", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		await engine.push(); // 先对齐
+		await store.addEntry({ name: "B", body: "b" }); // 本轮要推的本地新增
+		await remote.write(prefix, "c.md", raw("C")); // 对端领先一条 → 应用段会先把它拉下来
+		remote.failNext = "publish"; // 发布段炸掉（不是非快进，所以不重跑）
+
+		const res = await engine.push();
+		expect(res.ok).toBe(false);
+		expect(res.skipped?.reason).toMatch(/publish failed/i);
+		// 载重：失败发生在应用段**之后** —— c.md 已经落到本地并进了索引，报告不能声称什么都没发生
+		expect(res.pulled).toEqual(["c.md"]);
+		expect(res.pushed).toEqual([]);
+		expect(await readFile(join(projectDir, "c.md"), "utf8")).toBe(raw("C"));
+		expect(await store.readIndex()).toContain("- [C](c.md)");
+		expect(await backupNames(projectDir, "sync")).not.toEqual([]);
+		// 基线只写到 fetch 到的那个版本（没发布成功，绝不前进），报出去的 revision 与它一致
+		expect(res.revision).toBe(remote.revision);
+		expect((await readManifest(manifestPath(syncRoot, projectKey)))?.base.revision).toBe(remote.revision);
+		// 脏状态原样留着：下一次 push 把本地那条推出去
+		expect((await engine.push()).pushed).toEqual(["B.md"]);
+	});
+
 	it("pull 轮绝不把本地未发布的内容记进基线：下一轮仍判成本地领先，而不是把它删掉", async () => {
 		await store.addEntry({ name: "A", body: "a" });
 		await engine.push(); // 先对齐
@@ -640,6 +667,69 @@ describe("sync engine（假 backend）", () => {
 		expect(await readdir(projectDir)).toContain("B.md"); // 本地内容不动，留到下次
 	});
 
+	it("非快进重跑之间对端又推了新内容：失败的那一轮必须报出它已经拉到本地的东西", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		await engine.push(); // 基线与远端对齐
+		await store.addEntry({ name: "B", body: "b" }); // 本轮要推的本地新增
+		await remote.write(prefix, "c.md", raw("C")); // 对端领先一条：第一次尝试会把它拉下来
+		// 两次 publish 都撞非快进；第一次失败的**同时**对端又推了一条（d.md），
+		// 于是重跑的那一轮真的会改本地（拉下 d.md、拍 `-sync` 快照、写基线），然后才在发布段再次失败
+		remote.nonFastForward = 2;
+		let peerPushed = false;
+		remote.hooks.onPublish = async () => {
+			if (peerPushed) return;
+			peerPushed = true;
+			await remote.write(prefix, "d.md", raw("D"));
+		};
+
+		const fetchesBefore = remote.fetches;
+		const res = await engine.push();
+		expect(res.ok).toBe(false);
+		expect(res.skipped?.reason).toMatch(/moved on/i);
+		expect(res.skipped?.reason).toMatch(/gave up after 2 attempts/i);
+		// 措辞只说真话：本轮确实已经改过本地，所以绝不能声称「本地没动过」
+		expect(res.skipped?.reason).not.toMatch(/untouched/i);
+		expect(remote.fetches).toBe(fetchesBefore + 2); // 上限就是一次重跑
+		// 载重：两次尝试各自拉下来的都得报 —— 重跑不撤销上一次的落盘，而上一轮拉的东西
+		// 在新基线里已经是「两侧一致」的，只报后一次的话用户仍然会看到「本轮什么都没拉」
+		expect([...res.pulled].sort()).toEqual(["c.md", "d.md"]);
+		expect(res.pushed).toEqual([]); // 什么都没发布出去
+		expect(await readFile(join(projectDir, "c.md"), "utf8")).toBe(raw("C"));
+		expect(await readFile(join(projectDir, "d.md"), "utf8")).toBe(raw("D"));
+		expect(await readFile(join(projectDir, "B.md"), "utf8")).toContain("name: B"); // 本地那份也还在
+		expect(await store.readIndex()).toContain("- [D](d.md)");
+		expect(await backupNames(projectDir, "sync")).not.toEqual([]); // 真的改过本地 → 真的有快照
+	});
+
+	it("重跑那一轮造出的冲突副本：失败结果里看得见，副本也真的在盘上", async () => {
+		await store.addEntry({ name: "A", body: "最早的版本" });
+		await engine.push(); // 基线与远端都停在「最早的版本」
+		await store.replaceEntry("A", { body: "台式机的版本" }); // 本地改了，还没推出去
+		remote.nonFastForward = 2;
+		let peerPushed = false;
+		// 第一次发布失败的同时对端改了同一个文件：重跑的那一轮就是「两侧都改过」→ 冲突
+		remote.hooks.onPublish = async () => {
+			if (peerPushed) return;
+			peerPushed = true;
+			await remote.write(prefix, "A.md", raw("A", "2099-01-01T00:00:00.000Z", "笔记本的版本"));
+		};
+
+		const res = await engine.push();
+		expect(res.ok).toBe(false);
+		expect(res.skipped?.reason).toMatch(/moved on/i);
+		// 载重：这一轮**已经**把冲突收敛完了（副本落盘、索引重建、基线写好），然后才在发布段失败。
+		// 报告里必须看得见 —— 否则用户拿到的是一份「什么都没发生」的结果，而盘上多了一条记忆
+		expect(res.conflicts).toHaveLength(1);
+		const keptAsNew = res.conflicts[0].keptAsNew;
+		expect(keptAsNew).toMatch(/^A-\(冲突-\d{4}-\d{2}-\d{2}\)-[0-9a-f]{6}\.md$/);
+		expect(await readFile(join(projectDir, keptAsNew), "utf8")).toContain("台式机的版本");
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("笔记本的版本");
+		expect(await store.readIndex()).toContain(keptAsNew);
+		expect(res.pulled).toEqual([]); // 它是冲突，不是干净的拉取
+		expect(res.pushed).toEqual([]); // 什么都没发布出去
+		expect(await remote.names(prefix)).toEqual(["A.md"]); // 远端只有对端自己推的那份
+	});
+
 	it("backend 未初始化（ready()=false）→ skipped，且绝不偷偷 init", async () => {
 		remote.initialized = false;
 		const spy = vi.spyOn(remote, "init");
@@ -682,7 +772,10 @@ describe("sync engine（假 backend）", () => {
 		await remote.write(prefix, "a.md", raw("A"));
 		const before = await fingerprint(projectDir);
 		await store.withLogicalLock(async () => {
-			expect(await engine.pull()).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/lock/i) } });
+			const res = await engine.pull();
+			expect(res).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/lock/i) } });
+			// 本轮一个字都没落盘、基线也没写过，就不报 revision：失败的那一份结果同样会交到用户手上
+			expect(res.revision).toBeUndefined();
 		});
 		expect(await fingerprint(projectDir)).toEqual(before);
 		expect(await remote.names(prefix)).toEqual(["a.md"]);
@@ -703,8 +796,12 @@ describe("sync engine（假 backend）", () => {
 	it("两把锁永不嵌套：应用段持逻辑锁而根锁已放开，传输与发布段持根锁而逻辑锁未持有", async () => {
 		const seen: string[] = [];
 		const rootLockHeld = () => existsSync(join(syncRoot, "sync.lock"));
-		remote.hooks.onFetch = () => seen.push(`fetch root=${rootLockHeld()} logical=${store.logicalLockActive()}`);
-		remote.hooks.onPublish = () => seen.push(`publish root=${rootLockHeld()} logical=${store.logicalLockActive()}`);
+		remote.hooks.onFetch = () => {
+			seen.push(`fetch root=${rootLockHeld()} logical=${store.logicalLockActive()}`);
+		};
+		remote.hooks.onPublish = () => {
+			seen.push(`publish root=${rootLockHeld()} logical=${store.logicalLockActive()}`);
+		};
 		const originalApply = store.applyEntryFiles.bind(store);
 		vi.spyOn(store, "applyEntryFiles").mockImplementation(async (changes, opts) => {
 			seen.push(`apply root=${rootLockHeld()} logical=${store.logicalLockActive()}`);
@@ -732,6 +829,14 @@ describe("sync engine（假 backend）", () => {
 		await engine.push();
 		expect(await remote.read(prefix, "A.md")).toBe("没有 frontmatter 了");
 		expect(remote.publishes.at(-1)?.deletions ?? []).toEqual([]);
+
+		// 被拒收的名字在基线里退回上一次**真的一致过**的那份，所以后续每一轮仍然判成
+		// 「远端改了 → 拒收」，而不是退化成「两侧各新增了一份」→ 冲突：
+		// 否则 status 会在拒收旁边永久多报一条并不存在的冲突
+		const report = await engine.status();
+		expect(report.conflicts).toEqual([]);
+		expect(report.behind).toEqual(["A.md"]);
+		expect(report.rejected).toEqual([{ file: "A.md", reason: "unparsable frontmatter" }]);
 	});
 
 	it("远端 modified 不是 ISO-8601 形状 → 拒收（定序键落盘就再也修不回来）", async () => {
@@ -888,6 +993,39 @@ describe("sync engine（假 backend）", () => {
 			expect((await engine.push()).ok).toBe(true);
 		},
 	);
+
+	it("status 在未配置时也给出字段齐全的报告（不碰远端）", async () => {
+		const off = createSyncEngine({
+			syncRoot,
+			projectDir,
+			projectKey,
+			store,
+			backend: remote,
+			device: DEVICE,
+			config: { ...SYNC_CONFIG, remote: "   " },
+			now: NOW,
+		});
+		const report = await off.status();
+		// 字段齐全且取的是装配参数：早退路径与正常路径共用同一份初值，加字段时不会漏掉一边
+		expect(report).toMatchObject({
+			configured: false,
+			initialized: false,
+			remote: "   ",
+			branch: "main",
+			projectDir,
+			projectKey,
+			base: null,
+			ahead: [],
+			behind: [],
+			conflicts: [],
+			rejected: [],
+			unparsableLocal: [],
+			outOfScopeRemote: [],
+		});
+		expect(report.device).toEqual(DEVICE);
+		expect(report.errors).toEqual([expect.stringMatching(/not configured/i)]);
+		expect(remote.fetches).toBe(0);
+	});
 
 	it("status 是 dry-run：报出 ahead/behind/conflicts 与范围外路径，且不改任何文件", async () => {
 		await store.addEntry({ name: "A", body: "a" });
