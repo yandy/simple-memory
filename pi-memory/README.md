@@ -332,7 +332,6 @@ session_shutdown
   `Memory sync flush failed: … local changes will be retried at the next session start.` — the content stays
   local, and the next round publishes it: the next session start (with `pullOnStart`, the default) or the
   next write's debounced push. With `pushOnWrite` and `pullOnStart` both off, use `/memory sync push`.
-  local and the next startup round publishes it.
 - **Recorded index (known semantics, not a bug)**: `resume` / `fork` / `reload` freeze the index value
   recorded in the transcript. Startup convergence still runs and the disk does change, but the pulled entries
   are **not** in this session's `memory_index` until the next compaction (or the next session).
