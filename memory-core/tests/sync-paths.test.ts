@@ -23,11 +23,13 @@ describe("remoteProjectKey", () => {
 });
 
 describe("syncRootPath", () => {
-	it("目录名恒为 `.sync`，由记忆根 join 出来（布局契约只有这一份）", () => {
+	it("目录名恒为 `.sync`，由**记忆根** join 出来（布局契约只有这一份）", () => {
 		// 名字是用户可见的契约：改了它等于搬动用户盘上的目录，必须在这里先红
 		expect(SYNC_DIR_NAME).toBe(".sync");
-		const memoryDir = join("/tmp", "memory-root");
+		// 入参是记忆根（`config.memoryDir` / `defaultMemoryRoot` 那一个），不是 `<根>/<kind>/<项目>`
+		// 那个项目记忆目录：`.sync` 整棵树共享一份（设备身份、基线、唯一一个 git 克隆）。
+		const memoryRoot = join("/tmp", "memory-root");
 		// 断言 join 而不是字面量：win32 上分隔符不同，硬编码 `/` 会让这条测试只在 POSIX 上过
-		expect(syncRootPath(memoryDir)).toBe(join(memoryDir, ".sync"));
+		expect(syncRootPath(memoryRoot)).toBe(join(memoryRoot, ".sync"));
 	});
 });

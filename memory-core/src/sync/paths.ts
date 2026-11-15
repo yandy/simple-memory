@@ -45,14 +45,28 @@ export function remotePrefix(identityKey: string): string {
  * 同步状态目录在记忆根下的名字：`<记忆根>/.sync`。
  *
  * 这个字面值是**用户可见的布局契约**：它出现在文档、备份排除清单与用户自己的脚本里，而引擎、git
- * backend、设备身份与 manifest 都把它当入参 `syncRoot` 收发。适配层若各自写一遍 `join(memoryDir, ".sync")`，
- * 布局一改就要同步改若干处 —— 所以派生只留在这里一份，适配层一律调 `syncRootPath`。
+ * backend、设备身份与 manifest 都把它当入参 `syncRoot` 收发。适配层若各自写一遍
+ * `join(memoryRoot, ".sync")`，布局一改就要同步改若干处 —— 所以派生只留在这里一份，
+ * 适配层一律调 `syncRootPath`。
  */
 export const SYNC_DIR_NAME = ".sync";
 
-/** 记忆根 → 同步状态目录（`syncRoot`）。所有同步入口的 `syncRoot` 入参都由它派生，不要就地拼字符串。 */
-export function syncRootPath(memoryDir: string): string {
-	return join(memoryDir, SYNC_DIR_NAME);
+/**
+ * 记忆根 → 同步状态目录（`syncRoot`）。所有同步入口的 `syncRoot` 入参都由它派生，不要就地拼字符串。
+ *
+ * **入参是记忆根，不是某个项目的记忆目录**，也就是 `config.memoryDir` / {@link defaultMemoryRoot}
+ * 那一个（`resolveMemoryDir` 在它下面再派生出 `<kind>/<项目>` 两层）。这两者在代码里都叫过
+ * 「memoryDir」，传错的后果不报错、只是静默变形：
+ *
+ * - `.sync` 是**整棵树共享一份**的状态：设备身份（`<hostname>-<id>`）、基线 manifest、以及那一个
+ *   git 克隆（远端按 `git/<项目 key>/` 前缀区分项目）。传项目目录的话，每个项目各自克隆一遍整个
+ *   远端、各自生成一份设备身份 —— 同一台机器在 `git log` 里变成好几台设备，冲突副本的归属也就废了。
+ * - 那份状态还会被算进项目目录的内容里（备份排除清单、`snapshotFiles` 扫的就是这一层）。
+ *
+ * 所以参数名刻意不叫 `memoryDir`：调用点写出来必须看得出传的是根。
+ */
+export function syncRootPath(memoryRoot: string): string {
+	return join(memoryRoot, SYNC_DIR_NAME);
 }
 
 /** 项目内某个文件在远端的路径。 */
