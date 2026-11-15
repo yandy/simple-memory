@@ -448,8 +448,11 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	const debounce = positiveMs(config.pushDebounceMs, DEFAULT_CONFIG.sync.pushDebounceMs);
 
 	function isConfigured(): boolean {
-		// 逐字判类型：配置合并那一层不校验类型，`remote` 可能是任何值
-		return Boolean(config.enabled) && typeof config.remote === "string" && config.remote.trim() !== "";
+		// 逐字判类型：配置合并那一层不校验类型，`remote` 可能是任何值。
+		// `enabled` 用 `=== true` 而不是真值：这是一道**同意边界** —— 用户写的 `"enabled": "false"`
+		// 在 JS 里是真值，按真值判定就会把明写的「关」读成「开」，继续往远端推数据。
+		// 「不是明确的 true 一律按关处理」与 `syncConfigErrors` 的布尔校验同一口径。
+		return config.enabled === true && typeof config.remote === "string" && config.remote.trim() !== "";
 	}
 
 	function emptyResult(): SyncRoundResult {
@@ -1095,21 +1098,23 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 推送与手动 `push()` 走同一条 `runRound`：锁、快照、冲突收敛、基线全都不变，
 	 * 唯一区别是它由写入触发而不是用户敲命令。
 	 */
-	const scheduler: SyncScheduler<SyncRoundResult> = config.pushOnWrite
-		? createSyncScheduler<SyncRoundResult>({
-				debounceMs: debounce,
-				timeoutMs: autoBudget,
-				/*
-				 * 「没发布成功的一轮」必须映射成 `null`。`runRound` 永远 resolve 出一个结果对象 ——
-				 * 锁忙是 `SyncSkip`、传输失败是 `failedRound`，都包在 `ok: false` 里，从不 reject ——
-				 * 原样交过去的话调度器看到的是「永远成功」，退出兜底就会谎报干净。
-				 */
-				run: async (timeoutMs) => {
-					const result = await runRound("push", timeoutMs);
-					return result.ok ? result : null;
-				},
-			})
-		: NOOP_SCHEDULER;
+	// `=== true`：同 `isConfigured`，一个字符串 `"false"` 不得被读成「开着自动推送」
+	const scheduler: SyncScheduler<SyncRoundResult> =
+		config.pushOnWrite === true
+			? createSyncScheduler<SyncRoundResult>({
+					debounceMs: debounce,
+					timeoutMs: autoBudget,
+					/*
+					 * 「没发布成功的一轮」必须映射成 `null`。`runRound` 永远 resolve 出一个结果对象 ——
+					 * 锁忙是 `SyncSkip`、传输失败是 `failedRound`，都包在 `ok: false` 里，从不 reject ——
+					 * 原样交过去的话调度器看到的是「永远成功」，退出兜底就会谎报干净。
+					 */
+					run: async (timeoutMs) => {
+						const result = await runRound("push", timeoutMs);
+						return result.ok ? result : null;
+					},
+				})
+			: NOOP_SCHEDULER;
 
 	return {
 		pull: (timeoutMs?: number) => runRound("pull", positiveMs(timeoutMs, autoBudget)),

@@ -302,8 +302,40 @@ describe("sync 配置", () => {
 
 	// 用户的 `"sync": null` 经 `mergeConfig` 原样带进来（与 `dream` / `extractMemories` 同一条路径）：
 	// 读不懂的子树按「未启用」处理，不能变成一句看不懂的 TypeError。
-	it("sync 子树为 null 时按未启用处理，不抛错", () => {
+	it("sync 子树为 null / 不是对象时按未启用处理，不抛错", () => {
 		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: null }))).toEqual([]);
+		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: "yes" }))).toEqual([]);
+	});
+
+	// 布尔键是**同意边界**，不是类型洁癖：pi 侧把 JSON.parse 的结果直接喂给 mergeConfig，
+	// 而 `"false"` 在 JS 里是真值 —— 按真值判定就会把用户明写的「关」读成「开」，记忆继续往
+	// git 远端推，同时这个函数还返回空数组（= 「配置没问题」）。
+	it("★布尔键不是布尔 → 各报一条，且同步按未启用处理（不再校验它管辖的键）", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			sync: { enabled: "false", pullOnStart: "no", pushOnWrite: 1, remote: "", branch: "" },
+		});
+		expect(syncConfigErrors(cfg)).toEqual([
+			'sync is disabled because "sync.enabled" must be true or false (got "false")',
+			'sync is disabled because "sync.pullOnStart" must be true or false (got "no")',
+			'sync is disabled because "sync.pushOnWrite" must be true or false (got 1)',
+		]);
+		// 文案要点名「同步因此是关的」：用户写 "false" 的意图就是关，报出来的必须是这件事
+	});
+
+	it("enabled 明确为 false → 一条都不报，即使它管辖的键全是坏值", () => {
+		expect(syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: false, remote: "", branch: 3 } }))).toEqual(
+			[],
+		);
+	});
+
+	it("顺序：三个布尔键 → remote → branch → 三个数字键", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			sync: { enabled: true, pullOnStart: "yes", remote: "git@example.com:o/r.git", pushDebounceMs: -1 },
+		});
+		expect(syncConfigErrors(cfg)).toEqual([
+			'sync is disabled because "sync.pullOnStart" must be true or false (got "yes")',
+			'sync is enabled but "sync.pushDebounceMs" must be a positive number of milliseconds (got -1)',
+		]);
 	});
 });
 

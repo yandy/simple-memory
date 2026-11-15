@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG, type SyncConfig } from "../src/config.js";
+import { DEFAULT_CONFIG, type SyncConfig, syncConfigErrors } from "../src/config.js";
 import {
 	NonFastForwardError,
 	type RemoteView,
@@ -863,6 +863,44 @@ describe("sync engine（假 backend）", () => {
 		});
 		expect(await noRemote.push()).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
 		expect(remote.fetches).toBe(0);
+	});
+
+	it("★\"enabled\": \"false\" 是字符串真值 → 仍按未启用处理，一个字节都不推", async () => {
+		// 宿主把 JSON.parse 的结果直接喂给配置合并，所以这种手误真会发生；而 `"false"` 在 JS 里是
+		// 真值 —— 按真值判定就会把用户明写的「关」读成「开」，记忆继续往远端推。这是同意边界。
+		const off = engineWith(remote, { enabled: "false" as unknown as boolean });
+		await store.addEntry({ name: "A", body: "a" });
+
+		expect(await off.pull()).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
+		expect(await off.push()).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
+		expect(remote.fetches).toBe(0);
+		expect(remote.publishAttempts).toBe(0);
+
+		const report = await off.status();
+		expect(report.configured).toBe(false);
+		expect(report.errors).toEqual([expect.stringMatching(/not configured/i)]);
+		// 校验出口也不再谎报「配置没问题」：两处必须同一个口径，否则用户得不到任何提示
+		expect(
+			syncConfigErrors({ ...DEFAULT_CONFIG, sync: { ...SYNC_CONFIG, enabled: "false" as unknown as boolean } }),
+		).toHaveLength(1);
+		off.dispose();
+	});
+
+	it("★\"pushOnWrite\": \"false\" → 写入不排自动推送（走空转调度器）", async () => {
+		const eng = engineWith(remote, { pushOnWrite: "false" as unknown as boolean });
+		vi.useFakeTimers();
+		try {
+			eng.noteWrite();
+			await vi.advanceTimersByTimeAsync(SYNC_CONFIG.pushDebounceMs * 3);
+			// 载重：一次远端往返都没发生（真调度器会在静默期到点时跑一轮 push）
+			expect(remote.fetches).toBe(0);
+			expect(remote.publishAttempts).toBe(0);
+			expect(eng.inFlight).toBeNull();
+			expect(await eng.flush()).toBeNull();
+		} finally {
+			eng.dispose();
+			vi.useRealTimers();
+		}
 	});
 
 	it("逻辑锁被占用（另一个整轮持有者）→ skipped，不动任何文件", async () => {

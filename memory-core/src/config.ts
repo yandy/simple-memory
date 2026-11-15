@@ -61,15 +61,22 @@ export interface ExtractMemoriesConfig {
  * 本节不触碰文件系统：core 只给默认值与合并语义，配置由适配层从自己的配置源读出后交给 `mergeConfig`。
  */
 export interface SyncConfig {
-	/** opt-in：自动往远端写数据必须由用户显式承担（同 `extractMemories`）。为假时其余键一律不校验。 */
+	/**
+	 * opt-in：自动往远端写数据必须由用户显式承担（同 `extractMemories`）。
+	 *
+	 * **必须是布尔值**，而且消费方一律按 `=== true` 判定：这是一道**同意边界**，不是类型洁癖。
+	 * 配置从宿主的 JSON 直接合并进来（`mergeConfig` 不校验类型），而 `"false"` 这种字符串在 JS 里
+	 * 是真值 —— 按真值判定就会把用户明写的「关」读成「开」，记忆继续往远端推，而校验出口还报「没问题」。
+	 * 不为 `true` 时其余键一律不校验（见 `syncConfigErrors`）。
+	 */
 	enabled: boolean;
 	/** git 远端 URL：只供首次初始化用；初始化之后的真相来源是暂存 clone 的 origin。 */
 	remote: string;
 	/** 远端的跟踪分支名。 */
 	branch: string;
-	/** 会话开始时自动拉取远端变更。 */
+	/** 会话开始时自动拉取远端变更。同样是 `=== true` 才算开（见 `enabled`）。 */
 	pullOnStart: boolean;
-	/** 写入后去抖自动发布。 */
+	/** 写入后去抖自动发布。同样是 `=== true` 才算开（见 `enabled`）。 */
 	pushOnWrite: boolean;
 	/**
 	 * 写入触发的静默期：静默期内的多条写入合并成一次推送（一轮 dream 写十几个文件 → 一次推送）。
@@ -247,17 +254,31 @@ export function modelConfigErrors(
  * 不解析目录、不建 store、不注册工具、没有索引段。少写一个远端 URL 不该让用户丢掉全部记忆功能，
  * 所以收到非空列表的适配层只需把同步当成未启用并报出来，其余记忆功能照常。
  *
- * 只有 `enabled` 为真时才检查其余键：关掉的开关不该逼用户先去修它管辖的键。
- * 顺序固定：remote → branch → pushDebounceMs → autoTimeoutMs → timeoutMs；每条消息都点名键，便于直接改配置。
+ * 三个布尔键**无条件**校验类型（它们就是开关本身，包括 `enabled`）；其余键只在 `enabled === true`
+ * 时才检查：关掉的开关不该逼用户先去修它管辖的键。
+ * 顺序固定：enabled → pullOnStart → pushOnWrite → remote → branch → pushDebounceMs → autoTimeoutMs
+ * → timeoutMs；每条消息都点名键，便于直接改配置。
  */
 export function syncConfigErrors(cfg: MemoryConfig): string[] {
 	const sync = cfg.sync;
-	// `?.`：`deepMerge` 把用户写的 `"sync": null` 原样带进来 —— 读不懂的子树按「未启用」处理，
-	// 而不是抛 TypeError。按**真值**判定，与适配层「enabled 为假就跳过同步」同一口径，
-	// 否则垃圾值与校验结论会互相矛盾。
-	if (!sync?.enabled) return [];
+	// 读不懂的子树（`deepMerge` 会把用户写的 `"sync": null`、甚至一个字符串原样带进来）按「未启用」
+	// 处理，一条都不报：没有键可校验，也没有开关可开。不抛 TypeError 是底线。
+	if (typeof sync !== "object" || sync === null) return [];
 
 	const errors: string[] = [];
+	// 三个布尔键按**类型**校验，不按真值：`"enabled": "false"` 在 JS 里是真值，
+	// 只判真值的话用户明写的「关」会被当成「开」，而这个函数还返回空数组（= 配置没问题）。
+	// 自动往远端推数据必须由用户显式承担，所以「不是明确的 true」一律按关处理并报出来。
+	for (const key of ["enabled", "pullOnStart", "pushOnWrite"] as const) {
+		const value: unknown = sync[key];
+		if (typeof value !== "boolean") {
+			const shown = typeof value === "string" ? JSON.stringify(value) : String(value);
+			errors.push(`sync is disabled because "sync.${key}" must be true or false (got ${shown})`);
+		}
+	}
+	// 不是明确的 true 就到此为止：开关没开，它管辖的键不必逼用户先修（与消费方 `=== true` 同口径）。
+	if (sync.enabled !== true) return errors;
+
 	// 非字符串也算空：`mergeConfig` 不校验类型，这里一 `.trim()` 就把非致命校验变成一次崩溃。
 	if (typeof sync.remote !== "string" || sync.remote.trim() === "") {
 		errors.push('sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"');
