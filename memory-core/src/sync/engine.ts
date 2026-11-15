@@ -1,6 +1,6 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { SyncConfig } from "../config.js";
+import { DEFAULT_CONFIG, type SyncConfig } from "../config.js";
 import { type ParsedEntryFile, parseEntryFile } from "../store/entry-file.js";
 import { isEntryFileNameForWrite } from "../store/filename.js";
 import { tryWithLock } from "../store/fs-lock.js";
@@ -19,6 +19,7 @@ import { type SyncConflict, diffThreeWay, type SyncDiff } from "./diff.js";
 import { sha256Hex } from "./hash.js";
 import { emptyManifest, MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "./manifest.js";
 import { type LocalScan, scanLocalEntries } from "./scan.js";
+import { remotePrefixFromKey } from "./paths.js";
 import { createSyncScheduler, type SyncScheduler } from "./scheduler.js";
 import type { SyncFileInfo, SyncFileSet } from "./types.js";
 
@@ -199,6 +200,26 @@ function describeError(err: unknown): string {
 }
 
 /**
+ * 时间预算的入口兵底：只认「有限的正数」，其余一律退回 `fallback`。
+ *
+ * 配置合并那一层不校验类型，`deepMerge` 还会把用户写的 `null` 原样带进来；而 `null` / `NaN` / `0`
+ * 一路走到子进程的 `timeout` 上等于**无限等** —— 一次远端挂死就把「任何同步失败都不得阻塞会话」
+ * 这条铁律桶穿（自动拉取是被 await 在会话启动路径上的）。所以预算只在入口这里认一次，
+ * 里面每一层拿到的都已经是个能用的数。
+ */
+function positiveMs(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * 一份预算还剩下多少毫秒。**下限是 1 而不是 0**：子进程的 `timeout: 0` 是「不限时」，
+ * 预算耗尽时给出去的必须是「立刻超时」，而不是把无限等当成兜底。
+ */
+function remainingMs(deadline: number): number {
+	return Math.max(1, deadline - Date.now());
+}
+
+/**
  * 「这个名字在哪台设备上都写不下去」的稳定原因词（同 `unparsable frontmatter` / `invalid modified`）。
  *
  * 不把具体理由（哪个保留名、哪一类字符）拼进去：适配层要拿它分类，而拼进去的文案会把一个
@@ -235,16 +256,6 @@ function mergePartials(previous: SyncRoundResult | undefined, latest: SyncRoundR
 		// 同一个文件因为同一个原因被拒收两次只报一次；原因不同则两条都留着（那是两次不同的拒收）
 		rejected: unionBy(previous.rejected, latest.rejected, (item) => `${item.file}\n${item.reason}`),
 	};
-}
-
-/**
- * 这个项目的远端前缀。
- *
- * `projectKey` 已经是 `remoteProjectKey` 的输出，所以这里只补远端布局的那一段目录，
- * 而不能再走一次 `remotePrefix`（它的入参是**身份 key**，再派生一次等于二次转义）。
- */
-function syncPrefix(projectKey: string): string {
-	return `git/${projectKey}`;
 }
 
 function asFileSet(files: Record<string, SyncFileInfo>): SyncFileSet {
@@ -412,12 +423,24 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	const memoryDir = store.cfg.memoryDir;
 	const rootLockPath = join(syncRoot, "sync.lock");
 	const manifestFile = manifestPath(syncRoot, projectKey);
-	const scope: SyncScope = { prefix: syncPrefix(projectKey) };
+	const scope: SyncScope = { prefix: remotePrefixFromKey(projectKey) };
 
 	const NOT_CONFIGURED = "sync is not configured: set sync.enabled and a sync remote first";
 	const NOT_INITIALIZED = "the sync backend is not initialized: run the sync init command first";
 	const ROOT_LOCK_BUSY = "another sync round holds the root sync lock, so this round was skipped";
 	const MEMORY_LOCK_BUSY = "the memory lock for this project is busy, so this round was skipped";
+
+	/**
+	 * 三个时间参数只在装配时认一次（`positiveMs`）。
+	 *
+	 * 为什么要兜：`mergeConfig` 不校验类型，`deepMerge` 还会把用户写的 `null` 原样带进来，而 `null` /
+	 * `NaN` / `0` 一路传到子进程的 `timeout` 上等于**无限等**，传到 `setTimeout` 上等于「每次写入都立刻推一次」。
+	 * 两者都把「一次同步失败不得阻塞会话」这条铁律变成了靠配置正确才成立的东西。
+	 * 退回值是包里的那套默认值，而不是就地造一个魔法数：默认值已经记在设计里（自动档 5s / 手动档 20s）。
+	 */
+	const autoBudget = positiveMs(config.autoTimeoutMs, DEFAULT_CONFIG.sync.autoTimeoutMs);
+	const manualBudget = positiveMs(config.timeoutMs, DEFAULT_CONFIG.sync.timeoutMs);
+	const debounce = positiveMs(config.pushDebounceMs, DEFAULT_CONFIG.sync.pushDebounceMs);
 
 	function isConfigured(): boolean {
 		// 逐字判类型：配置合并那一层不校验类型，`remote` 可能是任何值
@@ -458,6 +481,27 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	}
 
 	/**
+	 * 在途那些远端调用的中止控制器账本（一轮一个；`status` 也算一轮）。
+	 *
+	 * 端口的 `signal` 形参存在的全部理由就是「宿主退出时能把在途的那一次收尾」，而只有这一层知道
+	 * 什么时候算收摊：`dispose()` 把它们全部 abort，于是挂在会话启动路径上的拉取、以及退出时正在跑的
+	 * 推送都能立刻结束，而不是等子进程自己的超时跑完。用账本而不是单个字段：手动 `pull()` 与自动
+	 * 推送可能重叠（两者都允许，根锁会把传输段串起来），一个字段会丢一个。
+	 */
+	const activeSignals = new Set<AbortController>();
+
+	/** 跑一段会碰远端的工作：给它一个 signal，结束时从账本里摘掉（无论成败失败）。 */
+	async function withAbortSignal<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		const controller = new AbortController();
+		activeSignals.add(controller);
+		try {
+			return await work(controller.signal);
+		} finally {
+			activeSignals.delete(controller);
+		}
+	}
+
+	/**
 	 * ① 传输段：取一份远端快照，出段即释放根锁。
 	 *
 	 * `list()` 的 hash 是差集唯一的判据，但 `modified` / `bytes` 不在端口里 —— 它们要从内容里解析，
@@ -469,9 +513,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 自足的快照，读内容不能推迟到共享的传输状态上。同一句话也写在端口注释里（backend 实现方
 	 * 看的是那一份）：两边都得说，否则独立包实现的 backend 会把 `read()` 写成对着共享状态现取。
 	 */
-	async function readRemoteSnapshot(timeoutMs: number): Promise<RemoteSnapshot> {
+	async function readRemoteSnapshot(timeoutMs: number, signal: AbortSignal): Promise<RemoteSnapshot> {
 		const locked = await withRootLock(async () => {
-			const view = await backend.fetch(scope, { timeoutMs });
+			const view = await backend.fetch(scope, { timeoutMs, signal });
 			return { view, listed: await view.list() };
 		});
 		if (!locked.acquired) throw new SyncSkip(ROOT_LOCK_BUSY);
@@ -818,6 +862,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		applied: AppliedRound,
 		result: SyncRoundResult,
 		timeoutMs: number,
+		signal: AbortSignal,
 	): Promise<RoundOutcome> {
 		const { delta } = applied;
 		// 增量为空 = 远端已经有我们全部的字节：不取锁、不做一次注定「无变化」的远端往返
@@ -828,7 +873,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 				scope,
 				delta,
 				{ revision: snapshot.revision },
-				{ timeoutMs, message: publishMessage(delta), author: commitAuthor(device) },
+				{ timeoutMs, signal, message: publishMessage(delta), author: commitAuthor(device) },
 			),
 		);
 		if (!locked.acquired) {
@@ -863,12 +908,16 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		return `memory sync: ${parts.length > 0 ? parts.join(", ") : "no changes"}`;
 	}
 
-	async function runOnce(mode: Mode, timeoutMs: number): Promise<RoundOutcome> {
+	/**
+	 * 跑一次尝试。**收的是截止时刻而不是一个毫秒数**：预算要在每一次远端调用之前重新问一次，
+	 * 否则传输段花掉的时间不会从发布段的预算里扣（那就又变回「每段各一份满额」）。
+	 */
+	async function runOnce(mode: Mode, deadline: number, signal: AbortSignal): Promise<RoundOutcome> {
 		if (!isConfigured()) throw new SyncSkip(NOT_CONFIGURED);
 		// 自动路径绝不偷偷做首次初始化：那可能是一次几十秒的远端往返
 		if (!(await backend.ready())) throw new SyncSkip(NOT_INITIALIZED);
 
-		const snapshot = await readRemoteSnapshot(timeoutMs); // ① 出段即释放根锁
+		const snapshot = await readRemoteSnapshot(remainingMs(deadline), signal); // ① 出段即释放根锁
 		const result = emptyResult();
 		result.outOfScopeRemote = [...snapshot.outOfScope];
 
@@ -878,7 +927,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			// 用户手上，报一个根本没写进基线的 revision，等于让他们对着一个不存在的状态去排查
 			result.revision = snapshot.revision;
 			if (mode === "pull") return result;
-			return await publishPhase(snapshot, applied, result, timeoutMs); // ③ 再取一次根锁
+			return await publishPhase(snapshot, applied, result, remainingMs(deadline), signal); // ③ 再取一次根锁
 		} catch (err) {
 			// 远端在这轮之间又前进了：整轮重跑一次（重新取远端、重算差集），而不是原地重试一次 publish。
 			// 这一次尝试已经落盘的改动不会被重跑撤销，所以连同部分结果一起交出去。
@@ -890,7 +939,20 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		}
 	}
 
-	async function runRound(mode: Mode, timeoutMs: number): Promise<SyncRoundResult> {
+	/**
+	 * 一轮同步：一份**总预算** + 一个**中止信号**，两者都在这一层生成、往下传给每一次 backend 调用。
+	 *
+	 * 预算为什么是「一轮」而不是「一次调用」：配置里那两档时限的推理是按一轮算的（自动档被
+	 * await 在会话启动路径上，所以只给 5s），而一轮至少是 `fetch` + `publish` 两次调用、每次调用里
+	 * 又是好几个子进程（离线路径上 `fetch` 失败后还要再探一次远端）。每个子进程各拿一份满额预算，
+	 * 最坏情况就是配置值的好几倍 —— 正是那两档时限要避免的事。所以这里只传**剩下的毫秒**。
+	 */
+	function runRound(mode: Mode, timeoutMs: number): Promise<SyncRoundResult> {
+		return withAbortSignal((signal) => attemptRound(mode, timeoutMs, signal));
+	}
+
+	async function attemptRound(mode: Mode, timeoutMs: number, signal: AbortSignal): Promise<SyncRoundResult> {
+		const deadline = Date.now() + timeoutMs;
 		let lastRetry = "";
 		// 到目前为止本轮**已经落到本地**的那部分。失败报告必须带着它：失败可能发生在应用段之后
 		// （非快进重跑、发布时的传输错误、写基线失败），那时本地早就改过了，而「同步到底动没动
@@ -900,8 +962,19 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// 上一轮算出来的差集已经作废，原地重试 publish 只会再撞一次。落盘与副本命名都是幂等的
 		// （同一份内容派生同一个名字），代价只是可能多拍一份 `-sync` 快照。
 		for (let attempt = 1; attempt <= MAX_ROUND_ATTEMPTS; attempt += 1) {
+			// 预算耗尽就不再起重跑，而是给一句说得清的原因。拿零头去跑第二次等于让重跑系统性地
+			// 饿死（看起来像一次传输失败），而给每次尝试一份满额预算又把一轮变成 2×。
+			// 基线不前进、脏标记留着，下一次触发接着来 —— 与「重试用尽」同一个出口。
+			if (attempt > 1 && deadline - Date.now() <= 0) {
+				return failedRound(
+					`${lastRetry} — the round budget of ${timeoutMs}ms ran out before a retry could start; ` +
+						"nothing was published this round, but it may already have changed local memory " +
+						"(see pulled/conflicts in this result); the next round will retry",
+					lastPartial,
+				);
+			}
 			try {
-				const outcome = await runOnce(mode, timeoutMs);
+				const outcome = await runOnce(mode, deadline, signal);
 				if (!("retry" in outcome)) return outcome;
 				lastRetry = outcome.retry;
 				// 合并而不是覆盖：重跑不撤销上一次的落盘（理由写在 `mergePartials`）
@@ -942,7 +1015,12 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	}
 
 	/** 算一份报告。**dry-run**：全程只读，盘上一个字都不改。 */
-	async function computeStatus(timeoutMs: number): Promise<SyncStatusReport> {
+	function computeStatus(timeoutMs: number): Promise<SyncStatusReport> {
+		// status 也要挂上中止信号：它同样会碰远端（一次 fetch），而宿主退出时该收尾的不只是同步轮。
+		return withAbortSignal((signal) => buildStatusReport(timeoutMs, signal));
+	}
+
+	async function buildStatusReport(timeoutMs: number, signal: AbortSignal): Promise<SyncStatusReport> {
 		const manifest = await readManifest(manifestFile);
 		// 初值只有一份（`emptyStatusReport`）：字段清单写两遍，加字段时必然漏掉一边
 		const report = emptyStatusReport();
@@ -965,7 +1043,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// dry-run：下面全程只读 —— 不快照、不落盘、不重建索引、不写基线
 		let snapshot: RemoteSnapshot;
 		try {
-			snapshot = await readRemoteSnapshot(timeoutMs);
+			snapshot = await readRemoteSnapshot(timeoutMs, signal);
 		} catch (err) {
 			report.errors.push(describeError(err));
 			return report;
@@ -1014,8 +1092,8 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 */
 	const scheduler: SyncScheduler<SyncRoundResult> = config.pushOnWrite
 		? createSyncScheduler<SyncRoundResult>({
-				debounceMs: config.pushDebounceMs,
-				timeoutMs: config.autoTimeoutMs,
+				debounceMs: debounce,
+				timeoutMs: autoBudget,
 				/*
 				 * 「没发布成功的一轮」必须映射成 `null`。`runRound` 永远 resolve 出一个结果对象 ——
 				 * 锁忙是 `SyncSkip`、传输失败是 `failedRound`，都包在 `ok: false` 里，从不 reject ——
@@ -1029,10 +1107,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		: NOOP_SCHEDULER;
 
 	return {
-		pull: (timeoutMs?: number) => runRound("pull", timeoutMs ?? config.autoTimeoutMs),
-		push: (timeoutMs?: number) => runRound("push", timeoutMs ?? config.autoTimeoutMs),
+		pull: (timeoutMs?: number) => runRound("pull", positiveMs(timeoutMs, autoBudget)),
+		push: (timeoutMs?: number) => runRound("push", positiveMs(timeoutMs, autoBudget)),
 		status: (timeoutMs?: number) =>
-			computeStatus(timeoutMs ?? config.timeoutMs).catch((err: unknown) => {
+			computeStatus(positiveMs(timeoutMs, manualBudget)).catch((err: unknown) => {
 				// 报告本身也绝不抛：状态命令失败时至少给出一份带错误的报告
 				const fallback = emptyStatusReport();
 				fallback.errors.push(describeError(err));
@@ -1040,8 +1118,14 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			}),
 		// 写触发推送的三个出口：记下写入、退出/补推时立刻跑一次、收摊。全部转发给调度器。
 		noteWrite: () => scheduler.noteWrite(),
-		flush: (timeoutMs?: number) => scheduler.flush(timeoutMs),
-		dispose: () => scheduler.dispose(),
+		flush: (timeoutMs?: number) => scheduler.flush(positiveMs(timeoutMs, autoBudget)),
+		dispose: () => {
+			// 先中止在途那一轮的远端调用，再收摊调度器：宿主的退出路径是「`dispose()` → `await inFlight`」，
+			// 少了这一步，一次挂死的 fetch/publish 会把退出拖到子进程自己的超时跑完为止。
+			for (const controller of activeSignals) controller.abort();
+			activeSignals.clear();
+			scheduler.dispose();
+		},
 		get inFlight(): Promise<unknown> | null {
 			return scheduler.inFlight;
 		},

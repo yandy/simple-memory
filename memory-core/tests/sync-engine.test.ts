@@ -9,6 +9,7 @@ import {
 	type RemoteView,
 	type SyncBackend,
 	type SyncPublishChanges,
+	type SyncRunOptions,
 	type SyncScope,
 } from "../src/sync/backend.js";
 import type { DeviceIdentity } from "../src/sync/device.js";
@@ -1337,5 +1338,140 @@ describe("sync engine（假 backend）", () => {
 			engine.dispose();
 			vi.useRealTimers();
 		}
+	});
+
+	// ---------------------------------------------------------------------
+	// 一轮的时间预算与中止信号
+	// ---------------------------------------------------------------------
+
+	/** 每次调用收到的运行参数：预算递减与「同一轮同一个 signal」都靠它断言。 */
+	type SeenCall = { call: "fetch" | "publish"; timeoutMs: number; signal?: AbortSignal };
+
+	/**
+	 * 把真 backend 包一层：记下运行参数，并让 `fetch` 花掉一点真时间 ——
+	 * 预算是「剩下的毫秒」，只有真花了时间才看得出来它在递减。
+	 */
+	function instrumented(seen: SeenCall[], fetchDelayMs = 0): SyncBackend {
+		const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+		return {
+			async ready() {
+				return remote.ready();
+			},
+			async init(opts: SyncRunOptions) {
+				return remote.init(opts);
+			},
+			async fetch(scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView> {
+				seen.push({ call: "fetch", timeoutMs: opts.timeoutMs, signal: opts.signal });
+				if (fetchDelayMs > 0) await sleep(fetchDelayMs);
+				return remote.fetch(scope, opts);
+			},
+			async publish(
+				scope: SyncScope,
+				changes: SyncPublishChanges,
+				base: { revision: string },
+				opts: SyncRunOptions & { message: string; author: { name: string; email: string } },
+			): Promise<string> {
+				seen.push({ call: "publish", timeoutMs: opts.timeoutMs, signal: opts.signal });
+				return remote.publish(scope, changes, base, opts);
+			},
+		};
+	}
+
+	function engineWith(backend: SyncBackend, over: Partial<SyncConfig> = {}): SyncEngine {
+		return createSyncEngine({
+			syncRoot,
+			projectDir,
+			projectKey,
+			store,
+			backend,
+			device: DEVICE,
+			config: { ...SYNC_CONFIG, ...over },
+			now: NOW,
+		});
+	}
+
+	it("★一轮一份预算与一个 signal：publish 拿到的是 fetch 花剩的毫秒，不是又一份满额", async () => {
+		const seen: SeenCall[] = [];
+		const eng = engineWith(instrumented(seen, 40), { autoTimeoutMs: 5_000 });
+		await store.addEntry({ name: "A", body: "a" }); // 有东西要发布，才会走到 publish
+
+		expect((await eng.push()).ok).toBe(true);
+		expect(seen.map((item) => item.call)).toEqual(["fetch", "publish"]);
+		// 同一轮共用一个 signal：dispose() 一次就能把整轮（含重跑）收掉
+		expect(seen[0].signal).toBeInstanceOf(AbortSignal);
+		expect(seen[1].signal).toBe(seen[0].signal);
+		expect(seen[0].signal?.aborted).toBe(false);
+		// 预算递减：配置那一档（自动档 5s）说的是「一轮」，不是「每个子进程各一份」
+		expect(seen[0].timeoutMs).toBeLessThanOrEqual(5_000);
+		expect(seen[0].timeoutMs).toBeGreaterThan(4_000);
+		expect(seen[1].timeoutMs).toBeLessThan(seen[0].timeoutMs);
+		expect(seen[1].timeoutMs).toBeGreaterThan(0);
+		eng.dispose();
+	});
+
+	it("★预算耗尽时给出去的也不是 0：子进程的 `timeout: 0` 是「不限时」，必须是「立刻超时」", async () => {
+		const seen: SeenCall[] = [];
+		// fetch 花掉的时间超过整轮预算（离线路径上真会发生：每个子进程各挂满一次）
+		const eng = engineWith(instrumented(seen, 80), { autoTimeoutMs: 20 });
+		await store.addEntry({ name: "A", body: "a" });
+
+		await eng.push();
+		expect(seen.map((item) => item.call)).toEqual(["fetch", "publish"]);
+		expect(seen[0].timeoutMs).toBeGreaterThanOrEqual(1);
+		expect(seen[1].timeoutMs).toBeGreaterThanOrEqual(1); // 不是 0，也不是负数
+		eng.dispose();
+	});
+
+	it("非快进的重跑与第一次尝试共用一份预算：耗尽就不再起重跑，并把原因报出来", async () => {
+		const seen: SeenCall[] = [];
+		remote.nonFastForward = 1; // 第一次 publish 撞非快进 → 本该整轮重跑
+		const eng = engineWith(instrumented(seen, 60), { autoTimeoutMs: 50 });
+		await store.addEntry({ name: "A", body: "a" });
+
+		const res = await eng.push();
+		expect(res.ok).toBe(false);
+		expect(res.skipped?.reason).toMatch(/round budget of 50ms ran out/);
+		// 载重：没有第二次 fetch —— 拿零头去跑重跑等于让它系统性地饿死，看起来还像一次传输失败
+		expect(seen.filter((item) => item.call === "fetch")).toHaveLength(1);
+		// 本地那条记忆还在，脏状态也留着（下一次触发接着推）
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("name: A");
+		expect(await remote.names(prefix)).toEqual([]);
+		eng.dispose();
+	});
+
+	it("★dispose() 中止在途那一轮：signal 已交给 backend，abort 之后本轮以失败收尾", async () => {
+		const seen: SeenCall[] = [];
+		// fetch 挂住，直到它拿到的 signal 被中止 —— 与真 backend 的行为一致（signal 直接交给子进程）
+		const hanging: SyncBackend = {
+			async ready() {
+				return true;
+			},
+			async init() {},
+			async fetch(_scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView> {
+				seen.push({ call: "fetch", timeoutMs: opts.timeoutMs, signal: opts.signal });
+				await new Promise<void>((_resolve, reject) => {
+					const onAbort = (): void => reject(new Error("This operation was aborted"));
+					if (opts.signal?.aborted) return onAbort();
+					opts.signal?.addEventListener("abort", onAbort, { once: true });
+				});
+				throw new Error("unreachable: fetch 要么被中止、要么返回快照");
+			},
+			async publish(): Promise<string> {
+				throw new Error("unreachable: 这一轮走不到发布段");
+			},
+		};
+		const eng = engineWith(hanging, { autoTimeoutMs: 60_000 });
+		const round = eng.push();
+		await vi.waitFor(() => expect(seen).toHaveLength(1));
+		expect(seen[0].signal?.aborted).toBe(false); // 在途时还没中止
+
+		eng.dispose();
+		expect(seen[0].signal?.aborted).toBe(true);
+		// 一轮同步永远不抛：中止也变成 ok:false + 一句可读的原因（宿主退出路径上不能再抛一次）
+		await expect(round).resolves.toMatchObject({
+			ok: false,
+			skipped: { reason: expect.stringMatching(/abort/i) },
+		});
+		expect(eng.inFlight).toBeNull();
 	});
 });

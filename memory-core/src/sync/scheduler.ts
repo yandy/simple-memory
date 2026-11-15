@@ -57,7 +57,12 @@ export interface SyncScheduler<T = unknown> {
 	 * flush 会等那一轮收尾（绝不并发），若收尾之后仍有待发布内容，就接着跑属于自己的那一轮并报它的结果。
 	 */
 	flush(timeoutMs?: number): Promise<T | null>;
-	/** 取消定时器并丢弃「尚未发布」的两个标记。绝不抛错。可重复调用。 */
+	/**
+	 * 取消定时器并丢弃「尚未发布」的两个标记。绝不抛错。可重复调用。
+	 *
+	 * 在途的那一次不在这里取消（调度器够不到传输层）：取消由调用方做 —— 引擎的 `dispose()`
+	 * 会先 abort 那一轮的中止信号，再转发到这里。
+	 */
 	dispose(): void;
 	/**
 	 * 在途的那一次推送（没有则 `null`）—— 宿主把它挂进自己的「退出前等在途写」账本。
@@ -195,7 +200,9 @@ export function createSyncScheduler<T = unknown>(options: SyncSchedulerOptions<T
 		flush,
 		dispose(): void {
 			// 绝不抛错：宿主在退出路径上调用它，那里再抛一次就是「退不掉」。
-			// 在途的那一次不取消（也没有办法取消）：宿主的账本负责先等它。
+			// 在途的那一次**调度器自己**取消不了：它手上只有一个 `run` 回调，够不到传输层。
+			// 取消是调用方的事 —— 引擎的 `dispose()` 会 abort 那一轮交给 backend 的中止信号。
+			// 宿主的账本仍要先等它（`await inFlight`）：中止是「尽快收尾」，不是「立刻就不在了」。
 			disposed = true;
 			cancelTimer();
 			dirty = false;

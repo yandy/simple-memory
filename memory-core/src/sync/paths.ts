@@ -17,9 +17,28 @@ export function remoteProjectKey(identityKey: string): string {
 	return projectDirName(identityKey, { platform: "linux" });
 }
 
-/** 单个项目在远端的前缀：`git/<远端 key>`。 */
+/**
+ * 远端布局里「全部记忆都放在这个目录下」的那一段：`git/`。
+ *
+ * 字面值只存这一份：引擎算 scope、适配层渲染远端路径、以及将来可能的「列出远端有哪些项目」
+ * 都靠它。多一处硬编码就多一处布局改动时会静默分叉的地方（与 `SYNC_DIR_NAME` 同一个理由）。
+ */
+const REMOTE_ROOT_DIR = "git";
+
+/**
+ * 已经是 `remoteProjectKey` 输出的 key → 它在远端的前缀。
+ *
+ * 与 `remotePrefix` 的区别就在入参：那边收的是**身份 key**（会再派生一次），这边收的是
+ * 已经派生好的项目 key。拿错一个就是二次转义（`github.com__o__r` 变成 `github.com____o____r`），
+ * 而这个错不报错：只是远端从此多出一个谁也不认的目录，同步看起来正常但两边各存一份。
+ */
+export function remotePrefixFromKey(projectKey: string): string {
+	return `${REMOTE_ROOT_DIR}/${projectKey}`;
+}
+
+/** 单个项目在远端的前缀：`git/<远端 key>`。入参是**身份 key**，在这里派生成项目 key。 */
 export function remotePrefix(identityKey: string): string {
-	return `git/${remoteProjectKey(identityKey)}`;
+	return remotePrefixFromKey(remoteProjectKey(identityKey));
 }
 
 /**

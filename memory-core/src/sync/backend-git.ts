@@ -71,6 +71,45 @@ interface RunOptions {
 }
 
 /**
+ * git 子进程的环境：**绍不向用户要凭据**。
+ *
+ * 同步是挂在会话里跑的，而 git 的凭据提示会直接打进用户正在用的终端：
+ * `GIT_TERMINAL_PROMPT=0` 关掉 git 自己的提示，`ssh -oBatchMode=yes` 关掉 ssh 的 passphrase 提示 ——
+ * ssh 是直接开 `/dev/tty` 的，绕过了被 pipe 的 stdin，所以不关掉它，一轮同步会静静地卡在用户的
+ * TUI 上等一个看不见的输入（既不是失败也不是超时，而是挂死）。关掉之后得到的是一条能读的
+ * 「认证失败」，与设计里「离线 / 认证失败 → 跳过 + 一条提示」同一口径。
+ *
+ * 用户自己设过的 `GIT_SSH_COMMAND` 原样保留：那通常带着他的 IdentityFile / ProxyCommand，
+ * 覆盖掉会把本来连得上的远端变成连不上。代价是他那份命令里没写 BatchMode 时仍可能提示 ——
+ * 那是用户自己选的命令，比静默改掉它的语义好。
+ */
+function subprocessEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+	if (env.GIT_SSH_COMMAND === undefined) env.GIT_SSH_COMMAND = "ssh -oBatchMode=yes";
+	return env;
+}
+
+/**
+ * 把「这一次调用的时间上限」变成一份**共享**预算：每要跑一个子进程就重新问一次还剩多少。
+ *
+ * 端口给的 `timeoutMs` 若原样交给每个子进程，一次 `fetch()` 里的 `git fetch` 与失败复核的
+ * `ls-remote` 就各花满一份（离线路径上正是这两步），而调用方以为它买的是「一次调用的上限」。
+ *
+ * 用 getter 而不是先算好一个数：`inRepo(o)` 每跑一个子进程都会展开一次这个对象，
+ * 展开的那一刻才读到剩余预算。下限是 1ms 而不是 0：`execFile` 的 `timeout: 0` 是「不限时」，
+ * 预算耗尽时给出去的必须是「立刻超时」。
+ */
+function budgeted<T extends SyncRunOptions>(o: T): T {
+	const deadline = Date.now() + Math.max(0, o.timeoutMs);
+	// `defineProperty` 而不是对象字面量里的 getter：前者类型上仍是 `T`（publish 多带的
+	// `message`/`author` 不会在转换里丢掉），也不需要一处向下转型。
+	return Object.defineProperty({ ...o }, "timeoutMs", {
+		enumerable: true,
+		get: (): number => Math.max(1, deadline - Date.now()),
+	});
+}
+
+/**
  * 抹掉 URL 里的口令。
  *
  * `https://user:<token>@host/...` 是 git 官方支持的凭据写法，也是 CI 上免交互推送的常规做法，
@@ -123,6 +162,7 @@ async function runGitRaw(args: string[], o: RunOptions): Promise<Buffer> {
 		signal: o.signal,
 		maxBuffer: MAX_BUFFER_BYTES,
 		encoding: "buffer",
+		env: subprocessEnv(),
 	};
 	const promise = execFileP("git", args, options);
 	if (o.input !== undefined) {
@@ -382,7 +422,10 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		};
 	}
 
-	async function fetch(scope: SyncScope, o: SyncRunOptions): Promise<RemoteView> {
+	async function fetch(scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView> {
+		// 一次调用一份共享预算：下面的 `remoteHead`（fetch + 失败时的 ls-remote 复核）、`ls-tree`
+		// 与 `cat-file` 加起来是五六个子进程，每个各拿一份满额超时就不是一次调用的上限了。
+		const o = budgeted(opts);
 		await requireRepo();
 		const revision = await remoteHead(o);
 		if (revision === null) return emptyView();
@@ -425,7 +468,9 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		await runGit(["push", "--quiet", "-u", "origin", branch], inRepo(o));
 	}
 
-	async function init(o: SyncRunOptions): Promise<void> {
+	async function init(opts: SyncRunOptions): Promise<void> {
+		// 共享预算（同 `fetch`）：init 是 clone + 引导提交，子进程最多的一条路径。
+		const o = budgeted(opts);
 		// 幂等：已经初始化过就什么都不做。换远端是另一条路径的职责 —— 这里悄悄改掉 origin，
 		// 用户会以为同步去了他刚配的地方。
 		if (await ready()) return;
@@ -507,8 +552,10 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		scope: SyncScope,
 		changes: SyncPublishChanges,
 		base: { revision: string },
-		o: SyncRunOptions & { message: string; author: { name: string; email: string } },
+		opts: SyncRunOptions & { message: string; author: { name: string; email: string } },
 	): Promise<string> {
+		// 共享预算（同 `fetch`）：一次发布是 reset + clean + add + commit + push 等好几个子进程。
+		const o = budgeted(opts);
 		await requireRepo();
 		const head = await remoteHead(o);
 
