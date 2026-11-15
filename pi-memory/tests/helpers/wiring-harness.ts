@@ -43,6 +43,8 @@ const mocks = vi.hoisted(() => ({
 	syncPushBarrier: { current: null as Promise<void> | null },
 	syncInitBarrier: { current: null as Promise<void> | null },
 	syncInitSignals: [] as Array<AbortSignal | undefined>,
+	/** 只故障注入适配层直接调用的 writeManifest；core engine 内部仍走真实实现。 */
+	syncManifestWriteFailure: { current: null as Error | null },
 	readDreamMetaMock: vi.fn(),
 	writeDreamMetaMock: vi.fn().mockResolvedValue(undefined),
 	detectLegacyMemoryDirMock: vi.fn().mockResolvedValue(null),
@@ -106,6 +108,14 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 					return backend.fetch(scope, opts);
 				},
 			};
+		},
+		writeManifest: async (...args: Parameters<typeof actual.writeManifest>) => {
+			const failure = mocks.syncManifestWriteFailure.current;
+			if (failure) {
+				mocks.syncManifestWriteFailure.current = null;
+				throw failure;
+			}
+			return actual.writeManifest(...args);
 		},
 		createSyncEngine: (options: Parameters<typeof actual.createSyncEngine>[0]) => {
 			const engine = actual.createSyncEngine(options);
@@ -196,6 +206,7 @@ export const syncEngines = mocks.syncEngines;
 export const syncPushBarrier = mocks.syncPushBarrier;
 export const syncInitBarrier = mocks.syncInitBarrier;
 export const syncInitSignals = mocks.syncInitSignals;
+export const syncManifestWriteFailure = mocks.syncManifestWriteFailure;
 export const scanEntriesMock = mocks.scanEntriesMock;
 export const runTaskMock = mocks.runTaskMock;
 export const shouldNudgeMock = mocks.shouldNudgeMock;
@@ -245,6 +256,7 @@ export function resetWiringMocks(): void {
 	syncPushBarrier.current = null;
 	syncInitBarrier.current = null;
 	syncInitSignals.length = 0;
+	syncManifestWriteFailure.current = null;
 	scanEntriesMock.mockReset();
 	runTaskMock.mockReset();
 	runTaskMock.mockImplementation((task: { id?: string }, _input: unknown, ctx?: { cfg?: MemoryConfig }) => {

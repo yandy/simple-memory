@@ -22,12 +22,14 @@ import {
 	remoteProjectKey,
 	syncLockPath,
 	syncRootPath,
+	writeManifest,
 } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createFakePi,
 	DISK_INDEX,
 	enableTestSync,
+	flush,
 	gitIdentity,
 	projectIdentityMock,
 	resetWiringMocks,
@@ -35,7 +37,10 @@ import {
 	setupSession,
 	syncEngines,
 	syncEvents,
+	syncInitBarrier,
+	syncManifestWriteFailure,
 	uiWith,
+	waitFor,
 } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import * as syncApi from "../src/sync";
@@ -523,7 +528,6 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		const prepared = await runtime.prepare(10_000);
 		if (!prepared.ok) throw new Error(`prepare failed: ${prepared.reason}`);
 		const paths = syncPaths();
-		const before = await readFile(paths.manifest, "utf8");
 		const nextRemote = join(s.cwd, "recovery.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
 		const init = vi
@@ -536,8 +540,8 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		if (changed.ok) throw new Error("unexpected remote change success");
 		expect(changed.reason).toContain("https://user:***@example.invalid/x");
 		expect(changed.reason).not.toContain("super-secret");
-		expect(runtime.engine).toBeNull();
-		expect(await readFile(paths.manifest, "utf8")).toBe(before);
+		expect(runtime.engine).not.toBeNull();
+		expect(await readManifest(paths.manifest)).toBeNull();
 
 		const recovered = await runtime.prepare(10_000);
 		if (!recovered.ok) throw new Error(`recovery failed: ${recovered.reason}`);
@@ -549,7 +553,138 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		runtime.dispose();
 	});
 
-	it("retries both revalidation and the empty baseline write after a real manifest write failure", async () => {
+	it("leaves the manifest missing and retries revalidation after the empty baseline write fails", async () => {
+		const config = memoryConfig();
+		const store = newStore(config);
+		const { runtime } = await syncApi.createPiSyncRuntime({
+			config,
+			store,
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`prepare failed: ${prepared.reason}`);
+		const paths = syncPaths();
+		syncManifestWriteFailure.current = new Error("controlled manifest write failure");
+		const nextRemote = join(s.cwd, "manifest-recovery.git");
+		await git(["init", "--bare", "--quiet", nextRemote]);
+		const init = vi.spyOn(runtime.backend, "init");
+
+		const changed = await runtime.changeRemote(nextRemote, 10_000);
+		expect(changed.ok).toBe(false);
+		expect(changed.ok ? "" : changed.reason).toContain("controlled manifest write failure");
+		expect(runtime.engine).not.toBeNull();
+		expect(await readManifest(paths.manifest)).toBeNull();
+
+		const recovered = await runtime.prepare(10_000);
+		if (!recovered.ok) throw new Error(`recovery failed: ${recovered.reason}`);
+		expect(init).toHaveBeenCalledTimes(2);
+		expect(await readManifest(paths.manifest)).toEqual({
+			version: 1,
+			base: { revision: "", syncedAt: expect.any(String) },
+			files: {},
+		});
+		runtime.dispose();
+	});
+
+	it("a new runtime never reuses the old base after revalidation fails following manifest invalidation", async () => {
+		const config = memoryConfig();
+		const store = newStore(config);
+		const { runtime } = await syncApi.createPiSyncRuntime({
+			config,
+			store,
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`prepare failed: ${prepared.reason}`);
+		await store.addEntry({ name: "Local", description: "local", body: "must survive" });
+		expect((await prepared.engine.push(10_000)).ok).toBe(true);
+		const paths = syncPaths();
+		expect(Object.keys((await readManifest(paths.manifest))?.files ?? {})).toHaveLength(1);
+		const nextRemote = join(s.cwd, "restart-after-init-failure.git");
+		await git(["init", "--bare", "--quiet", nextRemote]);
+		vi.spyOn(runtime.backend, "init").mockRejectedValueOnce(new Error("controlled revalidation failure"));
+
+		const changed = await runtime.changeRemote(nextRemote, 10_000);
+		expect(changed.ok).toBe(false);
+		runtime.dispose();
+
+		const restarted = await syncApi.createPiSyncRuntime({
+			config,
+			store: newStore(config),
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		if (!restarted.runtime) throw new Error("restarted runtime was not created");
+		const restartedPrepare = await restarted.runtime.prepare(10_000);
+		if (!restartedPrepare.ok) throw new Error(`restarted prepare failed: ${restartedPrepare.reason}`);
+		const baselineAfterRestart = await readManifest(paths.manifest);
+		expect((await restartedPrepare.engine.pull(10_000)).ok).toBe(true);
+
+		expect(baselineAfterRestart).toEqual({
+			version: 1,
+			base: { revision: "", syncedAt: expect.any(String) },
+			files: {},
+		});
+		expect(await readFile(join(s.dir, "Local.md"), "utf8")).toContain("must survive");
+		restarted.runtime.dispose();
+	});
+
+	it("a restart after setRemote but before init converges from an empty base without deleting local entries", async () => {
+		const config = memoryConfig();
+		const store = newStore(config);
+		const { runtime } = await syncApi.createPiSyncRuntime({
+			config,
+			store,
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`prepare failed: ${prepared.reason}`);
+		await store.addEntry({ name: "Local", description: "local", body: "survives crash window" });
+		expect((await prepared.engine.push(10_000)).ok).toBe(true);
+		const paths = syncPaths();
+		const nextRemote = join(s.cwd, "crash-before-init.git");
+		await git(["init", "--bare", "--quiet", nextRemote]);
+		let markInitStarted!: () => void;
+		const initStarted = new Promise<void>((resolveStarted) => {
+			markInitStarted = resolveStarted;
+		});
+		vi.spyOn(runtime.backend, "init").mockImplementation(({ signal }) => {
+			markInitStarted();
+			return new Promise<never>((_resolve, reject) => {
+				const stop = () => reject(new Error("process stopped before init"));
+				if (signal?.aborted) stop();
+				else signal?.addEventListener("abort", stop, { once: true });
+			});
+		});
+
+		const changing = runtime.changeRemote(nextRemote, 10_000);
+		await initStarted;
+		expect(await runtime.backend.getRemote()).toBe(nextRemote);
+		runtime.dispose();
+		await changing;
+		expect(await readManifest(paths.manifest)).toBeNull();
+
+		const restarted = await syncApi.createPiSyncRuntime({
+			config,
+			store: newStore(config),
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		if (!restarted.runtime) throw new Error("restarted runtime was not created");
+		const restartedPrepare = await restarted.runtime.prepare(10_000);
+		if (!restartedPrepare.ok) throw new Error(`restarted prepare failed: ${restartedPrepare.reason}`);
+		expect((await restartedPrepare.engine.pull(10_000)).ok).toBe(true);
+		expect(await readFile(join(s.dir, "Local.md"), "utf8")).toContain("survives crash window");
+		restarted.runtime.dispose();
+	});
+
+	it("does not mutate origin when manifest invalidation fails and still restores one write trigger", async () => {
 		const config = memoryConfig();
 		const store = newStore(config);
 		const { runtime } = await syncApi.createPiSyncRuntime({
@@ -565,25 +700,170 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		const backup = `${paths.manifest}.backup`;
 		await rename(paths.manifest, backup);
 		await mkdir(paths.manifest);
-		const nextRemote = join(s.cwd, "manifest-recovery.git");
+		const nextRemote = join(s.cwd, "invalidation-failure.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
-		const init = vi.spyOn(runtime.backend, "init");
+		const setRemote = vi.spyOn(runtime.backend, "setRemote");
+		syncEvents.length = 0;
 
 		const changed = await runtime.changeRemote(nextRemote, 10_000);
-		expect(changed.ok).toBe(false);
-		expect(runtime.engine).toBeNull();
 
-		await rm(paths.manifest, { recursive: true });
-		await rename(backup, paths.manifest);
-		const recovered = await runtime.prepare(10_000);
-		if (!recovered.ok) throw new Error(`recovery failed: ${recovered.reason}`);
-		expect(init).toHaveBeenCalledTimes(2);
+		expect(changed.ok).toBe(false);
+		expect(setRemote).not.toHaveBeenCalled();
+		expect(await runtime.backend.getRemote()).toBe(remote);
+		expect(runtime.engine).not.toBeNull();
+		expect(syncEvents.filter((event) => event === "noteWrite")).toHaveLength(1);
+		runtime.dispose();
+	});
+
+	it("remote change drains a manual round and the disposed engine inFlight before any old-base write can win", async () => {
+		await enableSync();
+		const { pi, tools, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		await tools[0].execute(
+			"old-base-add",
+			{ action: "add", name: "Old base", description: "local", content: "body" },
+			undefined,
+			undefined,
+			undefined,
+		);
+		const engine = syncEngines.at(-1);
+		if (!engine) throw new Error("sync engine was not prepared");
+		expect((await engine.push(10_000)).ok).toBe(true);
+		const paths = syncPaths();
+		const oldManifest = await readManifest(paths.manifest);
+		if (!oldManifest) throw new Error("old manifest was not written");
+		let releasePull!: () => void;
+		const pullGate = new Promise<void>((resolveGate) => {
+			releasePull = resolveGate;
+		});
+		let releaseAutomatic!: () => void;
+		const automaticGate = new Promise<void>((resolveGate) => {
+			releaseAutomatic = resolveGate;
+		});
+		const oldRound = automaticGate.then(() => writeManifest(paths.manifest, oldManifest));
+		vi.spyOn(engine, "inFlight", "get").mockReturnValue(oldRound);
+		const dispose = vi.spyOn(engine, "dispose");
+		const pull = vi.spyOn(engine, "pull").mockImplementation(async () => {
+			await pullGate;
+			await writeManifest(paths.manifest, oldManifest);
+			return { ...failedRound(), ok: true, skipped: undefined };
+		});
+		const nextRemote = join(s.cwd, "drain-before-change.git");
+		await git(["init", "--bare", "--quiet", nextRemote]);
+
+		const manual = commands["memory"].handler("sync pull", s.uiCtx());
+		await waitFor(() => pull.mock.calls.length === 1, "manual pull to start");
+		const changing = commands["memory"].handler(`sync remote ${nextRemote}`, s.uiCtx());
+		await flush();
+		await flush();
+		const originBeforeManualRelease = await git(["remote", "get-url", "origin"], join(paths.syncRoot, "repo"));
+		const manifestBeforeManualRelease = await readManifest(paths.manifest);
+
+		releasePull();
+		await waitFor(() => dispose.mock.calls.length === 1, "old engine disposal after manual pull");
+		await flush();
+		const originBeforeAutomaticRelease = await git(["remote", "get-url", "origin"], join(paths.syncRoot, "repo"));
+		releaseAutomatic();
+		await Promise.all([manual, changing, oldRound]);
+
+		expect(originBeforeManualRelease).toBe(remote);
+		expect(manifestBeforeManualRelease).toEqual(oldManifest);
+		expect(originBeforeAutomaticRelease).toBe(remote);
+		expect(await git(["remote", "get-url", "origin"], join(paths.syncRoot, "repo"))).toBe(nextRemote);
 		expect(await readManifest(paths.manifest)).toEqual({
 			version: 1,
 			base: { revision: "", syncedAt: expect.any(String) },
 			files: {},
 		});
-		runtime.dispose();
+	});
+
+	it("a successful remote change transfers dirty and blocked writes through exactly one replacement noteWrite", async () => {
+		await enableSync({ pushOnWrite: true, pushDebounceMs: 60_000 });
+		const { pi, tools, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		const oldEngine = syncEngines.at(-1);
+		if (!oldEngine) throw new Error("sync engine was not prepared");
+		oldEngine.noteWrite();
+		const nextRemote = join(s.cwd, "successful-trigger.git");
+		await git(["init", "--bare", "--quiet", nextRemote]);
+		let releaseInit!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveGate) => {
+			releaseInit = resolveGate;
+		});
+		const changing = commands["memory"].handler(`sync remote ${nextRemote}`, s.uiCtx());
+		await waitFor(() => syncEvents.includes("init:start"), "remote revalidation to block");
+		await tools[0].execute(
+			"during-successful-change",
+			{ action: "add", name: "During success", description: "local", content: "must auto publish" },
+			undefined,
+			undefined,
+			undefined,
+		);
+		syncEvents.length = 0;
+		syncInitBarrier.current = null;
+		releaseInit();
+		await changing;
+		const replacementTriggers = syncEvents.filter((event) => event === "noteWrite").length;
+
+		await handlers["session_shutdown"][0]({ reason: "quit" }, s.uiCtx());
+
+		expect(replacementTriggers).toBe(1);
+		expect(syncEngines.at(-1)).not.toBe(oldEngine);
+		expect(await git(["--git-dir", nextRemote, "ls-tree", "-r", "--name-only", "main"])).toContain(
+			"During-success.md",
+		);
+	});
+
+	it("a failed remote change restores exactly one noteWrite and keeps later writes auto-publishable", async () => {
+		await enableSync({ pushOnWrite: true, pushDebounceMs: 60_000 });
+		const { pi, tools, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		const oldEngine = syncEngines.at(-1);
+		if (!oldEngine) throw new Error("sync engine was not prepared");
+		oldEngine.noteWrite();
+		const nextRemote = join(s.cwd, "failed-trigger.git");
+		let releaseInit!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveGate) => {
+			releaseInit = resolveGate;
+		});
+		const changing = commands["memory"].handler(`sync remote ${nextRemote}`, s.uiCtx());
+		await waitFor(() => syncEvents.includes("init:start"), "failed remote revalidation to block");
+		await tools[0].execute(
+			"during-failed-change",
+			{ action: "add", name: "During failure", description: "local", content: "must survive" },
+			undefined,
+			undefined,
+			undefined,
+		);
+		syncEvents.length = 0;
+		syncInitBarrier.current = null;
+		releaseInit();
+		await changing;
+		const replacementTriggers = syncEvents.filter((event) => event === "noteWrite").length;
+
+		await git(["init", "--bare", "--quiet", nextRemote]);
+		await commands["memory"].handler("sync pull", s.uiCtx());
+		const triggersAfterRecovery = syncEvents.filter((event) => event === "noteWrite").length;
+		syncEvents.length = 0;
+		await tools[0].execute(
+			"after-failed-change",
+			{ action: "add", name: "After failure", description: "local", content: "new write" },
+			undefined,
+			undefined,
+			undefined,
+		);
+		const newWriteTriggers = syncEvents.filter((event) => event === "noteWrite").length;
+		await handlers["session_shutdown"][0]({ reason: "quit" }, s.uiCtx());
+
+		expect(replacementTriggers).toBe(1);
+		expect(triggersAfterRecovery).toBe(1);
+		expect(newWriteTriggers).toBe(1);
+		const tree = await git(["--git-dir", nextRemote, "ls-tree", "-r", "--name-only", "main"]);
+		expect(tree).toContain("During-failure.md");
+		expect(tree).toContain("After-failure.md");
 	});
 
 	it("/memory sync remote leaves memory.json untouched and the next status reports drift while using origin", async () => {

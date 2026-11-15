@@ -376,7 +376,7 @@ export default function (pi: ExtensionAPI) {
 					if (prepared.warning) syncErrors.push(prepared.warning);
 					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
 					if (cfg.sync.pullOnStart === true) {
-						const round = await prepared.engine.push(cfg.sync.autoTimeoutMs);
+						const round = await activeRuntime.runActivity(() => prepared.engine.push(cfg.sync.autoTimeoutMs));
 						if (!isCurrent()) return;
 						if (!round.ok) syncErrors.push(round.skipped?.reason ?? "memory sync startup round failed");
 					}
@@ -613,9 +613,9 @@ export default function (pi: ExtensionAPI) {
 			flushWarningShown = true;
 			notifySync(ui, `Memory sync flush failed: ${reason}; local changes will be retried at the next session start.`);
 		};
-		if (engine && cfg) {
+		if (engine && cfg && runtime) {
 			try {
-				flushPromise = engine.flush(cfg.sync.autoTimeoutMs);
+				flushPromise = runtime.runActivity(() => engine.flush(cfg.sync.autoTimeoutMs));
 			} catch (error) {
 				flushPromise = Promise.reject(error);
 			}
@@ -748,38 +748,36 @@ export default function (pi: ExtensionAPI) {
 			showSyncUnavailable(ui);
 			return;
 		}
-		const engine = activeRuntime.engine;
-		if (!engine) {
-			try {
-				const initialized = await activeRuntime.backend.ready();
-				if (!initialized) {
+		try {
+			await activeRuntime.runActivity(async () => {
+				const engine = activeRuntime.engine;
+				if (!engine) {
+					const initialized = await activeRuntime.backend.ready();
+					if (!initialized) {
+						notifySync(
+							ui,
+							'Memory sync is not initialized: set "sync.remote" in memory.json; initialization runs at session start, or use /memory sync pull to retry.',
+							"info",
+						);
+						return;
+					}
+					const origin = await activeRuntime.backend.getRemote();
 					notifySync(
 						ui,
-						'Memory sync is not initialized: set "sync.remote" in memory.json; initialization runs at session start, or use /memory sync pull to retry.',
+						syncErrorMessage(
+							[
+								"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
+								`Origin: ${origin ?? "(not set)"}`,
+								`Configured remote: ${typeof cfg.sync.remote === "string" && cfg.sync.remote.trim() !== "" ? cfg.sync.remote : "(not set)"}`,
+							].join("\n"),
+						),
 						"info",
 					);
 					return;
 				}
-				const origin = await activeRuntime.backend.getRemote();
-				notifySync(
-					ui,
-					syncErrorMessage(
-						[
-							"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
-							`Origin: ${origin ?? "(not set)"}`,
-							`Configured remote: ${typeof cfg.sync.remote === "string" && cfg.sync.remote.trim() !== "" ? cfg.sync.remote : "(not set)"}`,
-						].join("\n"),
-					),
-					"info",
-				);
-			} catch (error) {
-				notifySync(ui, `Memory sync status failed: ${syncErrorMessage(error)}`);
-			}
-			return;
-		}
-		try {
-			const report = await engine.status(cfg.sync.timeoutMs);
-			notifySync(ui, renderSyncStatus(report, typeof cfg.sync.remote === "string" ? cfg.sync.remote : ""), "info");
+				const report = await engine.status(cfg.sync.timeoutMs);
+				notifySync(ui, renderSyncStatus(report, typeof cfg.sync.remote === "string" ? cfg.sync.remote : ""), "info");
+			});
 		} catch (error) {
 			notifySync(ui, `Memory sync status failed: ${syncErrorMessage(error)}`);
 		}
@@ -794,26 +792,28 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
-			const prepared = await activeRuntime.prepare(cfg.sync.timeoutMs);
-			if (!prepared.ok) {
-				setSyncError([...syncPersistentErrors, prepared.reason]);
-				notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(prepared.reason)}`);
-				return;
-			}
-			const round = await prepared.engine[kind](cfg.sync.timeoutMs);
-			const errors = [...syncPersistentErrors];
-			if (prepared.warning) errors.push(prepared.warning);
-			if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
-			setSyncError(errors);
-			const rendered = renderSyncRound(round);
-			if (!round.ok) {
-				notifySync(
-					ui,
-					`Memory sync ${kind} failed: ${syncErrorMessage(round.skipped?.reason ?? "unknown sync failure")}\n${rendered}`,
-				);
-				return;
-			}
-			notifySync(ui, `Memory sync ${kind}:\n${rendered}`, "info");
+			await activeRuntime.runActivity(async () => {
+				const prepared = await activeRuntime.prepare(cfg.sync.timeoutMs);
+				if (!prepared.ok) {
+					setSyncError([...syncPersistentErrors, prepared.reason]);
+					notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(prepared.reason)}`);
+					return;
+				}
+				const round = await prepared.engine[kind](cfg.sync.timeoutMs);
+				const errors = [...syncPersistentErrors];
+				if (prepared.warning) errors.push(prepared.warning);
+				if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
+				setSyncError(errors);
+				const rendered = renderSyncRound(round);
+				if (!round.ok) {
+					notifySync(
+						ui,
+						`Memory sync ${kind} failed: ${syncErrorMessage(round.skipped?.reason ?? "unknown sync failure")}\n${rendered}`,
+					);
+					return;
+				}
+				notifySync(ui, `Memory sync ${kind}:\n${rendered}`, "info");
+			});
 		} catch (error) {
 			const reason = syncErrorMessage(error);
 			setSyncError([...syncPersistentErrors, reason]);

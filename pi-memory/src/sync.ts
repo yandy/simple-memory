@@ -1,3 +1,4 @@
+import { unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,6 +11,7 @@ import {
 	manifestPath,
 	normalizeRemoteUrl,
 	type ProjectIdentity,
+	readManifest,
 	remoteProjectKey,
 	type SyncBackend,
 	type SyncEngine,
@@ -30,7 +32,9 @@ export interface PiSyncRuntime {
 	backend: SyncBackend;
 	syncRoot: string;
 	prepare(timeoutMs: number): Promise<PrepareResult>;
-	/** 已初始化后改 origin；旧基线在新 origin 上没有意义，必须复核 revision 并重建空 files 基线。 */
+	/** 将启动/命令/退出轮次纳入换远端闸门；闸门关闭后拒绝新活动。 */
+	runActivity<T>(activity: () => Promise<T>): Promise<T>;
+	/** 已初始化后改 origin；先持久失效旧基线并排空旧轮次，再复核当前 origin。 */
 	changeRemote(remote: string, timeoutMs: number): Promise<PrepareResult>;
 	dispose(): void;
 }
@@ -189,70 +193,93 @@ export async function createPiSyncRuntime(options: {
 	}
 
 	const projectKey = remoteProjectKey(identity.key);
-	/** init 已成功、后续写 device/manifest 失败时，同一 runtime 重试仍使用那次真实 revision。 */
-	let initialRevision: string | null = null;
-	let initialWarnings: string[] = [];
+	const projectManifest = manifestPath(syncRoot, projectKey);
 	let disposed = false;
 	let initController: AbortController | null = null;
 	let pendingEngine: SyncEngine | null = null;
 	let prepareInFlight: Promise<PrepareResult> | null = null;
-	/** setRemote 成功后、当前 origin 复核与空 files 基线落盘前，任何 pull/push 都不得沿用旧 base。 */
-	let baselineResetRequired = false;
+	let remoteChangeInFlight: Promise<PrepareResult> | null = null;
+	let remoteChangeActive = false;
+	const activities = new Set<Promise<unknown>>();
 	const disposedResult = (): PrepareResult => ({ ok: false, reason: "sync runtime is disposed" });
+	const busyResult = (): Extract<PrepareResult, { ok: false }> => ({
+		ok: false,
+		reason: "sync remote change is already in progress; retry the operation afterwards",
+	});
+
+	async function buildEngine(): Promise<SyncEngine> {
+		const device = await loadOrCreateDevice(syncRoot, now);
+		return createSyncEngine({
+			syncRoot,
+			projectDir,
+			projectKey,
+			store,
+			backend,
+			device,
+			config: sync,
+			now,
+		});
+	}
+
+	/** 失败恢复也必须有新 engine 接住旧 dirty 与空档期写入；manifest 缺失本身仍是安全基线。 */
+	async function ensureRuntimeEngine(): Promise<SyncEngine | null> {
+		if (runtime.engine) return runtime.engine;
+		const engine = await buildEngine();
+		if (disposed) {
+			engine.dispose();
+			return null;
+		}
+		runtime.engine = engine;
+		return engine;
+	}
 
 	async function runPrepare(timeoutMs: number): Promise<PrepareResult> {
 		try {
-			// ready 快路径绝不 init：Task 2 的幂等 init 会联网复核 origin，离线启动不该因此失败。
+			// 有完整 manifest 的 ready 快路径绝不联网；缺失 manifest 则是跨进程持久 pending。
 			const ready = await backend.ready();
 			if (disposed) return disposedResult();
-			if (baselineResetRequired && !ready) {
-				throw new Error("the initialized sync backend disappeared while resetting its baseline; inspect .sync/repo");
+			const manifest = await readManifest(projectManifest);
+			if (disposed) return disposedResult();
+			if (ready && manifest !== null && runtime.engine !== null) {
+				return { ok: true, engine: runtime.engine };
 			}
-			if (baselineResetRequired || !ready) {
-				// 首次 init 内部先做 same-remote 共存拒绝；换远端后的幂等 init 则重新 fetch 当前 origin。
+
+			let initializedResult: SyncInitResult | null = null;
+			if (!ready || manifest === null) {
+				// 首次 init 做共存检查；缺失基线时复核当前 origin，绝不沿用旧 base。
 				const controller = new AbortController();
 				initController = controller;
-				let initializedResult: SyncInitResult;
 				try {
 					initializedResult = await backend.init({ timeoutMs, signal: controller.signal });
 				} finally {
 					if (initController === controller) initController = null;
 				}
 				if (disposed) return disposedResult();
-				initialRevision = initializedResult.revision;
-				initialWarnings = initializedResult.warnings;
 			}
 
-			if (disposed) return disposedResult();
-			const device = await loadOrCreateDevice(syncRoot, now);
-			if (disposed) return disposedResult();
-			const engine = createSyncEngine({
-				syncRoot,
-				projectDir,
-				projectKey,
-				store,
-				backend,
-				device,
-				config: sync,
-				now,
-			});
-			pendingEngine = engine;
+			let engine = runtime.engine;
+			if (engine === null) {
+				if (disposed) return disposedResult();
+				engine = await buildEngine();
+				if (disposed) {
+					engine.dispose();
+					return disposedResult();
+				}
+				pendingEngine = engine;
+			}
 
-			if (initialRevision !== null) {
-				if (disposed) return disposedResult();
+			if (initializedResult !== null) {
 				const baseline = emptyManifest();
-				baseline.base = { revision: initialRevision, syncedAt: now().toISOString() };
-				await writeManifest(manifestPath(syncRoot, projectKey), baseline);
+				baseline.base = { revision: initializedResult.revision, syncedAt: now().toISOString() };
+				await writeManifest(projectManifest, baseline);
 				if (disposed) return disposedResult();
-				initialRevision = null;
-				baselineResetRequired = false;
 			}
 
 			if (disposed) return disposedResult();
 			pendingEngine = null;
 			runtime.engine = engine;
-			const warning = initialWarnings.length > 0 ? initialWarnings.map(errorMessage).join("\n") : undefined;
-			initialWarnings = [];
+			const warnings = initializedResult?.warnings ?? [];
+			const warning = warnings.length > 0 ? warnings.map(errorMessage).join("\n") : undefined;
 			return warning === undefined ? { ok: true, engine } : { ok: true, engine, warning };
 		} catch (error) {
 			pendingEngine?.dispose();
@@ -261,13 +288,45 @@ export async function createPiSyncRuntime(options: {
 		}
 	}
 
+	async function finishRemoteChange(result: PrepareResult): Promise<PrepareResult> {
+		if (disposed) return disposedResult();
+		try {
+			const replacement = await ensureRuntimeEngine();
+			if (disposed || replacement === null) return disposedResult();
+			// 不猜 flush(null) 的含义：旧 dirty/unpublished 与换远端期间的写入统一转成一次触发。
+			replacement.noteWrite();
+		} catch (error) {
+			const recovery = `failed to restore the sync write trigger: ${errorMessage(error)}`;
+			return { ok: false, reason: result.ok ? recovery : `${result.reason}\n${recovery}` };
+		}
+		return result;
+	}
+
 	const runtime: PiSyncRuntime = {
 		engine: null,
 		backend,
 		syncRoot,
+		runActivity<T>(activity: () => Promise<T>): Promise<T> {
+			if (disposed) return Promise.reject(new Error("sync runtime is disposed"));
+			if (remoteChangeActive) return Promise.reject(new Error(busyResult().reason));
+			let flight: Promise<T>;
+			try {
+				// flush/status 的既有入口在调用返回前就开始；登记不能额外引入一个微任务延迟。
+				flight = activity();
+			} catch (error) {
+				flight = Promise.reject(error);
+			}
+			activities.add(flight);
+			void flight
+				.catch(() => undefined)
+				.finally(() => {
+					activities.delete(flight);
+				});
+			return flight;
+		},
 		prepare(timeoutMs: number): Promise<PrepareResult> {
 			if (disposed) return Promise.resolve(disposedResult());
-			if (runtime.engine !== null && !baselineResetRequired) return Promise.resolve({ ok: true, engine: runtime.engine });
+			if (remoteChangeActive) return Promise.resolve(busyResult());
 			if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
 				return Promise.resolve({ ok: false, reason: "sync initialization requires a finite positive timeout budget" });
 			}
@@ -282,27 +341,40 @@ export async function createPiSyncRuntime(options: {
 		},
 		changeRemote(remote: string, timeoutMs: number): Promise<PrepareResult> {
 			if (disposed) return Promise.resolve(disposedResult());
+			if (remoteChangeInFlight !== null) return remoteChangeInFlight;
 			if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
 				return Promise.resolve({ ok: false, reason: "sync initialization requires a finite positive timeout budget" });
 			}
-			if (prepareInFlight !== null) {
-				return Promise.resolve({
-					ok: false,
-					reason: "sync preparation is already in progress; retry the remote change afterwards",
-				});
-			}
 
+			remoteChangeActive = true;
 			const runChange = async (): Promise<PrepareResult> => {
+				let result: PrepareResult;
 				try {
+					// 关闸后拒绝新活动，再排空已登记的 status/pull/push/flush 与直接 prepare。
+					await Promise.allSettled([...activities]);
+					const preparing = prepareInFlight;
+					if (preparing !== null) await preparing;
+					if (disposed) return disposedResult();
 					if (!(await backend.ready())) {
 						return { ok: false, reason: 'sync is not initialized: set "sync.remote" in memory.json instead' };
 					}
 					if (disposed) return disposedResult();
 
-					// 先封住旧 engine 的写触发与在途 I/O，再改 origin；失败后的 prepare 也只能走恢复路径。
 					const previous = runtime.engine;
 					runtime.engine = null;
 					previous?.dispose();
+					// abort/dispose 不是 settled：旧调度轮未结束前绝不能失效 manifest 或改 origin。
+					const previousRound = previous?.inFlight;
+					if (previousRound) await previousRound;
+					if (disposed) return disposedResult();
+
+					// 删除是换 origin 的持久前置条件；失败时保持 origin 不动。
+					try {
+						await unlink(projectManifest);
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					}
+					if (disposed) return disposedResult();
 					const controller = new AbortController();
 					initController = controller;
 					try {
@@ -311,21 +383,21 @@ export async function createPiSyncRuntime(options: {
 						if (initController === controller) initController = null;
 					}
 					if (disposed) return disposedResult();
-					baselineResetRequired = true;
-					initialRevision = null;
-					initialWarnings = [];
-					return await runPrepare(timeoutMs);
+					result = await runPrepare(timeoutMs);
 				} catch (error) {
 					pendingEngine?.dispose();
 					pendingEngine = null;
-					return disposed ? disposedResult() : { ok: false, reason: errorMessage(error) };
+					if (disposed) return disposedResult();
+					result = { ok: false, reason: errorMessage(error) };
 				}
+				return finishRemoteChange(result);
 			};
 			const flight = runChange();
 			const tracked = flight.finally(() => {
-				if (prepareInFlight === tracked) prepareInFlight = null;
+				remoteChangeActive = false;
+				if (remoteChangeInFlight === tracked) remoteChangeInFlight = null;
 			});
-			prepareInFlight = tracked;
+			remoteChangeInFlight = tracked;
 			return tracked;
 		},
 		dispose(): void {
