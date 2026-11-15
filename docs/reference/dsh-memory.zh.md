@@ -23,6 +23,8 @@ extract 与 dream 都靠**子会话**跑（dsh 里唯一能跑工具循环的机
    `<project_instructions path="…">` 抠出这些块塞进 extract prompt；dsh 的 AGENTS.md 由
    `dsh-agent-instructions` 拼成**不透明的 prompt 文本**，没有稳定标记可切。所以 `## AGENTS.md Rules`
    那一段在 dsh 侧是空的 —— 指令本身对主 agent 依然可见，只是不会单独递给 extract。
+6. **没有跨设备同步。** 同步引擎（`.sync/` 暂存 clone、manifest 基线、去抖推送、`/memory sync` 子命令）
+   只接在 `pi-memory` 里；dsh 适配层只读写本地记忆目录。需要多机共享时在 pi 侧开启同步。
 
 除此之外，`dream` / `extractMemories` 两个配置子树与 pi 的 `memory.json` 逐字同名，可以照抄；
 它们的 `model` / `thinkLevel` / 预算值全部由 core 自己消费，本适配层一个都不读（除了 `/memory` 的

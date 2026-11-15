@@ -36,6 +36,12 @@ $XDG_DATA_HOME/simple-memory/<git|local>/<project>/
 `memoryDir` 可以覆盖根目录，但它是**每个 harness 各自的配置** —— 要覆盖就在每个宿主里覆盖成同一个值，
 否则共享会静默失效。
 
+## 跨设备同步
+
+记忆默认只在本机。`pi-memory` 可以把当前项目的记忆推进一个 git 远端（默认关闭），同一仓库在另一台
+机器上打开时落到同一批文件上；dsh 侧还没有接线。见 [pi-memory](./pi-memory) 与
+[参考文档](./docs/reference/pi-memory.zh.md#跨设备同步)。
+
 ## 文档
 
 - 参考：[memory-core](./docs/reference/memory-core.zh.md) · [pi-memory](./docs/reference/pi-memory.zh.md) · [dsh-memory](./docs/reference/dsh-memory.zh.md)

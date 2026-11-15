@@ -60,6 +60,7 @@ value here.
 - The extract prompt has no AGENTS.md block (dsh assembles it as opaque text with no stable marker).
 - The index is not frozen: dsh reassembles the system prompt every step, so the index is an
   asynchronously refreshed snapshot.
+- No cross-device sync: the sync engine is wired up in pi only; dsh uses local memory.
 
 ## Requirements
 

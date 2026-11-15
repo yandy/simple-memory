@@ -28,6 +28,9 @@ loop), which creates a few structural differences. They are listed here rather t
    `dsh-agent-instructions` into **opaque prompt text** with no stable marker, so the
    `## AGENTS.md Rules` section is empty on this side — the instructions are still visible to the main
    agent, they just are not handed to extract separately.
+6. **No cross-device sync.** The sync engine (`.sync/` staging clone, manifest baselines, debounced
+   pushes, the `/memory sync` subcommands) is wired up in `pi-memory` only; the dsh adapter reads and
+   writes the local memory directory. Enable sync on the pi side if you need to share across machines.
 
 The `dream` / `extractMemories` config subtrees are named exactly as in pi's `memory.json`, so they can
 be copied over; their `model` / `thinkLevel` / budget values are consumed by core, not by this adapter

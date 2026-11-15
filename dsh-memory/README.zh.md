@@ -56,6 +56,7 @@ dsh plugin --profile web add file:/abs/path/to/dsh-memory
 - 没有「该整理了」的 nudge，只有你显式 `/dream`。
 - extract 的 prompt 里没有 AGENTS.md 块（dsh 那边是不透明文本，切不出来）。
 - 索引不冻结：dsh 每一步都重新装配 system prompt，索引是一份异步刷新的快照。
+- 没有跨设备同步：同步引擎只接在 pi 侧，dsh 只用本地记忆。
 
 ## 要求
 

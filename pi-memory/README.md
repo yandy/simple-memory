@@ -42,8 +42,29 @@ initialise nothing.
   remembering and writes it through the same tool.
 - **`/dream`** — a headless tidy-up: merge duplicates, resolve contradictions, rebuild the index.
 - **Cross-device sync** (off by default) — push this project's memory to a git remote and share it with
-  another machine working on the same repository.
+  another machine working on the same repository (see below).
 - Runs natively on Windows; no WSL needed.
+
+## Cross-device sync (optional, off by default)
+
+Push **this project's** memory entries to a git remote so another machine working on the same
+repository shares them:
+
+```json
+// ~/.pi/agent/memory.json
+{ "sync": { "enabled": true, "remote": "git@github.com:you/project-memory.git" } }
+```
+
+- **There is no init command**: the next session start with this config clones into
+  `<memoryDir>/.sync/repo` and records a baseline.
+- Prepare the remote yourself (an empty repository is fine) and make sure `git` can clone/push it
+  non-interactively — pi-memory stores no credentials.
+- Only entry `*.md` files sync: `MEMORY.md`, `.lock`, `.backups/` and `sessions/` stay local.
+- If both sides rewrite the same memory, **both are kept**: the other becomes a deterministic conflict
+  copy that `/dream` merges later.
+- Manual convergence: `/memory sync pull` / `push` / `status` (strict dry-run) / `remote <url>`.
+
+Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.md#cross-device-sync).
 
 ## Commands
 

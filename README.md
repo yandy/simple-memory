@@ -37,6 +37,12 @@ lands in `git/<host__owner__repo>` (clones and worktrees share it); anything els
 `memoryDir` overrides the root, but it is **per-harness configuration** — if you override it, override it
 in every harness, or sharing silently stops working.
 
+## Cross-device sync
+
+Memory is local by default. `pi-memory` can push this project's memory to a git remote (off by default),
+so another machine working on the same repository lands on the same files; dsh does not wire sync up yet.
+See [pi-memory](./pi-memory) and the [reference](./docs/reference/pi-memory.md#cross-device-sync).
+
 ## Docs
 
 - Reference: [memory-core](./docs/reference/memory-core.md) · [pi-memory](./docs/reference/pi-memory.md) · [dsh-memory](./docs/reference/dsh-memory.md)

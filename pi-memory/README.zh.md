@@ -37,8 +37,25 @@ pi install npm:@yandy0725/pi-memory
 - **自动浮现** —— 每轮用一次轻量侧查询挑出相关记忆，把正文注入 `<relevant_memories>`。
 - **自动提取**（默认关闭）—— 每轮结束后由子会话挑出值得长期记住的内容写进记忆。
 - **`/dream`** —— headless 整理：合并重复、消解矛盾、重建索引。
-- **跨设备同步**（默认关闭）—— 把当前项目的记忆推进一个 git 远端，另一台机器打开同一仓库时共用。
+- **跨设备同步**（默认关闭）—— 把当前项目的记忆推进一个 git 远端，另一台机器打开同一仓库时共用（见下）。
 - Windows 原生可用，不需要 WSL。
+
+## 跨设备同步（可选，默认关闭）
+
+把**当前项目**的记忆 entry 推进一个 git 远端，同一仓库在另一台机器上打开时共用一份：
+
+```json
+// ~/.pi/agent/memory.json
+{ "sync": { "enabled": true, "remote": "git@github.com:you/project-memory.git" } }
+```
+
+- **没有 init 命令**：带上这份配置的下一次会话启动会自动 clone 到 `<memoryDir>/.sync/repo` 并建立基线。
+- 远端由你自己准备（空仓库可以），`git` 必须能非交互地 clone / push —— pi-memory 不保存任何凭据。
+- 只同步 entry `*.md`：`MEMORY.md`、`.lock`、`.backups/`、`sessions/` 都留在本机。
+- 两侧并发改写同一条记忆时**两份都保留**，另一份变成确定性的冲突副本，之后由 `/dream` 合并。
+- 手动收敛：`/memory sync pull` / `push` / `status`（严格 dry-run）/ `remote <url>`。
+
+完整语义见[跨设备同步](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.zh.md#跨设备同步可选默认关闭)。
 
 ## 常用命令
 
