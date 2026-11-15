@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createFakePi,
 	DISK_INDEX,
+	flush,
 	gitIdentity,
 	projectIdentityMock,
 	readRecordedMemoryIndexMock,
@@ -30,6 +31,8 @@ import {
 	sectionsEvent,
 	setupSession,
 	syncEvents,
+	syncInitBarrier,
+	syncInitSignals,
 	syncPushBarrier,
 	uiWith,
 	waitFor,
@@ -183,6 +186,128 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(again).toEqual({ ok: true, engine: runtime.engine });
 		expect(syncEvents).toEqual([]);
 		runtime.engine?.dispose();
+	});
+
+	it("shares one backend init between concurrent prepare calls and returns the same engine", async () => {
+		const config = memoryConfig();
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		const { runtime, errors } = await createPiSyncRuntime({
+			config,
+			store,
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		expect(errors).toEqual([]);
+		if (!runtime) throw new Error("runtime was not created");
+		let release!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
+			release = resolveBarrier;
+		});
+
+		const first = runtime.prepare(10_000);
+		const second = runtime.prepare(10_000);
+		await waitFor(() => syncEvents.includes("init:start"), "first prepare to reach init");
+		// 旧实现的第二个调用也已越过 ready；屏障保证它看到的仍是未初始化状态。
+		await flush();
+		release();
+		const [left, right] = await Promise.all([first, second]);
+
+		expect(syncEvents.filter((entry) => entry === "init:start")).toHaveLength(1);
+		if (!left.ok) throw new Error(`first prepare failed: ${left.reason}`);
+		if (!right.ok) throw new Error(`second prepare failed: ${right.reason}`);
+		expect(left.engine).toBe(right.engine);
+		expect(left.engine).toBe(runtime.engine);
+		runtime.engine?.dispose();
+	});
+
+	it("aborts a disposed runtime during init without later device creation or startup push", async () => {
+		await enableSync({ pullOnStart: true });
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		let release!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
+			release = resolveBarrier;
+		});
+
+		const staleStarting = handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		await waitFor(() => syncEvents.includes("init:start"), "stale session to reach init");
+		await enableSync({ enabled: false, pullOnStart: false });
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		const initSignalAborted = syncInitSignals[0]?.aborted;
+		release();
+		await staleStarting;
+
+		expect(await exists(devicePath(syncPaths().syncRoot))).toBe(false);
+		expect(syncEvents).not.toContain("push:start");
+		expect(initSignalAborted).toBe(true);
+	});
+
+	it("keeps a newer session healthy when a superseded init fails and resumes later", async () => {
+		const staleRemote = join(s.cwd, "stale-missing", "remote.git");
+		await enableSync({ remote: staleRemote, pullOnStart: true });
+		const oldNotify = vi.fn();
+		const oldSessionManager = { getEntries: () => [], getLeafId: () => null };
+		const newSessionManager = { getEntries: () => [], getLeafId: () => null };
+		const oldIndex = "- [Old](old.md) — stale session index\n";
+		const newIndex = "- [New](new.md) — current session index\n";
+		readRecordedMemoryIndexMock.mockImplementation((manager: unknown) =>
+			manager === oldSessionManager ? oldIndex : newIndex,
+		);
+		const { pi, tools, commands, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		let release!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
+			release = resolveBarrier;
+		});
+
+		const staleStarting = handlers["session_start"][0](
+			{ reason: "resume" },
+			s.uiCtx({ sessionManager: oldSessionManager, ...uiWith(oldNotify) }),
+		);
+		await waitFor(() => syncEvents.includes("init:start"), "stale session to reach init");
+
+		// 新会话使用另一棵记忆根与可达 remote；旧 init 仍被它自己已经捕获的屏障挡住。
+		syncInitBarrier.current = null;
+		const nextCwd = join(s.cwd, "next-project");
+		const nextMemoryRoot = join(s.cwd, "next-memory");
+		await mkdir(nextCwd, { recursive: true });
+		await enableSync({ pullOnStart: true });
+		await s.writeConfig({ memoryDir: nextMemoryRoot });
+		const newCtx = s.uiCtx({ cwd: nextCwd, sessionManager: newSessionManager });
+		await handlers["session_start"][0]({ reason: "resume" }, newCtx);
+		release();
+		await staleStarting;
+
+		expect(oldNotify).not.toHaveBeenCalled();
+		expect(syncEvents.filter((entry) => entry === "push:start")).toHaveLength(1);
+		const event = sectionsEvent();
+		await handlers["before_agent_start"][0](event, newCtx);
+		expect(event.systemPromptOptions.sections["memory_index"]).toBe(newIndex);
+
+		await tools[0].execute(
+			"current-session-add",
+			{ action: "add", name: "Current note", description: "current store", content: "body" },
+			undefined,
+			undefined,
+			undefined,
+		);
+		expect(await exists(join(nextMemoryRoot, "next-project", "Current-note.md"))).toBe(true);
+		expect(await exists(join(s.dir, "Current-note.md"))).toBe(false);
+
+		const statusNotify = vi.fn();
+		await commands["memory"].handler("", s.uiCtx({ cwd: nextCwd, ...uiWith(statusNotify) }));
+		expect(statusNotify.mock.calls[0][0]).toContain(join(nextMemoryRoot, "next-project"));
+		expect(statusNotify.mock.calls[0][0]).not.toContain("stale-missing");
+
+		const pullNotify = vi.fn();
+		await commands["memory"].handler("sync pull", s.uiCtx({ cwd: nextCwd, ...uiWith(pullNotify) }));
+		expect(pullNotify.mock.calls.at(-1)?.[0]).toContain("Memory sync pull:");
+		expect(pullNotify.mock.calls.at(-1)?.[0]).not.toContain("failed");
 	});
 
 	it("session_start automatically initializes a real bare remote without registering sync init", async () => {

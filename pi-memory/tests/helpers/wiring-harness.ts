@@ -34,8 +34,10 @@ const mocks = vi.hoisted(() => ({
 	projectIdentityMock: vi.fn(),
 	/** 真 backend/engine 的观察带：只记顺序，调用仍委托 core 的真实现。 */
 	syncEvents: [] as string[],
-	/** dispose 竞争测试只延迟真实 push 的起点，不替换其结果或行为。 */
+	/** dispose 竞争测试只延迟真实 push/init 的起点，不替换其结果或行为。 */
 	syncPushBarrier: { current: null as Promise<void> | null },
+	syncInitBarrier: { current: null as Promise<void> | null },
+	syncInitSignals: [] as Array<AbortSignal | undefined>,
 	readDreamMetaMock: vi.fn(),
 	writeDreamMetaMock: vi.fn().mockResolvedValue(undefined),
 	detectLegacyMemoryDirMock: vi.fn().mockResolvedValue(null),
@@ -86,7 +88,9 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 				...backend,
 				init: async (opts: Parameters<typeof backend.init>[0]) => {
 					mocks.syncEvents.push("init:start");
+					mocks.syncInitSignals.push(opts.signal);
 					try {
+						if (mocks.syncInitBarrier.current) await mocks.syncInitBarrier.current;
 						return await backend.init(opts);
 					} finally {
 						mocks.syncEvents.push("init:end");
@@ -178,6 +182,8 @@ export const resolveMemoryDirMock = mocks.resolveMemoryDirMock;
 export const projectIdentityMock = mocks.projectIdentityMock;
 export const syncEvents = mocks.syncEvents;
 export const syncPushBarrier = mocks.syncPushBarrier;
+export const syncInitBarrier = mocks.syncInitBarrier;
+export const syncInitSignals = mocks.syncInitSignals;
 export const scanEntriesMock = mocks.scanEntriesMock;
 export const runTaskMock = mocks.runTaskMock;
 export const shouldNudgeMock = mocks.shouldNudgeMock;
@@ -224,6 +230,8 @@ export function resetWiringMocks(): void {
 	}));
 	syncEvents.length = 0;
 	syncPushBarrier.current = null;
+	syncInitBarrier.current = null;
+	syncInitSignals.length = 0;
 	scanEntriesMock.mockReset();
 	runTaskMock.mockReset();
 	runTaskMock.mockImplementation((task: { id?: string }, _input: unknown, ctx?: { cfg?: MemoryConfig }) => {

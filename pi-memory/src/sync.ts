@@ -13,6 +13,7 @@ import {
 	remoteProjectKey,
 	type SyncBackend,
 	type SyncEngine,
+	type SyncInitResult,
 	syncConfigErrors,
 	syncRootPath,
 	writeManifest,
@@ -27,6 +28,7 @@ export interface PiSyncRuntime {
 	backend: SyncBackend;
 	syncRoot: string;
 	prepare(timeoutMs: number): Promise<PrepareResult>;
+	dispose(): void;
 }
 
 /** 与 git backend 相同的本地/URL 比较口径；适配层只用它判断要不要提醒配置漂移。 */
@@ -110,53 +112,100 @@ export async function createPiSyncRuntime(options: {
 	/** init 已成功、后续写 device/manifest 失败时，同一 runtime 重试仍使用那次真实 revision。 */
 	let initialRevision: string | null = null;
 	let initialWarnings: string[] = [];
+	let disposed = false;
+	let initController: AbortController | null = null;
+	let pendingEngine: SyncEngine | null = null;
+	let prepareInFlight: Promise<PrepareResult> | null = null;
+	const disposedResult = (): PrepareResult => ({ ok: false, reason: "sync runtime is disposed" });
+
+	async function runPrepare(timeoutMs: number): Promise<PrepareResult> {
+		try {
+			// ready 快路径绝不 init：Task 2 的幂等 init 会联网复核 origin，离线启动不该因此失败。
+			const ready = await backend.ready();
+			if (disposed) return disposedResult();
+			if (!ready) {
+				// init 内部先做 same-remote 共存拒绝，任何 clone/device 写入都排在它之后。
+				const controller = new AbortController();
+				initController = controller;
+				let initializedResult: SyncInitResult;
+				try {
+					initializedResult = await backend.init({ timeoutMs, signal: controller.signal });
+				} finally {
+					if (initController === controller) initController = null;
+				}
+				if (disposed) return disposedResult();
+				initialRevision = initializedResult.revision;
+				initialWarnings = initializedResult.warnings;
+			}
+
+			if (disposed) return disposedResult();
+			const device = await loadOrCreateDevice(syncRoot, now);
+			if (disposed) return disposedResult();
+			const engine = createSyncEngine({
+				syncRoot,
+				projectDir,
+				projectKey,
+				store,
+				backend,
+				device,
+				config: sync,
+				now,
+			});
+			pendingEngine = engine;
+
+			if (initialRevision !== null) {
+				if (disposed) return disposedResult();
+				const baseline = emptyManifest();
+				baseline.base = { revision: initialRevision, syncedAt: now().toISOString() };
+				await writeManifest(manifestPath(syncRoot, projectKey), baseline);
+				if (disposed) return disposedResult();
+				initialRevision = null;
+			}
+
+			if (disposed) return disposedResult();
+			pendingEngine = null;
+			runtime.engine = engine;
+			const warning = initialWarnings.length > 0 ? initialWarnings.map(errorMessage).join("\n") : undefined;
+			initialWarnings = [];
+			return warning === undefined ? { ok: true, engine } : { ok: true, engine, warning };
+		} catch (error) {
+			pendingEngine?.dispose();
+			pendingEngine = null;
+			return disposed ? disposedResult() : { ok: false, reason: errorMessage(error) };
+		}
+	}
 
 	const runtime: PiSyncRuntime = {
 		engine: null,
 		backend,
 		syncRoot,
-		async prepare(timeoutMs: number): Promise<PrepareResult> {
-			if (runtime.engine !== null) return { ok: true, engine: runtime.engine };
+		prepare(timeoutMs: number): Promise<PrepareResult> {
+			if (disposed) return Promise.resolve(disposedResult());
+			if (runtime.engine !== null) return Promise.resolve({ ok: true, engine: runtime.engine });
 			if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-				return { ok: false, reason: "sync initialization requires a finite positive timeout budget" };
+				return Promise.resolve({ ok: false, reason: "sync initialization requires a finite positive timeout budget" });
 			}
+			if (prepareInFlight !== null) return prepareInFlight;
 
-			let nextEngine: SyncEngine | null = null;
+			const flight = runPrepare(timeoutMs);
+			const tracked = flight.finally(() => {
+				if (prepareInFlight === tracked) prepareInFlight = null;
+			});
+			prepareInFlight = tracked;
+			return tracked;
+		},
+		dispose(): void {
+			disposed = true;
+			initController?.abort();
+			initController = null;
+			const engine = runtime.engine;
+			const pending = pendingEngine;
+			runtime.engine = null;
+			pendingEngine = null;
 			try {
-				// ready 快路径绝不 init：Task 2 的幂等 init 会联网复核 origin，离线启动不该因此失败。
-				if (!(await backend.ready())) {
-					// init 内部先做 same-remote 共存拒绝，任何 clone/device 写入都排在它之后。
-					const initializedResult = await backend.init({ timeoutMs });
-					initialRevision = initializedResult.revision;
-					initialWarnings = initializedResult.warnings;
-				}
-
-				const device = await loadOrCreateDevice(syncRoot, now);
-				nextEngine = createSyncEngine({
-					syncRoot,
-					projectDir,
-					projectKey,
-					store,
-					backend,
-					device,
-					config: sync,
-					now,
-				});
-
-				if (initialRevision !== null) {
-					const baseline = emptyManifest();
-					baseline.base = { revision: initialRevision, syncedAt: now().toISOString() };
-					await writeManifest(manifestPath(syncRoot, projectKey), baseline);
-					initialRevision = null;
-				}
-
-				runtime.engine = nextEngine;
-				const warning = initialWarnings.length > 0 ? initialWarnings.map(errorMessage).join("\n") : undefined;
-				initialWarnings = [];
-				return warning === undefined ? { ok: true, engine: nextEngine } : { ok: true, engine: nextEngine, warning };
-			} catch (error) {
-				nextEngine?.dispose();
-				return { ok: false, reason: errorMessage(error) };
+				engine?.dispose();
+			} finally {
+				pending?.dispose();
 			}
 		},
 	};
