@@ -5,7 +5,7 @@
  */
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, flush, resetWiringMocks, runTaskMock, setupSession, uiCtx, uiWith } from "./helpers/wiring-harness";
+import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, enableTestSync, flush, resetWiringMocks, runTaskMock, setupSession, syncEngines, uiCtx, uiWith } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { MAIN_AGENT_ACTIONS, TASKS } from "@yandy0725/memory-core";
 
@@ -19,6 +19,7 @@ describe("index wiring — agent_end / extract", () => {
 	});
 
 	afterEach(async () => {
+		for (const engine of syncEngines) engine.dispose();
 		await s.cleanup();
 	});
 
@@ -379,5 +380,56 @@ describe("index wiring — agent_end / extract", () => {
 		expect(typeof extractCall?.[1]?.onWrite).toBe("function");
 		// extract 没有整轮快照，所以**不得**带 skipSnapshot：每次写入都要留下自己的回滚点
 		expect(extractCall?.[1]?.skipSnapshot).toBeFalsy();
+	});
+
+	it("extract writes keep their counter notification and notify sync after the original callback", async () => {
+		await enableTestSync(s);
+		await s.writeConfig({ extractMemories: { enabled: true } });
+		let resolveExtract: ((value: { skipped: boolean; result: string }) => void) | undefined;
+		runTaskMock.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					resolveExtract = resolve;
+				}),
+		);
+		const notify = vi.fn();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+		const engine = syncEngines.at(-1);
+		if (!engine) throw new Error("sync engine was not prepared");
+		const noteWrite = vi.spyOn(engine, "noteWrite");
+		createMemoryToolSpy.mockClear();
+
+		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hi" }] }, s.uiCtx(uiWith(notify)));
+		const input = runTaskMock.mock.calls[0][1];
+		const originalOnWrite = vi.fn(input.onWrite);
+		const ports = runTaskMock.mock.calls[0][2].ports;
+		await expect(
+			ports.headless.run({
+				task: "t",
+				cwd: s.dir,
+				model: "nope/not-resolvable",
+				builtinTools: "none",
+				memoryTool: { actions: MAIN_AGENT_ACTIONS, skipLogicalLock: true, onWrite: originalOnWrite },
+			}),
+		).rejects.toThrow(/not resolvable/);
+		const callIndex = createMemoryToolSpy.mock.calls.findIndex((c: any[]) => c[1]?.skipLogicalLock === true);
+		const extractTool = createMemoryToolSpy.mock.results[callIndex].value;
+
+		await extractTool.execute(
+			"extract-add",
+			{ action: "add", name: "A", description: "d", content: "body" },
+			undefined,
+			undefined,
+		);
+		resolveExtract?.({ skipped: false, result: "ok" });
+		await flush();
+
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify).toHaveBeenCalledWith("Extracted 1 memory.", "info");
+		expect(originalOnWrite).toHaveBeenCalledWith({ action: "add", name: "A" });
+		expect(noteWrite).toHaveBeenCalledTimes(1);
+		expect(originalOnWrite.mock.invocationCallOrder[0]).toBeLessThan(noteWrite.mock.invocationCallOrder[0]);
 	});
 });

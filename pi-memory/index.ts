@@ -1,6 +1,11 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionUIContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
 	buildIndexSection,
@@ -15,6 +20,7 @@ import {
 	readLockStatus,
 	resolveMemoryDir,
 	runTask,
+	type SyncRoundResult,
 	scanEntries,
 	TASKS,
 	withFsRetry,
@@ -25,7 +31,7 @@ import { createPiTranscript } from "./src/host-transcript";
 import { readRecordedMemoryIndex } from "./src/index-source";
 import { applyIndexSection, buildInjection } from "./src/inject-pi";
 import { detectLegacyMemoryDir } from "./src/legacy-hint";
-import { createMemoryTool, type MemoryToolDeps } from "./src/memory-tool";
+import { createMemoryTool, type MemoryToolDeps, type MemoryToolOptions } from "./src/memory-tool";
 import { resolveModel } from "./src/model-resolver";
 import { readDreamMeta, shouldNudge, writeDreamMeta } from "./src/nudge";
 import { searchSessions } from "./src/session-search";
@@ -180,13 +186,14 @@ export default function (pi: ExtensionAPI) {
 	const inFlight = new Set<Promise<unknown>>();
 
 	/** 每次 session_start 先收掉旧 runtime；init 阶段 engine 仍为空，也必须 abort。 */
-	function disposeSyncRuntime(): void {
+	function disposeSyncRuntime(target: PiSyncRuntime | null = syncRuntime): void {
 		try {
-			syncRuntime?.dispose();
+			target?.dispose();
 		} catch {
 			/* 同步收摊不得影响新会话 */
 		} finally {
-			syncRuntime = null;
+			// shutdown 可能跨过一个新 session_start：只能清掉自己快照的那一代 runtime。
+			if (syncRuntime === target) syncRuntime = null;
 		}
 	}
 
@@ -231,6 +238,22 @@ export default function (pi: ExtensionAPI) {
 		return promise;
 	}
 
+	/** 同一个 lock.timeoutMs 有界等待；空闲时连兜底定时器都不创建。 */
+	async function waitForShutdownInFlight(timeoutMs: number): Promise<void> {
+		if (inFlight.size === 0) return;
+		// `Promise.race` 胜出后兜底定时器仍然挂在事件循环上：显式 clear + unref。
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const giveUp = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, timeoutMs);
+			timer.unref?.();
+		});
+		try {
+			await Promise.race([Promise.allSettled([...inFlight]), giveUp]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
 	/**
 	 * 主 agent、extract、dream 共用同一份依赖，三者只差 `actions` 与锁/快照选项（D12）。
 	 * 用 getter 而不是快照值：config / memoryDir / store 都在 session_start 里才确定。
@@ -251,10 +274,21 @@ export default function (pi: ExtensionAPI) {
 	 * `headless` 每次现造：`ctx.modelRegistry` 来自事件上下文，不在工厂作用域里。
 	 */
 	const piTranscript = createPiTranscript();
+	/** 主工具与所有 headless 工具共用：保留原回调语义，再通知当前这一代的 engine。 */
+	function buildMemoryTool(spec: MemoryToolOptions = {}): ToolDefinition {
+		return createMemoryTool(toolDeps, {
+			...spec,
+			onWrite: (info) => {
+				spec.onWrite?.(info);
+				syncRuntime?.engine?.noteWrite();
+			},
+		});
+	}
+
 	const headlessFor = (modelRegistry: ExtensionContext["modelRegistry"]) =>
 		createPiHeadlessAgent({
 			modelRegistry,
-			buildMemoryTool: (spec) => createMemoryTool(toolDeps, spec),
+			buildMemoryTool,
 		});
 
 	/**
@@ -350,7 +384,7 @@ export default function (pi: ExtensionAPI) {
 		if (!toolRegistered) {
 			pi.registerTool(
 				// biome-ignore lint/suspicious/noExplicitAny: pi registerTool type cast
-				createMemoryTool(toolDeps) as any,
+				buildMemoryTool() as any,
 			);
 			toolRegistered = true;
 		}
@@ -522,21 +556,69 @@ export default function (pi: ExtensionAPI) {
 		indexSnapshot = await buildIndexSection(activeStore, config.memIndexInjectMaxLines, config.memIndexInjectMaxBytes);
 	});
 
-	// spec §10：退出前等在途写操作收尾（上限 lock.timeoutMs），避免留下 stale 锁。
-	pi.on("session_shutdown", async () => {
-		if (inFlight.size === 0) return;
-		// `Promise.race` 胜出后兜底定时器仍然挂在事件循环上（最长 lock.timeoutMs）：宿主从
-		// main() 返回后靠事件循环自然 drain 退出，漏一个定时器就把退出拖满超时。显式 clear +
-		// unref —— 这条路径必须不留下任何定时器。
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const giveUp = new Promise<void>((resolve) => {
-			timer = setTimeout(resolve, config?.lock.timeoutMs ?? 5000);
-			timer.unref?.();
-		});
+	// spec §10：所有 reason 共用同一条退出兜底；不按 quit/new/resume/fork/reload 分支。
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// 同步段快照：后续 await 之后绝不回读可能已 dispose 的 ExtensionContext。
+		const runtime = syncRuntime;
+		const engine = runtime?.engine ?? null;
+		const cfg = config;
+		const timeoutMs = cfg?.lock.timeoutMs ?? 5000;
+		let ui: ExtensionUIContext | undefined;
 		try {
-			await Promise.race([Promise.allSettled([...inFlight]), giveUp]);
-		} finally {
-			if (timer !== undefined) clearTimeout(timer);
+			ui = ctx.hasUI ? ctx.ui : undefined;
+		} catch {
+			/* session 已经 dispose：只走无 UI 收尾 */
+		}
+
+		// 先登记已有的同步轮，再启动 flush；两者都进入既有账本，并共享 lock.timeoutMs 上限。
+		const existing = engine?.inFlight;
+		if (existing) track(existing);
+		const hadWorkBeforeFlush = inFlight.size > 0;
+		let flushPromise: Promise<SyncRoundResult | null> | null = null;
+		let flushSettled = false;
+		let flushWarningShown = false;
+		const warnFlush = (reason: string): void => {
+			if (flushWarningShown) return;
+			flushWarningShown = true;
+			notifySync(ui, `Memory sync flush failed: ${reason}; local changes will be retried at the next session start.`);
+		};
+		if (engine && cfg) {
+			try {
+				flushPromise = engine.flush(cfg.sync.autoTimeoutMs);
+			} catch (error) {
+				flushPromise = Promise.reject(error);
+			}
+			const activeFlush = flushPromise;
+			track(activeFlush);
+			// null 只表示没有可回报的结果；只有明确的 ok:false / rejection 才进入失败通知。
+			void activeFlush.then(
+				(result) => {
+					flushSettled = true;
+					if (result !== null && !result.ok) warnFlush(result.skipped?.reason ?? "unknown sync flush failure");
+				},
+				(error: unknown) => {
+					flushSettled = true;
+					warnFlush(error instanceof Error ? error.message : String(error));
+				},
+			);
+		}
+
+		if (hadWorkBeforeFlush) {
+			await waitForShutdownInFlight(timeoutMs);
+		} else if (flushPromise) {
+			// 干净 engine 的 flush 已 resolve：让 track 的清理链先跑完，不为空转创建一个 give-up timer。
+			await Promise.resolve();
+			await Promise.resolve();
+			await waitForShutdownInFlight(timeoutMs);
+		}
+		if (flushPromise && !flushSettled) warnFlush("shutdown timed out while waiting for memory sync");
+
+		// 中止超时残留；绝不能 dispose 新 session 的 runtime，也不能在 dispose 后再调用 flush。
+		disposeSyncRuntime(runtime);
+		const leftover = engine?.inFlight;
+		if (leftover) {
+			track(leftover);
+			await waitForShutdownInFlight(timeoutMs);
 		}
 	});
 
