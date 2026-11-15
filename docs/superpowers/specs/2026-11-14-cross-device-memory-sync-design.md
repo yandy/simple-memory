@@ -673,7 +673,87 @@ core 合并 → core 发布 → 适配层合并 → 在同一条合并提交的 
 `npm version` 会用 2 空格缩进重写 `package.json`，发布后不要手改，直接
 `npx biome format --write <包>/package.json` 再提交。
 
-## 11. 规模
+## 11. 第一刀（memory-core）交付后的遗留清单
+
+第一刀已实现并通过最终整分支审阅（`memory-core` 705 passed + 5 skipped、dsh 282、pi 228，
+typecheck / lint / format / build / 三道 `check:*` 全绿，`package-lock.json` 零变化，未发布）。
+审阅判定 **With fixes → 修复波已做完一轮**（R57–R62 六条全部落地并经 scoped re-review 确认），
+re-review 又报出 1 条 Important + 6 条 Minor 的残留。按流程**不开第二轮修复波**，逐条裁定如下，
+并把载重项显式交给后续三刀 —— 这份清单是那些裁定的**入库**记录（执行台账在 git-ignored 的
+`.superpowers/sdd/` 下，会随工作区消失，所以载重项必须落在这里）。
+
+### 必须先修，再开始第二刀（载重：适配层接线时会读到/用到）
+
+1. **`src/sync/paths.ts` 的 `syncRootPath` 文档里有一句假话**（re-review 的 Important）：它说
+   `.sync` "会被算进项目目录的内容里（备份排除清单、`snapshotFiles` 扫的就是这一层）"。两处都不成立 ——
+   仓库里没有任何"备份排除清单"（同一文件 18 行之上的 `SYNC_DIR_NAME` 文档已经改成实话，两处现在互相矛盾），
+   而 `.sync` 以点开头，`#entryFiles` / `scanLocalEntries` / `snapshotFiles` **全都看不见它**。
+   这句恰好把因果讲反了：传错目录的后果是**静默**的（没有任何测试会红），而不是"会被扫描器抓到"。
+   这是本分支上第 7 例"注释与代码不符"，而它落在第二/三刀决定"该把哪个目录传给 `syncRootPath`"时
+   唯一会读的那段公开文档上。改成实话：传错的后果是 `.sync` 落进项目目录 → 每项目一份暂存 clone、
+   根锁退化成每项目一把，且**没有任何测试会红**。
+2. **`SyncScheduler.flush` 的接口文档少一种情形**：它写"返回 `null` 的三种情形"并承诺"会等那一轮收尾"，
+   而修复波新增的 `if (disposed) return null` 是第四种情形、且**不等** `inFlight`。接线方（pi 的退出兜底）
+   正是照这段文档决定要不要 `await inFlight` 的。
+3. **`SyncRunOptions.timeoutMs` 的字段文档口径过时**：仍写"单次远端往返的上限"，而修复波把语义改成了
+   "本次调用的**总预算**，调用内多次往返共享"（一次 `fetch` 是 fetch + ls-remote + ls-tree + cat-file
+   四五个往返）。字段文档是未来的独立包 backend 实现者最先读的东西。
+
+### 归第二/三刀（适配层接线）
+
+- **端口的自省面（M6）**：设计 §6.12 把 origin 定为 `remote` 的真相来源、§6.11 要求"配置与 origin
+  不一致 → `status` 报一行"、§6.10 要求 `/memory sync remote <url>`，但端口目前既不能读 origin 也不能改
+  origin，`init()` 也不交出引导后的 revision（于是 §6.12 第 6 步要适配层用 `init()` → `fetch()` →
+  `writeManifest` 三个公开符号拼）。**裁定：留到第二刀加**，因为 core 还没带着 sync 发布过，
+  加成员不是破坏性变更。
+- **根 `sync.lock` 的清除入口（M10）**：`tryWithLock` 对遗弃锁是**抛错**而不是返回 null（刻意设计），
+  所以一次崩溃会让此后每一轮同步都失败，文案是"delete the file to clear it"；而既有 unlock 入口针对
+  `<memoryDir>/.lock`，够不到 `<syncRoot>/sync.lock`。第二/三刀**必须**把 unlock 扩到这个文件
+  （或提供 `sync unlock`），否则"一次崩溃 → 永久不同步 + 用户得手工 rm 一个隐藏目录里的文件"。
+- **`init()` 由适配层直接调、不经引擎的 `positiveMs` 兜底**，所以 `timeoutMs` 为 `NaN` 会直接透传给
+  `execFile`（与修复波之前同级，不是回退）。接线时把配置校验过的值传进去。
+- **`pull()` / `push()` 在 `dispose()` 之后仍会跑一整轮**（引擎层没有 disposed 守卫，`flush` 有）——
+  这个不对称接线时顺手统一。
+- 渲染契约（见 §6.11 与执行台账的 R45/R49/R52）：失败轮也要摊开 `pulled`/`conflicts`/`rejected`、
+  按文件去重、`flush() === null` **不是**成功判据（只有 `ok` 是）、退出前必须 `await engine.inFlight`。
+- windows CI 腿上有 10 条 skip（chmod / 符号链接），意味着"目录读不了要上抛"与"符号链接 stat 的 errno
+  分流"这两条数据安全线在 windows 上从未执行过。接线期间补 `vi.mock` 版本（样板：`tests/sync-scan.test.ts`
+  的委托缝）。
+- `pullOnStart` 在 core 里**没有消费者**（引擎只在被调用时干活），接线时必须照 `=== true` 判定。
+
+### 归第四刀（文档）
+
+- 本文件 §6.6 仍写 `isEntryFileName`，修复波已把它按方向拆成 `isEntryFileNameForRead(name, platform)`
+  与 `isEntryFileNameForWrite(name)`（网络进来的名字一律走写方向）。§6.5 的端口形状也要跟上
+  （`RemoteView.outOfScope` 的判据是"异常"而不是"不在本 scope 内"、`SyncRunOptions.signal` 现在真的被接线、
+  `timeoutMs` 是一轮的总预算）。
+- 把实测性能数量级写进 `docs/guides/architecture.md`：300 条 CJK 记忆下 `init` 39ms、首次 push 183ms、
+  **空转 pull 72–77ms**、`status` 78ms。它是 O(远端总字节) 而非 O(变更量) —— 把"上万条时该换成 oid 缓存"
+  这个触发条件写明，免得将来有人当它是 O(变更) 去优化别处。
+
+### 已裁定为"不修"（附理由，免得下一个人再提第三次）
+
+- **不抽 `writeJsonAtomic`**：`manifest.ts` 要的是原子替换，`device.ts` 要的是排他创建 + 发布后读回 +
+  无硬链接时退回覆盖 —— 两套语义，抽出来必然带 flag，而 flag 会掩盖排他性边界的论证。真正重复的只有
+  `tempPath` 那 3 行。（这个决定已写进两个文件的注释。）
+- **`modified` 用字典序而非时间序比较**：混合时区偏移时时间上更旧的一侧可能胜出，但两台设备仍然一致、
+  两份都留 —— 不丢内容、不破坏收敛。要改就是改设计的定序键，属于另一件事。
+- **R39（`cat-file --batch` 按 `\n` 分帧、符号链接也是 blob）不在本刀修**：两条触发路径的后果都推演过，
+  都是 fail-closed 而非错位落盘（名字含换行 → 帧字段失配 → 抛错；符号链接 blob → `parseEntryFile`
+  返回 null → `rejected`），且都需要"手工往自己的私有同步仓库推畸形内容"。真正的修法动的正是测试最密的
+  那段代码，应与 S3 backend 的 hash 语义讨论合并成一次独立改动。
+- **`conflict.ts` 删掉尾部线性扫描的结论正确**（审阅者用 `dist/` 对 20 万个随机主干、约 1600 万次求值
+  暴力验证了单调性，0 处违反），但它留下的理由不是载重的那条：真正的理由是"`build(keep)` 的字节长度对
+  `keep` 单调不减"，而不是"头部发生什么都不影响结尾"（`con.` 补 `_` 前缀恰恰是头部影响长度的例子）。
+  连同四处错字（"绍不"→绝不、"兵底"→兜底、"桶穿"→捅穿、"成败失败"）、`engine.ts` 一处 import 顺序、
+  以及"一轮预算被传输段吃光时首次尝试仍带着 1ms 去 publish、于是用户看到 `timed out after 1ms`
+  而不是说得清的 budget 文案"（行为安全：基线不前进、脏标记留着、下一轮接着推），一起归第二刀顺手清理。
+- **一条不可达的升级风险，仅记录**：R57 之后远端的 `con.md` 会被归成范围外而不进 `theirs`；假如某个
+  **更早的构建**已经把它发布出去并写进了基线，"base 有 / ours 有 / theirs 无"会被读成"远端删了它"→
+  `deleteLocal`。今天不可达（sync 从未随 core 发布过），若这条分支曾被真机 dogfooding 过，
+  第二刀接线时扫一眼既有 manifest。
+
+## 12. 规模
 
 按上面的切分，这是一个**项目**而不是小改动：core 那一刀最大（引擎 + backend + 新原语 + 四类测试），
 两个适配层各自是中等接线。粗略估计 core 新增 800–1200 行含测试，每个适配层 150–300 行含测试。
