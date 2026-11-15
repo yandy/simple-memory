@@ -74,6 +74,18 @@ export function syncRootPath(memoryRoot: string): string {
 	return join(memoryRoot, SYNC_DIR_NAME);
 }
 
+/**
+ * 根级 sync 锁的路径：`<syncRoot>/sync.lock`。
+ *
+ * 引擎的传输段与发布段各取一次这把锁（两段之间放开），而适配层还需要一个「清除遗弃根锁」的
+ * 入口：`tryWithLock` 对遗弃锁是**抛错**而不是返回 null（刻意设计），所以一次崩溃会让此后每一轮
+ * 同步都失败，而那句 “delete the file to clear it” 没人够得着。两边必须算出**同一个文件** ——
+ * 各自拼字符串的话，那条命令删的是一个没人用的文件，而真正卡住的锁永远在那里。
+ */
+export function syncLockPath(syncRoot: string): string {
+	return join(syncRoot, "sync.lock");
+}
+
 /** 项目内某个文件在远端的路径。 */
 export function remoteEntryPath(prefix: string, file: string): string {
 	return `${prefix}/${file}`;

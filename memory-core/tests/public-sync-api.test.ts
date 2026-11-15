@@ -7,6 +7,8 @@ import {
 	MANIFEST_VERSION,
 	NonFastForwardError,
 	SYNC_DIR_NAME,
+	type SyncBackend,
+	type SyncInitResult,
 	conflictSuffix,
 	createGitSyncBackend,
 	createSyncEngine,
@@ -25,6 +27,7 @@ import {
 	resolveConflict,
 	scanLocalEntries,
 	sha256Hex,
+	syncLockPath,
 	syncRootPath,
 	writeManifest,
 } from "../src/index.js";
@@ -54,6 +57,9 @@ describe("公开出口上的同步符号", () => {
 		expect(manifestPath(syncRoot, "github.com__o__r")).toBe(
 			join(syncRoot, "state", "github.com__o__r.json"),
 		);
+		// 根锁的路径也只有一份：引擎与适配层的「清除遗弃根锁」入口必须算出同一个文件，
+		// 否则那条命令删的是一个没人用的文件，而真正卡住的锁永远在那里。
+		expect(syncLockPath(syncRoot)).toBe(join(syncRoot, "sync.lock"));
 		expect(typeof MANIFEST_VERSION).toBe("number");
 	});
 
@@ -103,5 +109,23 @@ describe("公开出口上的同步符号", () => {
 		// 非快进是一个**可识别的类型**（引擎靠 `instanceof` 决定重跑整轮），所以它必须是类而不是文案
 		expect(new NonFastForwardError("x")).toBeInstanceOf(Error);
 		expect(new NonFastForwardError("x").name).toBe("NonFastForwardError");
+	});
+
+	it("端口的自省面也在出口上：init 的结果形状、getRemote / setRemote", () => {
+		// 构造不碰盘：这里只看装配出来的对象上有没有那几个方法
+		const backend = createGitSyncBackend({
+			syncRoot: join("/tmp", "memory-root", ".sync"),
+			memoryRoot: join("/tmp", "memory-root"),
+			remote: "https://git.example.invalid/o/r.git",
+			branch: "main",
+		});
+		for (const member of ["ready", "init", "getRemote", "setRemote", "fetch", "publish"] as const) {
+			expect(typeof backend[member], member).toBe("function");
+		}
+		// 类型层面的钉子：端口少了成员、或 init 不再交回 `SyncInitResult`，下面两行就编译不过
+		const asPort: SyncBackend = backend;
+		expect(asPort.getRemote).toBe(backend.getRemote);
+		const initResult: SyncInitResult = { revision: "", warnings: [] };
+		expect(initResult).toEqual({ revision: "", warnings: [] });
 	});
 });

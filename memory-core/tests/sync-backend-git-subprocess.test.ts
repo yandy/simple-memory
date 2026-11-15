@@ -75,7 +75,13 @@ describe("git backend 的子进程启动参数", () => {
 	});
 
 	const backend = (): ReturnType<typeof createGitSyncBackend> =>
-		createGitSyncBackend({ syncRoot: join(dir, "sync"), remote: "https://git.example.invalid/o/r.git", branch: "main" });
+		createGitSyncBackend({
+			syncRoot: join(dir, "sync"),
+			// 记忆根显式给（共存检查的入参）；它不存在，所以 init 不会多跑一个读用户仓库的子进程
+			memoryRoot: join(dir, "memory"),
+			remote: "https://git.example.invalid/o/r.git",
+			branch: "main",
+		});
 
 	const envOf = (index: number): Record<string, unknown> => harness.calls[index].options.env as Record<string, unknown>;
 
@@ -131,6 +137,7 @@ describe("git backend 的子进程启动参数", () => {
 		const token = "s3cr3t-token";
 		const bad = createGitSyncBackend({
 			syncRoot: join(dir, "creds"),
+			memoryRoot: join(dir, "creds-memory"),
 			remote: `https://sync-user:${token}@127.0.0.1:1/o/r.git`,
 			branch: "main",
 		});

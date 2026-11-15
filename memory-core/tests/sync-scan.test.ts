@@ -1,4 +1,14 @@
-import { chmod, mkdir, mkdtemp, rm, stat as fsStat, symlink, writeFile } from "node:fs/promises";
+import { type Dirent } from "node:fs";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readdir as fsReaddir,
+	rm,
+	stat as fsStat,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,17 +17,61 @@ import { scanLocalEntries } from "../src/sync/scan.js";
 import { createReservedNameFixture, removeReservedNameFixture } from "./helpers/reserved-name.js";
 
 // `vi.spyOn` 对 `node:fs/promises` 不可用（ESM 命名空间不可配置，vitest 直接抛 “Module namespace is not
-// configurable”），所以用整模块 mock + `importOriginal` 透传真实实现、只把 `stat` 包成 spy：除被点名的调用外
-// 全部照旧走真实 fs，其余用例的行为不受影响。
+// configurable”），所以用整模块 mock + `importOriginal` 透传真实实现、只把 `stat` 与 `readdir` 包成 spy：
+// 除被点名的调用外全部照旧走真实 fs，其余用例的行为不受影响。
 vi.mock("node:fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs/promises")>();
-	return { ...actual, stat: vi.fn(actual.stat) };
+	return { ...actual, stat: vi.fn(actual.stat), readdir: vi.fn(actual.readdir) };
 });
 
 function errnoError(code: string): NodeJS.ErrnoException {
 	const e = new Error(`${code}: simulated`) as NodeJS.ErrnoException;
 	e.code = code;
 	return e;
+}
+
+/**
+ * 只毒化**一次**调用的 spy 帮手，并在用完之后把真实实现装回去。
+ *
+ * 两条数据安全线（「目录读不了必须上抛」与「符号链接目标 stat 失败必须进 unparsable」）
+ * 原本只能靠 chmod / 真符号链接造现场，而两者在 windows 上都做不到（chmod 造不出「存在但读不了」，
+ * 建符号链接需要特权）—— 于是那两条线在 windows CI 腿上从来没被执行过。改成 mock errno 之后
+ * 它们全平台都真的跑：这里注入的就是扫描分支真正关心的那一个 errno，而不是造 errno 的手段。
+ */
+interface OnceSpy {
+	mockImplementationOnce(fn: (...args: never[]) => Promise<unknown>): void;
+	mockReset(): void;
+	mockImplementation(fn: (...args: never[]) => Promise<unknown>): void;
+}
+
+const readdirSpy = vi.mocked(fsReaddir) as unknown as OnceSpy;
+const statSpy = vi.mocked(fsStat) as unknown as OnceSpy;
+
+/** 收尾必须装回真实实现：`mockImplementationOnce` 若没被消费（例如断言提前失败），留着会污染后续用例。 */
+async function restoreRealFs(): Promise<void> {
+	const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+	const readdir = actual.readdir as unknown as (...args: never[]) => Promise<unknown>;
+	const stat = actual.stat as unknown as (...args: never[]) => Promise<unknown>;
+	readdirSpy.mockReset();
+	readdirSpy.mockImplementation(readdir);
+	statSpy.mockReset();
+	statSpy.mockImplementation(stat);
+}
+
+/** 一个只实现扫描真正会问的那两个谓词的 dirent（不需要真去盘上造一个符号链接）。 */
+function symlinkDirent(name: string): Dirent {
+	return {
+		name,
+		parentPath: "",
+		path: "",
+		isSymbolicLink: () => true,
+		isFile: () => false,
+		isDirectory: () => false,
+		isBlockDevice: () => false,
+		isCharacterDevice: () => false,
+		isFIFO: () => false,
+		isSocket: () => false,
+	} as unknown as Dirent;
 }
 
 const raw = (name: string, modified = "2026-11-09T10:00:00.000Z", body = "正文") =>
@@ -157,7 +211,6 @@ describe("scanLocalEntries", () => {
 			// 三方合并就会把「base 有、ours 没有」读成用户删除，进而删掉对端仍在盘上的记忆。
 			await writeFile(join(dir, "real.md"), raw("R"));
 			await symlink(join(dir, "real.md"), join(dir, "link.md"));
-			const statSpy = vi.mocked(fsStat);
 			// 只毒化第一次（也就是 link.md 那次）调用：普通文件不进 stat 分支，真实实现照旧。
 			statSpy.mockImplementationOnce(() => Promise.reject(errnoError("EMFILE")));
 			try {
@@ -165,14 +218,55 @@ describe("scanLocalEntries", () => {
 				expect(scan.unparsable).toEqual(["link.md"]);
 				expect([...scan.files.keys()]).toEqual(["real.md"]);
 			} finally {
-				// 收尾必须装回真实实现：`mockImplementationOnce` 若没被消费（例如上面提前失败）留着会污染
-				// 后续用例，所以先 `mockReset` 清掉一次性实现、再把 `importActual` 的真实 stat 装上。
-				const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-				statSpy.mockReset();
-				statSpy.mockImplementation(actual.stat);
+				await restoreRealFs();
 			}
 		},
 	);
+
+	it("★目录读不了（readdir 报 EACCES）→ 抛错，不当成空目录（mock 版，全平台真的跑）", async () => {
+		// 数据安全线：一次 EACCES 被当成「目录是空的」，会让三方合并把「用户删光了记忆」传播到远端。
+		// 上面那条靠 chmod 造现场的版本在 win32 上只能 skip，所以这一条用 mock errno 把同一条线
+		// 钉在所有平台上：扫描分支关心的是 errno，不是造出 errno 的手段。
+		await writeFile(join(dir, "a.md"), raw("A"));
+		readdirSpy.mockImplementationOnce(() => Promise.reject(errnoError("EACCES")));
+		try {
+			// 断言 errno 本身而不是只断言「抛了」：否则这条测不出「EACCES 被原样传播」
+			await expect(scanLocalEntries(dir)).rejects.toMatchObject({ code: "EACCES" });
+		} finally {
+			await restoreRealFs();
+		}
+	});
+
+	it("★符号链接目标 stat 报 EMFILE → 进 unparsable、不进 files（mock 版，不依赖真符号链接）", async () => {
+		// 同一条数据安全线的文件级那一半：瞬时 errno 若被当成「跳过」，这个名字会同时从 files 与
+		// unparsable 里消失，三方合并就会把「base 有、ours 没有」读成用户删除，进而删掉对端仍在盘的记忆。
+		// readdir 直接交一个「自称是符号链接」的 dirent：win32 上建真符号链接需要特权，而扫描只读
+		// dirent 的 name 与 isSymbolicLink()，所以这里不需要盘上真有一个链接。
+		await writeFile(join(dir, "real.md"), raw("R"));
+		readdirSpy.mockImplementationOnce(async () => [symlinkDirent("link.md")]);
+		statSpy.mockImplementationOnce(() => Promise.reject(errnoError("EMFILE")));
+		try {
+			const scan = await scanLocalEntries(dir);
+			expect(scan.unparsable).toEqual(["link.md"]);
+			expect([...scan.files.keys()]).toEqual([]); // 它绝不能同时出现在 files 里
+		} finally {
+			await restoreRealFs();
+		}
+	});
+
+	it("★断链（stat 报 ENOENT）既不进 files 也不进 unparsable（mock 版，全平台真的跑）", async () => {
+		// 对照组：同一条分支上「目标确实不存在」与「这一次读不出目标」必须分开处理 ——
+		// 两个 errno 走同一个出口的话，上面那两条数据安全线就形同虚设。
+		readdirSpy.mockImplementationOnce(async () => [symlinkDirent("broken.md")]);
+		statSpy.mockImplementationOnce(() => Promise.reject(errnoError("ENOENT")));
+		try {
+			const scan = await scanLocalEntries(dir);
+			expect(scan.unparsable).toEqual([]);
+			expect([...scan.files.keys()]).toEqual([]);
+		} finally {
+			await restoreRealFs();
+		}
+	});
 
 	it(
 		"win32 保留名文件在 win32 宿主上不被读内容（沿用 #entryFiles 的剔除理由）",

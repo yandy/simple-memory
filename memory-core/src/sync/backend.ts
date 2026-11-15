@@ -87,6 +87,21 @@ export interface RemoteView {
 }
 
 /**
+ * 一次初始化的结果。
+ *
+ * `revision` 是远端**真的存在**的那一个（空串 = 远端还没有任何已同步内容）：适配层拿它写首份基线
+ * （`emptyManifest()` + 这个 revision，`files` 为空集）。不得让适配层自己再 `fetch()` 一遍拼：
+ * 那一来多一次远端往返，二来两次读之间远端可能已经前进，写进基线的就是一个对不上的版本。
+ *
+ * `warnings` 是「已经发生、但不足以拒绝初始化」的情形（例如用户自己把记忆根做成了指向别处的
+ * 仓库），逐条可读、不带凭据，由适配层排进非致命提示。
+ */
+export interface SyncInitResult {
+	revision: string;
+	warnings: string[];
+}
+
+/**
  * 要发布的**增量**：从 `base`（= 本轮取到的远端那一侧）到合并结果的差异。
  *
  * 用增量而不是完整文件集：对象存储这类 backend 只需 PUT/DELETE 变化的对象，不必重传全量。
@@ -142,16 +157,40 @@ export interface SyncBackend {
 	 * 是否已初始化（本地那点状态在不在）。false 时引擎的自动轮直接跳过并报一句可读原因 ——
 	 * **引擎自己不初始化**（首次 clone 可能要几十秒，挂在会话启动上的它必须有独立预算）。
 	 * 初始化由适配层在会话启动时按配置调用 {@link init}；它抛出的失败由适配层降级成一条提示，
-	 * 不影响其余记忆功能。
+	 * 不影响其余记忆功能。`ready()` 的判据是本地那份传输状态在不在（git: `<syncRoot>/repo/.git`），
+	 * **不得**改成“设备身份在不在”：两者不同时写成（clone 成功之后才写设备身份），
+	 * 拿后者当判据会把“clone 好了、身份写失败”误报成“没初始化”，从而重做一次初始化。
 	 */
 	ready(): Promise<boolean>;
 
 	/**
 	 * 首次初始化：由适配层在启动时按配置触发（显式 pull/push 的恢复路径也可以再调），但不是一条
 	 * 用户要手工输入的命令。失败要抛错让人看见，不静默降级成「没初始化」。幂等：已初始化时不得
-	 * 重做一次会改变远端历史的初始化。
+	 * 重做一次会改变远端历史的初始化（也不得为此多跑一次远端往返：适配层每次启动都会调它）。
+	 *
+	 * 返回远端真的存在的那个 revision 与非致命警告（见 {@link SyncInitResult}）。
+	 * **拒绝初始化时不得留下任何可被认成「已初始化」的产物**：否则 `ready()` 随即变 true，
+	 * 下一次启动会照着那个状态继续同步，拒绝分支就成了假话。
 	 */
-	init(opts: SyncRunOptions): Promise<void>;
+	init(opts: SyncRunOptions): Promise<SyncInitResult>;
+
+	/**
+	 * 本地那份传输状态记录的远端地址（git: 暂存 clone 的 origin）；读不出来时 `null`。
+	 *
+	 * 它是初始化之后「同步到底去哪儿」的**真相来源**：状态报告里那一行必须来自这里，而不是构造时的
+	 * 配置值（配置里的 remote 只是未初始化时的输入，已初始化后留空也合法）。
+	 * 未初始化时一律 `null`：那时本地还没有任何可自省的状态。
+	 */
+	getRemote(): Promise<string | null>;
+
+	/**
+	 * 改本地那份传输状态指向的远端（git: `remote set-url`），**不对远端发任何写操作**。
+	 *
+	 * 已初始化时用（适配层的「换远端」入口走这里）；未初始化时它什么都不改也不报错 ——
+	 * 那时该改的是配置，而本功能不写用户的配置文件。
+	 * 空地址 fail-closed（抛错，origin 原样不动）；错误里的地址必须经凭据脱敏。
+	 */
+	setRemote(remote: string, opts: SyncRunOptions): Promise<void>;
 
 	/** 取远端最新状态。 */
 	fetch(scope: SyncScope, opts: SyncRunOptions): Promise<RemoteView>;

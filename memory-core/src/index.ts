@@ -179,7 +179,14 @@ export type {
 // （`ApplyChange` / `ApplyResult`）在 store 分区、配置子树（`SyncConfig` / `syncConfigErrors`）
 // 在配置分区：一个符号只导一次，分区跟拥有它的模块走。
 export { NonFastForwardError } from "./sync/backend.js";
-export type { RemoteView, SyncBackend, SyncPublishChanges, SyncRunOptions, SyncScope } from "./sync/backend.js";
+export type {
+	RemoteView,
+	SyncBackend,
+	SyncInitResult,
+	SyncPublishChanges,
+	SyncRunOptions,
+	SyncScope,
+} from "./sync/backend.js";
 
 export { createGitSyncBackend, gitAvailable } from "./sync/backend-git.js";
 export type { GitSyncBackendOptions } from "./sync/backend-git.js";
@@ -201,15 +208,18 @@ export { sha256Hex } from "./sync/hash.js";
 export { MANIFEST_VERSION, emptyManifest, manifestPath, readManifest, writeManifest } from "./sync/manifest.js";
 export type { SyncManifest } from "./sync/manifest.js";
 
-// 远端布局的单一来源：适配层渲染「这条记忆在远端哪里」一律调这两个，不要就地拼 `git/` 字面量。
-// `remotePrefix` 收**身份 key**（在这里派生成项目 key），`remotePrefixFromKey` 收已经派生好的
-// **项目 key**（适配层算 status 时手上往往就是它）；拿错一个是二次转义，不报错，只是远端多一个谁也不认的目录。
+// 布局的单一来源：适配层渲染「这条记忆在远端哪里」一律调这几个，不要就地拼 `git/` 字面量；
+// 本地状态（`.sync` 目录与根锁文件）同理 —— `syncLockPath` 必须与引擎用的是同一条派生，
+// 否则「清除遗弃根锁」删的是一个没人用的文件。`remotePrefix` 收**身份 key**（在这里派生成项目 key），
+// `remotePrefixFromKey` 收已经派生好的**项目 key**（适配层算 status 时手上往往就是它）；
+// 拿错一个是二次转义，不报错，只是远端多一个谁也不认的目录。
 export {
 	SYNC_DIR_NAME,
 	remoteEntryPath,
 	remotePrefix,
 	remotePrefixFromKey,
 	remoteProjectKey,
+	syncLockPath,
 	syncRootPath,
 } from "./sync/paths.js";
 

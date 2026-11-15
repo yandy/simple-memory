@@ -1,11 +1,14 @@
 import { type ExecFileOptionsWithBufferEncoding, execFile } from "node:child_process";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { normalizeRemoteUrl } from "../store/paths.js";
 import {
 	NonFastForwardError,
 	type RemoteView,
 	type SyncBackend,
+	type SyncInitResult,
 	type SyncPublishChanges,
 	type SyncRunOptions,
 	type SyncScope,
@@ -37,6 +40,14 @@ const MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
 /** 探测 git 在不在 PATH 上的超时（与 `store/paths.ts` 驱动 git 的口径一致）。 */
 const GIT_PROBE_TIMEOUT_MS = 3000;
+
+/**
+ * 只读本地仓库、不联网的那几个命令（读 origin、读用户仓库的 remote 列表）的超时。
+ *
+ * `getRemote()` 在端口上没有运行参数形参（它不碰远端，也就无所谓「自动档 / 手动档」），
+ * 所以它自己带一份。下限仍然是一个有限值：绝不得把 `timeout: 0`（= 不限时）交给子进程。
+ */
+const LOCAL_COMMAND_TIMEOUT_MS = 10_000;
 
 /** `cat-file --batch` 的分帧字节：`\n`。 */
 const LINE_FEED = 0x0a;
@@ -302,7 +313,18 @@ function classify(tree: string[], prefix: string): { inScope: string[]; outOfSco
 export interface GitSyncBackendOptions {
 	/** 本功能自己的状态目录（记忆根下的那个隐藏目录）。用户的记忆目录不在这里，也永远不会被碰。 */
 	syncRoot: string;
-	/** 远端仓库地址。只在 init 时用：之后的真相来源是暂存 clone 自己的 origin。 */
+	/**
+	 * 记忆根（`syncRootPath` 的那个入参，也就是 `.sync` 的上一层）。
+	 *
+	 * 只用于初始化之前的**共存检查**：用户可能自己把记忆根做成了 git 仓库，而「两个写入者推同一个
+	 * 远端」是丢数据的标准姿势（见 `memoryRootWarnings`）。本模块**从不往这个目录里写任何东西**：
+	 * 全部状态都在 `syncRoot` 底下。
+	 */
+	memoryRoot: string;
+	/**
+	 * 远端仓库地址。只在 init 时用：之后的真相来源是暂存 clone 自己的 origin（见 `getRemote`）。
+	 * 已初始化时它可以是空串（适配层按配置重建 backend，而配置里的 remote 初始化之后可以留空）。
+	 */
 	remote: string;
 	/** 远端分支名。 */
 	branch: string;
@@ -312,6 +334,8 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 	// syncRoot 固化成绝对路径：`git init` 那一步要在它里面跑，而进程 cwd 未必还在
 	//（remote **不能** resolve —— 它可能是 URL 或 scp 形态的 host:path）。
 	const syncRoot = resolve(options.syncRoot);
+	// memoryRoot 同理：它要与用户仓库里的 remote（可能是相对路径）做 resolved 字节比较。
+	const memoryRoot = resolve(options.memoryRoot);
 	const { remote, branch } = options;
 	const repoDir = join(syncRoot, "repo");
 
@@ -365,7 +389,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 	 */
 	async function requireRepo(): Promise<void> {
 		if (!(await ready())) {
-			throw new Error(`The sync staging repository is missing (initialise sync first): ${repoDir}`);
+			throw new Error(`The sync staging repository is missing (sync has not been initialised yet): ${repoDir}`);
 		}
 	}
 
@@ -519,12 +543,181 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		await runGit(["push", "--quiet", "-u", "origin", branch], inRepo(o));
 	}
 
-	async function init(opts: SyncRunOptions): Promise<void> {
+	/**
+	 * 本地已知的远端 head（**不联网**）：优先远端跟踪 ref，它不在时退回本地 HEAD。
+	 *
+	 * 幂等 init 靠它交回 revision：适配层每次启动都会调 `init()`，为「什么都没做」的那一次
+	 * 多跑一次 `git fetch` 就白耗一份启动预算。退回本地 HEAD 是安全的：下面每一条成功路径都把
+	 * HEAD 推上去过（引导分支那次是 `push -u`，对齐那次 HEAD 就是从远端 checkout 出来的）。
+	 */
+	async function knownRemoteRevision(o: SyncRunOptions): Promise<string> {
+		const tracked = await localRef(`refs/remotes/origin/${branch}`, o);
+		if (tracked !== null) return tracked;
+		return await localHead(o).catch(() => "");
+	}
+
+	/**
+	 * 两个 remote 是不是「同一个地方」。
+	 *
+	 * 先用 `normalizeRemoteUrl`（http(s)/ssh/git 与 scp 写法都归一成 `host/path`，大小写、尾斜杠、
+	 * `.git` 后缀的差异都抹平）—— 它是仓内既有的**单一口径**，项目身份也靠它，两边必须一致。
+	 * 它认不出的（`file://`、本地绝对路径、win32 盘符）按 **resolved 字节**比 —— 与 git 自己对本地
+	 * 路径的解释同口径（相对路径按进程 cwd 解析）。比不出来宁可归成「不同」（多一条 warning），
+	 * 也不要拿一个猜测去拒绝用户初始化。
+	 */
+	function sameRemoteTarget(left: string, right: string): boolean {
+		return remoteCompareKey(left) === remoteCompareKey(right);
+	}
+
+	function remoteCompareKey(url: string): string {
+		const normalized = normalizeRemoteUrl(url);
+		if (normalized !== null) return normalized;
+		const raw = url.trim();
+		if (/^file:\/\//i.test(raw)) {
+			// `fileURLToPath` 会顺手把 win32 的 `file:///C:/x` 变成盘符路径；畸形 URL 退回去掉 scheme 的字节
+			try {
+				return resolve(fileURLToPath(raw));
+			} catch {
+				return resolve(raw.replace(/^file:\/\//i, ""));
+			}
+		}
+		return resolve(raw);
+	}
+
+	/**
+	 * 读用户自己那个仓库的 remote 列表（`<name> → <url>`）。只读 `git config`，不发网络请求。
+	 * 口径同 `store/paths.ts` 读 remote 的那一处：`--get-regexp` 无匹配时退出码是 **1**，那是
+	 * 「一个 remote 都没有」的正常出口，不是故障。
+	 */
+	async function readUserRemotes(o: SyncRunOptions): Promise<Array<{ name: string; url: string }>> {
+		let out: string;
+		try {
+			out = await runGit(["config", "--get-regexp", "^remote\\..*\\.url$"], { ...o, cwd: memoryRoot });
+		} catch (err) {
+			if (exitCodeOf(err) === 1) return [];
+			throw err;
+		}
+		const remotes: Array<{ name: string; url: string }> = [];
+		for (const line of out.split("\n")) {
+			const trimmed = line.trim();
+			const space = trimmed.indexOf(" ");
+			if (space === -1) continue;
+			remotes.push({
+				name: trimmed
+					.slice(0, space)
+					.replace(/^remote\./, "")
+					.replace(/\.url$/, ""),
+				url: trimmed.slice(space + 1),
+			});
+		}
+		return remotes;
+	}
+
+	/**
+	 * 初始化之前的**共存检查**：用户可能自己把记忆根做成了 git 仓库。
+	 *
+	 * 那不是错误（很多人事先就在备份自己的记忆），但「两个写入者推**同一个**远端」是丢数据的标准姿势：
+	 * 用户自己的 `git push` 与同步的 push 互相覆盖，而两边都以为自己是唯一的写入者。所以分界按
+	 * 「是否同一个远端」划：
+	 * - 有**任何一个** remote 指向我们要配的那个地址 → **拒绝**初始化（抛错）；
+	 * - 指向别处、或一个 remote 都没有 → 允许，交回一条 warning（各推各的，互不干扰）。
+	 *
+	 * 它**只能排在任何写入之前**（调用处就在那里）：clone 一旦跑过，`.sync/repo` 就已经在磁盘上、
+	 * `ready()` 随即变 true —— 「拒绝了初始化、却已经把 clone 建好」会让拒绝分支变成假话。
+	 *
+	 * 只读不写：不发网络请求，也不动用户仓库一个字节。读不出来（权限、坏盘）时**抛错**，
+	 * 口径同 `ready()` 与本地扫描：无从判断就不得假装「没有冲突」。
+	 */
+	async function memoryRootWarnings(o: SyncRunOptions): Promise<string[]> {
+		try {
+			await stat(join(memoryRoot, ".git"));
+		} catch (err) {
+			// 没有用户仓库（绝大多数情形）：这条检查到此为止，也不为此建出那个目录
+			if (isNotFound(err)) return [];
+			throw err;
+		}
+
+		const remotes = await readUserRemotes(o);
+		const clash = remotes.find((item) => sameRemoteTarget(item.url, remote));
+		if (clash !== undefined) {
+			// 文案里的 URL 必须过一遍脏敏：`https://user:token@host/...` 是 git 官方支持的凭据写法，
+			// 而这条错误会被宿主记进日志、被人贴进 issue。
+			throw new Error(
+				redactCredentials(
+					`refusing to initialise sync: the memory root ${memoryRoot} is already a git repository whose ` +
+						`remote "${clash.name}" points at the same remote (${clash.url}) — two writers pushing the same ` +
+						'remote is how memory gets lost; point "sync.remote" in memory.json at a different repository ' +
+						`(or remove that remote from ${memoryRoot})`,
+				),
+			);
+		}
+		// warning 里只列 remote 的**名字**，不列它们的地址：名字里没有凭据，而地址里可能有。
+		const listed =
+			remotes.length === 0
+				? "no remotes"
+				: `remotes: ${remotes
+						.map((item) => item.name)
+						.sort()
+						.join(", ")}`;
+		return [
+			`the memory root ${memoryRoot} is already a git repository (${listed}) — memory sync keeps its own ` +
+				`staging clone under ${syncRoot} and does not touch that repository`,
+		];
+	}
+
+	/** 暂存 clone 的 origin；未初始化或根本没有 origin 时 null。 */
+	async function getRemote(): Promise<string | null> {
+		if (!(await ready())) return null;
+		try {
+			const out = (
+				await runGit(["remote", "get-url", "origin"], { timeoutMs: LOCAL_COMMAND_TIMEOUT_MS, cwd: repoDir })
+			).trim();
+			return out === "" ? null : out;
+		} catch (err) {
+			// 退出码 2 = “No such remote 'origin'”（有人手工动过暂存仓库）。其余错误照旧抛（口径同 `ready()`）：
+			// 「读不出来」与「没有 origin」是两件事，压成 null 会把仓库坏了报成「还没配远端」。
+			if (exitCodeOf(err) === 2) return null;
+			throw err;
+		}
+	}
+
+	/** 把暂存 clone 的 origin 改到另一个地址（不对远端发写操作）。 */
+	async function setRemote(next: string, opts: SyncRunOptions): Promise<void> {
+		const url = next.trim();
+		// 空地址 fail-closed：origin 一旦被清空，此后每一次 fetch/publish 都失败在 git 那句
+		// “'origin' does not appear to be a git repository”上，而用户看不出是谁把它清掉的。
+		if (url === "") {
+			throw new Error("refusing to set an empty sync remote: give the URL of the repository to sync with");
+		}
+		// 未初始化：什么都不改也不报错（也没有东西可改）。那时该改的是配置里的 `sync.remote` ——
+		// 本功能不写用户的配置文件，也不为此建出半个暂存仓库。
+		if (!(await ready())) return;
+		const o = budgeted(opts);
+		try {
+			await runGit(["remote", "set-url", "origin", url], inRepo(o));
+		} catch (setUrlErr) {
+			// origin 被人删过：建回来。语义仍是「让暂存 clone 指向这个地址」，两步的错都跟着出去。
+			try {
+				await runGit(["remote", "add", "origin", url], inRepo(o));
+			} catch (addErr) {
+				throw withEarlierCause(addErr, "git remote set-url", setUrlErr);
+			}
+		}
+	}
+
+	async function init(opts: SyncRunOptions): Promise<SyncInitResult> {
 		// 共享预算（同 `fetch`）：init 是 clone + 引导提交，子进程最多的一条路径。
 		const o = budgeted(opts);
-		// 幂等：已经初始化过就什么都不做。换远端是另一条路径的职责 —— 这里悄悄改掉 origin，
+		// 幂等：已经初始化过就什么都不做。换远端是 `setRemote` 的职责 —— 这里悄悄改掉 origin，
 		// 用户会以为同步去了他刚配的地方。
-		if (await ready()) return;
+		if (await ready()) return { revision: await knownRemoteRevision(o), warnings: [] };
+		// 未初始化而手上根本没地址：给一句指回配置的错误，而不是 git 那句 “You must specify a repository”。
+		// 排在幂等那个 return **之后**：已初始化时 remote 留空是合法的（origin 才是真相来源）。
+		if (remote.trim() === "") {
+			throw new Error('cannot initialise sync: no remote is configured (set "sync.remote" in memory.json)');
+		}
+		// 共存检查在任何写入之前：它一旦拒绝，磁盘上就不能留下任何可被认成「已初始化」的产物。
+		const warnings = await memoryRootWarnings(o);
 		await mkdir(syncRoot, { recursive: true });
 
 		try {
@@ -544,7 +737,8 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 					await runGit(["init", "--quiet", repoDir], { ...o, cwd: syncRoot });
 					await runGit(["remote", "add", "origin", remote], inRepo(o));
 					await bootstrapBranch(o);
-					return;
+					// 引导提交已经 push 上去了（`push -u`），所以本地 HEAD 就是远端那一个
+					return { revision: await localHead(o), warnings };
 				} catch (fallbackErr) {
 					throw withEarlierCause(fallbackErr, "git clone", cloneErr);
 				}
@@ -554,12 +748,13 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 			const head = await localRef(`refs/remotes/origin/${branch}`, o);
 			if (head === null) {
 				await bootstrapBranch(o);
-				return;
+				return { revision: await localHead(o), warnings };
 			}
 			// bare 远端的 HEAD 常常还指着它自己 init 时的默认分支（例如 master），clone 出来的
 			// 本地分支因此是 unborn 的。不对齐到远端分支的话，下一次提交会变成第二个根提交、
 			// push 永远非快进 —— 初始化「成功」了，同步却从此推不上去。
 			await runGit(["checkout", "--quiet", "-B", branch, head], inRepo(o));
+			return { revision: head, warnings };
 		} catch (err) {
 			// 失败的 init 不留半个暂存仓库：留下了 ready() 就是 true，而 origin 指着错的地址，
 			// 用户改对之后再 init 会因为幂等直接返回 —— 同步会永远去错的地方。
@@ -677,5 +872,5 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		return await localHead(o);
 	}
 
-	return { ready, init, fetch, publish };
+	return { ready, init, getRemote, setRemote, fetch, publish };
 }

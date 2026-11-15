@@ -258,8 +258,10 @@ export function modelConfigErrors(
  * 时才检查：关掉的开关不该逼用户先去修它管辖的键。
  * 顺序固定：enabled → pullOnStart → pushOnWrite → remote → branch → pushDebounceMs → autoTimeoutMs
  * → timeoutMs；每条消息都点名键，便于直接改配置。
+ * `options.initialized === true` 时本地 origin 已是远端真相来源，因此只放宽 remote 为空这一条，
+ * 其余键与同意边界的校验完全不变。
  */
-export function syncConfigErrors(cfg: MemoryConfig): string[] {
+export function syncConfigErrors(cfg: MemoryConfig, options: { initialized?: boolean } = {}): string[] {
 	const sync = cfg.sync;
 	// 读不懂的子树（`deepMerge` 会把用户写的 `"sync": null`、甚至一个字符串原样带进来）按「未启用」
 	// 处理，一条都不报：没有键可校验，也没有开关可开。不抛 TypeError 是底线。
@@ -280,8 +282,8 @@ export function syncConfigErrors(cfg: MemoryConfig): string[] {
 	if (sync.enabled !== true) return errors;
 
 	// 非字符串也算空：`mergeConfig` 不校验类型，这里一 `.trim()` 就把非致命校验变成一次崩溃。
-	if (typeof sync.remote !== "string" || sync.remote.trim() === "") {
-		errors.push('sync is enabled but "sync.remote" is empty — run the sync init command or unset "sync.enabled"');
+	if (options.initialized !== true && (typeof sync.remote !== "string" || sync.remote.trim() === "")) {
+		errors.push('sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"');
 	}
 	if (typeof sync.branch !== "string" || sync.branch.trim() === "") {
 		errors.push('sync is enabled but "sync.branch" is empty — set a branch name or unset "sync.enabled"');

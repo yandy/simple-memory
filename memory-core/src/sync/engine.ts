@@ -18,7 +18,7 @@ import type { DeviceIdentity } from "./device.js";
 import { type SyncConflict, diffThreeWay, type SyncDiff } from "./diff.js";
 import { sha256Hex } from "./hash.js";
 import { emptyManifest, MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "./manifest.js";
-import { remotePrefixFromKey } from "./paths.js";
+import { remotePrefixFromKey, syncLockPath } from "./paths.js";
 import { type LocalScan, scanLocalEntries } from "./scan.js";
 import { createSyncScheduler, type SyncScheduler } from "./scheduler.js";
 import type { SyncFileInfo, SyncFileSet } from "./types.js";
@@ -435,12 +435,14 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * `projectDir` 仅用于报告（`status` 里那条「本地目录 ↔ 远端 key」的映射）。
 	 */
 	const memoryDir = store.cfg.memoryDir;
-	const rootLockPath = join(syncRoot, "sync.lock");
+	const rootLockPath = syncLockPath(syncRoot);
 	const manifestFile = manifestPath(syncRoot, projectKey);
 	const scope: SyncScope = { prefix: remotePrefixFromKey(projectKey) };
 
-	const NOT_CONFIGURED = "sync is not configured: set sync.enabled and a sync remote first";
-	const NOT_INITIALIZED = "the sync backend is not initialized: run the sync init command first";
+	const NOT_CONFIGURED = 'sync is not configured: set "sync.enabled" and "sync.remote" in memory.json';
+	const NOT_INITIALIZED =
+		'the sync backend is not initialized: set "sync.remote" in memory.json so the host can initialize it';
+	const DISPOSED = "the sync engine is disposed; no new backend I/O will be started";
 	const ROOT_LOCK_BUSY = "another sync round holds the root sync lock, so this round was skipped";
 	const MEMORY_LOCK_BUSY = "the memory lock for this project is busy, so this round was skipped";
 
@@ -456,12 +458,18 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	const manualBudget = positiveMs(config.timeoutMs, DEFAULT_CONFIG.sync.timeoutMs);
 	const debounce = positiveMs(config.pushDebounceMs, DEFAULT_CONFIG.sync.pushDebounceMs);
 
-	function isConfigured(): boolean {
+	let disposed = false;
+
+	function hasConfiguredRemote(): boolean {
 		// 逐字判类型：配置合并那一层不校验类型，`remote` 可能是任何值。
+		return typeof config.remote === "string" && config.remote.trim() !== "";
+	}
+
+	function isConfigured(initialized: boolean): boolean {
 		// `enabled` 用 `=== true` 而不是真值：这是一道**同意边界** —— 用户写的 `"enabled": "false"`
 		// 在 JS 里是真值，按真值判定就会把明写的「关」读成「开」，继续往远端推数据。
-		// 「不是明确的 true 一律按关处理」与 `syncConfigErrors` 的布尔校验同一口径。
-		return config.enabled === true && typeof config.remote === "string" && config.remote.trim() !== "";
+		// 初始化之后 origin 是真相来源，配置里的 remote 留空合法；只有尚未初始化时才需要它。
+		return config.enabled === true && (initialized || hasConfiguredRemote());
 	}
 
 	function emptyResult(): SyncRoundResult {
@@ -884,19 +892,30 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		snapshot: RemoteSnapshot,
 		applied: AppliedRound,
 		result: SyncRoundResult,
-		timeoutMs: number,
+		deadline: number,
+		roundBudgetMs: number,
 		signal: AbortSignal,
 	): Promise<RoundOutcome> {
 		const { delta } = applied;
-		// 增量为空 = 远端已经有我们全部的字节：不取锁、不做一次注定「无变化」的远端往返
+		// 增量为空 = 远端已经有我们全部的字节：不取锁、不做一次注定「无变化」的远端往返。
+		// 这条出口先于预算检查：没有发布工作要做时，传输段花光预算也不该把成功改成失败。
 		if (delta.writes.length === 0 && delta.deletions.length === 0) return result;
+		// `remainingMs` 为了给子进程规避 timeout: 0 会把耗尽钳成 1ms；在发起发布前先拦住，
+		// 否则用户看到的是一次注定失败的 “timed out after 1ms”，而不是真正的预算耗尽原因。
+		if (deadline - Date.now() <= 0) {
+			return failedRound(
+				`the round budget of ${roundBudgetMs}ms ran out before publishing; ` +
+					"local changes converged and will be published next time",
+				result,
+			);
+		}
 
 		const locked = await withRootLock(() =>
 			backend.publish(
 				scope,
 				delta,
 				{ revision: snapshot.revision },
-				{ timeoutMs, signal, message: publishMessage(delta), author: commitAuthor(device) },
+				{ timeoutMs: remainingMs(deadline), signal, message: publishMessage(delta), author: commitAuthor(device) },
 			),
 		);
 		if (!locked.acquired) {
@@ -935,10 +954,18 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 跑一次尝试。**收的是截止时刻而不是一个毫秒数**：预算要在每一次远端调用之前重新问一次，
 	 * 否则传输段花掉的时间不会从发布段的预算里扣（那就又变回「每段各一份满额」）。
 	 */
-	async function runOnce(mode: Mode, deadline: number, signal: AbortSignal): Promise<RoundOutcome> {
-		if (!isConfigured()) throw new SyncSkip(NOT_CONFIGURED);
-		// 自动路径绝不偷偷做首次初始化：那可能是一次几十秒的远端往返
-		if (!(await backend.ready())) throw new SyncSkip(NOT_INITIALIZED);
+	async function runOnce(
+		mode: Mode,
+		deadline: number,
+		roundBudgetMs: number,
+		signal: AbortSignal,
+	): Promise<RoundOutcome> {
+		if (config.enabled !== true) throw new SyncSkip(NOT_CONFIGURED);
+		// 先问本地初始化状态，才能区分「已初始化、配置 remote 留空」与「没有地址可初始化」。
+		// 自动路径绝不偷偷做首次初始化：那可能是一次几十秒的远端往返。
+		const initialized = await backend.ready();
+		if (!isConfigured(initialized)) throw new SyncSkip(NOT_CONFIGURED);
+		if (!initialized) throw new SyncSkip(NOT_INITIALIZED);
 
 		const snapshot = await readRemoteSnapshot(remainingMs(deadline), signal); // ① 出段即释放根锁
 		const result = emptyResult();
@@ -950,7 +977,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			// 用户手上，报一个根本没写进基线的 revision，等于让他们对着一个不存在的状态去排查
 			result.revision = snapshot.revision;
 			if (mode === "pull") return result;
-			return await publishPhase(snapshot, applied, result, remainingMs(deadline), signal); // ③ 再取一次根锁
+			return await publishPhase(snapshot, applied, result, deadline, roundBudgetMs, signal); // ③ 再取一次根锁
 		} catch (err) {
 			// 远端在这轮之间又前进了：整轮重跑一次（重新取远端、重算差集），而不是原地重试一次 publish。
 			// 这一次尝试已经落盘的改动不会被重跑撤销，所以连同部分结果一起交出去。
@@ -971,6 +998,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 最坏情况就是配置值的好几倍 —— 正是那两档时限要避免的事。所以这里只传**剩下的毫秒**。
 	 */
 	function runRound(mode: Mode, timeoutMs: number): Promise<SyncRoundResult> {
+		if (disposed) return Promise.resolve(failedRound(DISPOSED));
 		return withAbortSignal((signal) => attemptRound(mode, timeoutMs, signal));
 	}
 
@@ -997,7 +1025,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 				);
 			}
 			try {
-				const outcome = await runOnce(mode, deadline, signal);
+				const outcome = await runOnce(mode, deadline, timeoutMs, signal);
 				if (!("retry" in outcome)) return outcome;
 				lastRetry = outcome.retry;
 				// 合并而不是覆盖：重跑不撤销上一次的落盘（理由写在 `mergePartials`）
@@ -1019,7 +1047,8 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	/** `status` 自己出意外时的兜底报告：字段齐全、只有 `errors` 里有话。 */
 	function emptyStatusReport(): SyncStatusReport {
 		return {
-			configured: isConfigured(),
+			// 初值只表达同意开关；是否还需要配置 remote 要等 ready() 之后才能判定。
+			configured: config.enabled === true,
 			initialized: false,
 			remote: typeof config.remote === "string" ? config.remote : "",
 			branch: config.branch,
@@ -1039,6 +1068,11 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 
 	/** 算一份报告。**dry-run**：全程只读，盘上一个字都不改。 */
 	function computeStatus(timeoutMs: number): Promise<SyncStatusReport> {
+		if (disposed) {
+			const report = emptyStatusReport();
+			report.errors.push(DISPOSED);
+			return Promise.resolve(report);
+		}
 		// status 也要挂上中止信号：它同样会碰远端（一次 fetch），而宿主退出时该收尾的不只是同步轮。
 		return withAbortSignal((signal) => buildStatusReport(timeoutMs, signal));
 	}
@@ -1058,9 +1092,21 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			report.errors.push(describeError(err));
 			return report;
 		}
+		report.configured = isConfigured(report.initialized);
+		if (!report.configured) {
+			report.errors.push(NOT_CONFIGURED);
+			return report;
+		}
 		if (!report.initialized) {
 			report.errors.push(NOT_INITIALIZED);
 			return report;
+		}
+		try {
+			// 初始化之后 origin 才是真相来源；读不到时保留配置值作展示回退，但不放弃整份 dry-run 报告。
+			const origin = await backend.getRemote();
+			if (origin !== null) report.remote = origin;
+		} catch (err) {
+			report.errors.push(describeError(err));
 		}
 
 		// dry-run：下面全程只读 —— 不快照、不落盘、不重建索引、不写基线
@@ -1145,6 +1191,8 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		noteWrite: () => scheduler.noteWrite(),
 		flush: (timeoutMs?: number) => scheduler.flush(positiveMs(timeoutMs, autoBudget)),
 		dispose: () => {
+			// 先封住所有新入口，再中止在途那一轮并收摊调度器：dispose 之后连只读的 status 也不碰 backend。
+			disposed = true;
 			// 先中止在途那一轮的远端调用，再收摊调度器：宿主的退出路径是「`dispose()` → `await inFlight`」，
 			// 少了这一步，一次挂死的 fetch/publish 会把退出拖到子进程自己的超时跑完为止。
 			for (const controller of activeSignals) controller.abort();
