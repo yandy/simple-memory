@@ -31,7 +31,7 @@
 ## 用户契约
 
 磁盘格式、prompt 文本、`memory` 工具的 action 语义不得顺手改。它们对用户是契约，改动要有独立的
-spec 与迁移说明。
+spec。
 
 工具提示词（`description` / `promptSnippet` / `promptGuidelines` 三通道）的措辞与预算由
 `scripts/prompt-hygiene.ts` 把关，执行点是 `pi-memory/tests/prompt-meta.test.ts`。
