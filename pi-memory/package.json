@@ -13,7 +13,7 @@
 	},
 	"type": "module",
 	"dependencies": {
-		"@yandy0725/memory-core": "^2.0.0"
+		"@yandy0725/memory-core": "^2.1.0"
 	},
 	"keywords": [
 		"pi-package"

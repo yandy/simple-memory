@@ -19,6 +19,7 @@ Aligned with Claude Code's auto memory mechanism: **one memory = one file**, a `
 - **Two-level locking** — an in-process logical lock carries the *logical* scope (one primitive call, or a whole dream round); the cross-process `.lock` file is held for **milliseconds only** and is **never reclaimed automatically**. There is no TTL, no heartbeat and no takeover, so mutual exclusion is a hard guarantee; the price is that a lock left behind by a crashed process must be removed by a human (`/memory unlock`).
 - **Snapshots** — every write leaves a rollback point under `.backups/<ts>-<label>/`, keeping the last `lock.snapshotKeep` (directories named `migrate-*` — whole-directory snapshots from an earlier 1.x migration, whose `originals/` subdirectory holds the pre-2.0 topic files — are never pruned). `/dream` is the exception: it snapshots the whole directory **once on entry**, and the primitives inside that round skip their per-file snapshots (one round, one rollback point).
 - **Session search** — `memory search scope=sessions` queries past conversation history.
+- **Cross-device sync (opt-in)** ⭐ — replicate this project's entry files to one git remote, so the same repository opened on two machines shares one memory. **Off by default**: set `sync.enabled: true` plus `sync.remote` and the next session initialises itself — there is no init command. Only entry files travel (`MEMORY.md` stays local and is rebuilt after each pull); concurrent edits to the same memory keep **both** sides as deterministic conflict copies.
 - **Readable, clone-safe layout** — memory lives under `~/.local/share/simple-memory/git/<host__owner__repo>/` for git repos with an http(s)/ssh/git remote (including scp-style and `git+ssh`/`git+https`), and `~/.local/share/simple-memory/local/<absolute-path>/` otherwise — clones and worktrees of the same repo share memory (a fork has its own remote, so it gets its own directory).
 
 ## Install
@@ -68,6 +69,10 @@ takes the `.git` directory with it and the history survives.
   .dream-meta.json     — last dream timestamp + session count (drives the nudge)
   sessions/            — persisted headless sessions, only when sessionPersistence is enabled
 ```
+
+The root that holds `git/` and `local/` also holds **`.sync/`** — cross-device sync's own state (device
+identity, staging clone, per-project baselines, root lock). It is created only when sync is enabled, it is
+never part of your memory, and nothing under `local/` is synced. See [Cross-device sync](#cross-device-sync).
 
 ### Entry file
 
@@ -147,6 +152,16 @@ Create `memory.json` in the agent directory (`~/.pi/agent/memory.json`) or the p
     "maxContextTokens": 2000,
     "maxToolResultChars": 500,
     "maxAssistantChars": 2000
+  },
+  "sync": {
+    "enabled": false,
+    "remote": "",
+    "branch": "main",
+    "pullOnStart": true,
+    "pushOnWrite": true,
+    "pushDebounceMs": 5000,
+    "autoTimeoutMs": 5000,
+    "timeoutMs": 20000
   }
 }
 ```
@@ -186,6 +201,14 @@ Create `memory.json` in the agent directory (`~/.pi/agent/memory.json`) or the p
 | `extractMemories.maxToolResultChars` | `500` | ⭐ Per-message cap for a rendered `tool_result` |
 | `extractMemories.maxAssistantChars` | `2000` | ⭐ Per-message cap for rendered assistant text (user messages are never truncated) |
 | `extractMemories.sessionPersistence.*` | inherits `defaults` | Persist extract sessions to disk |
+| `sync.enabled` | `false` | ⭐ Enable cross-device sync. Validated by **type**: a string such as `"false"` is reported as "sync is disabled because …", never read as truthy |
+| `sync.remote` | `""` | ⭐ Git remote URL, used for the **first** initialisation only. Empty is an error only when `enabled` is true and sync is not yet initialised; afterwards the staging clone's `origin` is the source of truth |
+| `sync.branch` | `"main"` | ⭐ Remote branch this project syncs on |
+| `sync.pullOnStart` | `true` | ⭐ Run one convergence round (a push round: converge, then publish) at session start, **before** the index value is chosen. `false` still prepares (and initialises on first use), it just never fetches/pulls/pushes automatically |
+| `sync.pushOnWrite` | `true` | ⭐ Publish after every successful memory write, debounced by `pushDebounceMs` |
+| `sync.pushDebounceMs` | `5000` | ⭐ Quiet period, measured from the **first** write: a burst (one `/dream` round rewrites a dozen files) becomes one push round |
+| `sync.autoTimeoutMs` | `5000` | ⭐ Budget for one automatic path (startup prepare + convergence round, shutdown flush). One budget shared by all git subprocesses of that call |
+| `sync.timeoutMs` | `20000` | ⭐ Budget for a manual command, where the user is explicitly waiting (`/memory sync pull` / `push` / `status`) |
 
 Persisted headless sessions default to `<project memory dir>/sessions/` — inside the project's memory directory, not inside your working copy.
 
@@ -199,7 +222,155 @@ Project-only (`.pi/settings.json` in the project root — read only after projec
 { "packages": [{ "source": "npm:@yandy0725/pi-memory", "extensions": [] }] }
 ```
 
-A project entry replaces the personal entry, so the extension is not loaded in that project. Globally: `pi remove npm:@yandy0725/pi-memory`, or toggle the package's resources with `pi config` (project scope writes `autoload: false` plus `extensions: ["-index.ts"]`). Module switches (`autoSurfacing.enabled`, `extractMemories.enabled`) still turn off individual behaviors while the extension stays loaded.
+A project entry replaces the personal entry, so the extension is not loaded in that project. Globally: `pi remove npm:@yandy0725/pi-memory`, or toggle the package's resources with `pi config` (project scope writes `autoload: false` plus `extensions: ["-index.ts"]`). Module switches (`autoSurfacing.enabled`, `extractMemories.enabled`, `sync.enabled`) still turn off individual behaviors while the extension stays loaded.
+
+## Cross-device sync
+
+pi-memory can replicate a project's memory entries to **one git remote**, so the same repository opened on
+another machine lands on the same memories. It is **off by default** — syncing writes your memories to a
+remote, so that cost has to be opted into, exactly like `extractMemories`.
+
+### Setup — there is no `/memory sync init`
+
+1. Prepare the remote repository yourself (**empty is fine**) and make sure plain `git` in the environment
+   where pi runs can `clone` / `push` it non-interactively — SSH key, credential helper, token in the URL,
+   whatever your setup already uses. pi-memory stores no credential of its own and never prompts; it shells
+   out to `git` from `PATH`. A **private** remote is the intended default: the repository and its access
+   permissions are yours to provision.
+2. Point `memory.json` at it:
+
+```json
+{ "sync": { "enabled": true, "remote": "git@github.com:you/simple-memory.git" } }
+```
+
+3. Start a session. The first `session_start` with this configuration **initialises automatically**: it
+   clones the remote into `<memoryDir>/.sync/repo` and writes this project's first baseline. There is
+   deliberately **no `/memory sync init`** command — its first run could be a slow clone, and a typed-but-not-
+   applied command would leave one more state to explain (wrong URL? unreachable remote?) than a config line.
+
+Rules that follow from "the origin is the source of truth":
+
+- **Once initialised, the staging clone's `origin` is authoritative**, not `sync.remote`. You may empty
+  `sync.remote` afterwards and sync keeps working.
+- **A configured remote that differs from `origin` is non-fatal**: one error notice per session
+  (`sync.remote differs from the initialized origin; continuing to use origin`), `/memory sync status`
+  prints both values, and every round keeps using `origin`. Nothing is disabled and no local memory is
+  touched. Use `/memory sync remote <url>` to actually change it.
+- `sync.enabled: true` with an empty `sync.remote` **before** the first initialisation is a config error
+  (sync is reported unavailable; the rest of memory keeps working). After initialisation it is not an error.
+- `enabled`, `pullOnStart` and `pushOnWrite` are validated by **type**, not truthiness: a string such as
+  `"enabled": "false"` is reported as `sync is disabled because …` and never silently read as on.
+- Initialisation failures (no `git`, no network, bad URL, no permission) are **non-fatal**: the session runs
+  with local memory only and one readable error notice explains it. Fix the cause and the next session start
+  — or an explicit `/memory sync pull` / `push` — retries the same idempotent initialisation.
+- If `<memoryDir>` is itself a git repository, initialisation **refuses** when one of its remotes points at
+  the same URL (two writers pushing one remote is how memory gets lost) and only warns when they point
+  elsewhere: the staging clone is separate and your repository is never touched.
+
+### Scope and layout
+
+Only the **current project's** entry files travel: flat `*.md` files under `<memoryDir>/git/<project>/` that
+parse as v2 entries. One remote mirrors the whole memory root (`git/<project-key>/…`), but a session syncs
+just the project it is in; other projects sync in their own sessions.
+
+| Path | Synced? | Why |
+|---|---|---|
+| entry `*.md` of the current project | **yes** | the memories themselves |
+| `MEMORY.md` | no | a local derivative, rebuilt from disk after each pull. Hand-written headings and groups stay device-local |
+| `.lock` | no | a cross-process lock is never reclaimed automatically; syncing it would manufacture a fake dead lock on another device |
+| `.backups/` | no | local rollback points; syncing them multiplies their size per device |
+| `sessions/` | no | headless transcripts: large, and local execution traces. `memory search scope=sessions` therefore only finds this machine's history |
+| `.dream-meta.json` | no | "last dream" is per device — each machine counts its own sessions |
+| `<memoryDir>/local/**` | no | non-git projects are not replicated in v1 |
+| `<memoryDir>/.sync/**` | no | this feature's own state |
+
+```
+<memoryDir>/                     e.g. ~/.local/share/simple-memory
+  .sync/                         sync state — created only when sync is enabled
+    device.json                  { id, hostname, createdAt }: per-device identity, never synced
+    repo/                        the staging clone (worktree + .git) — the whole transport channel
+    state/<project-key>.json     this project's baseline manifest (the last state both sides agreed on)
+    sync.lock                    root-level cross-process lock (transport and publish segments)
+  git/<project>/                 your memory: no .git is added here, nothing else is written
+  local/<project>/               never synced
+```
+
+`.sync` sits **next to** the project tree, not inside it: the memory directory stays clean, and every scan
+skips it (dot-directories are not entries). The root `sync.lock` is a **different lock** from the project
+`.lock` described above: it is taken per segment — one `fetch` in the transport segment, one `push` in the
+publish segment — never for a whole round. An abandoned one makes every sync round fail with an actionable
+error; `/memory sync unlock` is the one sanctioned way to clear it.
+
+### Lifecycle
+
+```
+session_start
+  1. config + models + memory directory
+  2. sync: prepare (inspect the staging clone; initialise on first use or when the baseline is missing)
+     — this runs whether or not pullOnStart is set
+  3. pullOnStart === true → one push round (converge + catch up) BEFORE the index value is chosen
+  4. choose the index value (disk for startup/new, the recorded transcript value for resume/fork/reload)
+
+every successful memory write
+  → core debounce: mark dirty, schedule one push after pushDebounceMs (quiet period from the first write)
+
+session_shutdown
+  → flush once regardless of the debounce, bounded by sync.autoTimeoutMs
+```
+
+- **A push round is the whole convergence**: transport (fetch) → three-way apply against the baseline
+  (snapshot, disk, index rebuild) → publish. So the startup round both pulls in what other devices wrote and
+  re-publishes what a previous session failed to push. That is why it is one round instead of "pull, then
+  push": the in-process dirty flag only knows about writes made by *this* process.
+- **`pullOnStart: false` still prepares** — it just never fetches, pulls or pushes automatically. First-time
+  initialisation and recovery from a failed one still happen at session start.
+- **Writes**: every successful entry write (the `memory` tool, a whole `/dream` round, extract's saves) arms
+  the debounce. `pushOnWrite: false` installs a no-op trigger — nothing is published automatically, manual
+  commands still work.
+- **Shutdown** flushes once even if the debounce has not elapsed, with `sync.autoTimeoutMs` for the round and
+  the same `lock.timeoutMs` bound on in-flight waits that ordinary writes use. A failed flush only produces
+  `Memory sync flush failed: … local changes will be retried at the next session start.` — the content stays
+  local, and the next round publishes it: the next session start (with `pullOnStart`, the default) or the
+  next write's debounced push. With `pushOnWrite` and `pullOnStart` both off, use `/memory sync push`.
+  local and the next startup round publishes it.
+- **Recorded index (known semantics, not a bug)**: `resume` / `fork` / `reload` freeze the index value
+  recorded in the transcript. Startup convergence still runs and the disk does change, but the pulled entries
+  are **not** in this session's `memory_index` until the next compaction (or the next session).
+  `/memory sync status` says so in its last line.
+
+### Commands
+
+```
+/memory sync              — status (same as `/memory sync status`); strict dry-run
+/memory sync pull         — converge remote changes into disk + rebuild the index; publishes nothing
+/memory sync push         — converge, then publish
+/memory sync remote <url> — point the staging clone's origin at <url> and reset this project's baseline
+/memory sync unlock       — remove a left-behind .sync/sync.lock (asks for confirmation first)
+```
+
+`status` is a **strict dry-run**: it computes the same three-way diff a real round would, but it does not
+clone, initialise, snapshot, write a baseline or touch a memory file (its `git fetch` only moves transport
+metadata inside `.sync/repo`). It reports `Configured` / `Initialized`, `Origin` versus `Configured remote`,
+`Branch`, `Device`, the local directory → remote key mapping, the baseline revision, the `Ahead` / `Behind` /
+`Conflicts` file lists, `Rejected` (with reasons), `Unparsable local` (files that count as neither entry nor
+safe deletion, so they are left untouched), `Out of scope remote` (paths in the remote that are not this
+project's entries — for example someone pushed a root `MEMORY.md`), and `Errors`.
+
+`remote <url>` is the only supported way to change the origin:
+
+- It closes the gate for new sync activity (a second `/memory sync remote` reports `sync remote change is
+  already in progress`), drains the rounds already in flight, then **invalidates this project's baseline**
+  (`state/<project-key>.json` is deleted) and re-runs preparation against the new origin. A missing manifest
+  is a *safe* empty baseline: it means "nothing agreed yet", never "the user deleted everything".
+- Because the baseline is empty, the first round against the new remote may see the same memory on both
+  sides with different content. **Both are kept**: the newer `modified` stays at the path (ties broken by the
+  content hash), the other becomes a normal entry whose `name` gains ` (冲突 <date> <sha6>)` (the suffix is Chinese in every locale — it is
+  part of the name contract). The suffix depends on content only, so two devices resolving the same conflict
+  write the **same** file and converge instead of multiplying copies; `/dream` merges duplicates afterwards.
+- `memory.json` is **never rewritten** (this layer has no config writer) — the notice says exactly that.
+  Edit the file yourself if you want the value to be the configured default on the next start.
+- Before the first initialisation there is no origin to change: it tells you to set `sync.remote` in
+  `memory.json` instead.
 
 ## Model configuration
 
@@ -224,11 +395,14 @@ Fix `memory.json` and restart the session — the config is read once at session
 
 | Event | What pi-memory does |
 |---|---|
-| `session_start` | Load config → validate the required models (a failure means nothing is initialised) → resolve the memory directory → **pick the index value and freeze it** (disk for `startup`/`new`; the recorded transcript value for `resume`/`fork`/`reload`) → register the `memory` tool (once, five actions) → rebuild the manifest cache → dream nudge |
+| `session_start` | Load config → validate the required models (a failure means nothing is initialised) → resolve the memory directory → **prepare cross-device sync** (auto-initialise on first use, always, even with `pullOnStart: false`) → with `pullOnStart` run one convergence round (a push round) → **pick the index value and freeze it** (disk for `startup`/`new`; the recorded transcript value for `resume`/`fork`/`reload`) → register the `memory` tool (once, five actions) → rebuild the manifest cache → dream nudge |
 | `before_agent_start` | Write the frozen value into `sections["memory_index"]` (**unconditionally, every turn**), then auto-surfacing (main session, not a subagent) |
 | `agent_end` | With `extractMemories.enabled`, fire the async extractor; notify `Extracted N memories.` when it wrote something, or `Extract failed: …` once per session |
 | `session_compact` | Clear the injected-file set **and re-read the index from disk** — the only in-session refresh point |
-| `session_shutdown` | Wait for in-flight writes to finish (bounded by `lock.timeoutMs`) so a quit does not leave a stale `.lock` |
+| `session_shutdown` | Flush pending sync pushes (bounded by `sync.autoTimeoutMs`) and wait for in-flight writes to finish (bounded by `lock.timeoutMs`) so a quit leaves neither a stale `.lock` nor a memory that only ever reached local disk |
+
+Every successful memory write also arms the sync write trigger, so a burst of writes becomes one debounced
+push round. Details in [Cross-device sync](#cross-device-sync).
 
 ### Why the index is frozen
 
@@ -314,8 +488,13 @@ One line per memory: `- name (type, modified …) — description [file]`.
 ### `/memory`
 
 ```
-/memory          — status
-/memory unlock   — remove a left-behind .lock (asks for confirmation first)
+/memory                      — status
+/memory unlock               — remove a left-behind .lock (asks for confirmation first)
+/memory sync                 — sync status (same as `/memory sync status`); strict dry-run
+/memory sync pull            — converge remote changes into disk + rebuild the index
+/memory sync push            — converge, then publish
+/memory sync remote <url>    — change the staging clone's origin and reset this project's baseline
+/memory sync unlock          — remove a left-behind .sync/sync.lock (asks for confirmation first)
 ```
 
 Status output:
@@ -328,12 +507,14 @@ Entries: 37
 Modules: dream=on(provider/model-a) extractMemories=off autoSurfacing=on(provider/model-b)
 Last dream: 2026-10-01T22:10:04.882Z
 Lock: free
+Sync: ready
 ```
 
 - `Index` uses the **write** capacity (`memIndexMax*`) and reports how many non-empty lines could not be parsed as index lines (the `# Memory Index` header and hand-written headings count). CRLF (or lone CR) line endings are normalised to LF before parsing, and the next write emits LF too, so a `MEMORY.md` re-saved by a Windows editor does **not** raise this count.
 - `Inject` uses the **injection** window (`memIndexInjectMax*`) and counts the window's lines and bytes — the index text that goes into the `memory_index` section, taken from the **newest** end (the truncation marker itself is not counted). It is computed by the same window code that produces the injected value, so the two cannot drift. Note the two lines count different things: `Index` counts **non-empty** lines, `Inject` counts **every** line of the window, so on a canonical index (LF endings, trailing newline, one blank line after the header) `Inject` reports one more line than `Index` and the same byte count. The value in the system prompt is **frozen for the session** (see [Why the index is frozen](#why-the-index-is-frozen)): a memory written after `session_start` appears in `Index` immediately but in `Inject` only after compaction or in the next session.
 - `Modules` reports the activation state of the three model-driven features as `on(<effective model>)` / `off`. The effective model is the task's own `model`, otherwise `defaults.model`. `dream` has no switch of its own — it is always available in a healthy session.
 - `Lock` is `free`, `held by <op> (pid N on <hostname>, started <ISO>)`, or `unreadable — run /memory unlock`. `/memory unlock` shows the same holder line in its confirmation prompt.
+- `Sync` is `ready` (engine prepared), `not initialized` (the runtime exists but preparation has not finished — a `/memory sync pull` or `push` retries it), or `disabled` (no runtime). The line is appended only when sync is enabled or degraded, so a default install still prints the seven lines above; sync errors follow it as `- <error>` lines. Details: [Cross-device sync](#cross-device-sync).
 - If a required model is missing or cannot be resolved, nothing is initialized and `/memory` reports `Memory: misconfigured` and `Dir: not initialized`, followed by one `- <error>` line per problem. The same errors are shown as an error notification at session start.
 
 ### `/dream`
@@ -401,5 +582,8 @@ pi-memory runs natively on Windows — no WSL required.
 | The extractor wrote memories | `Extracted <N> memory.` / `Extracted <N> memories.` |
 | The extractor failed | `Extract failed: <message>` — at most once per session |
 | `/dream` finished / failed | the headless agent's summary / `Dream failed: <message>` |
+| Sync fails at startup or on a manual command | `pi-memory sync error:` with one `- <error>` line each / `Memory sync pull failed: <reason>` / `Memory sync push failed: …` / `Memory sync remote failed: …` / `Memory sync status failed: …` |
+| A manual sync command succeeded | `Memory sync pull:` / `Memory sync push:` / `Memory sync remote: <url>`, followed by that round's pulled / pushed / conflict / rejected file lists |
+| Shutdown flush failed | `Memory sync flush failed: <reason>; local changes will be retried at the next session start.` |
 
 Headless sessions (`hasUI === false`) never notify.

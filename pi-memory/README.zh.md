@@ -19,6 +19,7 @@ pi coding agent 的文件系统持久记忆层。把项目知识（事实、偏�
 - **两级锁** —— 进程内逻辑锁承担**逻辑作用域**（单次原语，或 dream 的整轮）；跨进程 `.lock` **只持毫秒**且**永不自动回收**。没有 TTL、没有心跳、没有接管，所以互斥是硬保证；代价是崩溃遗留的锁必须**人工**清除（`/memory unlock`）。
 - **快照** —— 每次写入都在 `.backups/<ts>-<label>/` 留下回滚点，保留最近 `lock.snapshotKeep` 份（`migrate-` 开头的目录是旧版迁移留下的整目录快照，其 `originals/` 子目录里才是 2.0 之前的 topic 原文，永不裁剪）。`/dream` 是例外：它**进入时只对整个目录拍一次**快照，该轮内部的原语会跳过逐文件快照（一轮只留一个回滚点）。
 - **会话检索** —— `memory search scope=sessions` 查历史会话。
+- **跨设备同步（opt-in）** ⭐ —— 把当前项目的 entry 文件复制到**一个 git 远端**，同一仓库在两台机器上打开时共用一份记忆。**默认关闭**：设 `sync.enabled: true` + `sync.remote`，下次会话启动就自动初始化 —— 没有 init 命令。只同步 entry 文件（`MEMORY.md` 留在本地，每次 pull 后从磁盘重建）；同一条记忆在两侧被并发改写时**两份都保留**，另一份变成确定性的冲突副本。
 - **可读、clone 友好的布局** —— git 仓库（http(s)/ssh/git remote，含 scp 写法与 `git+ssh`/`git+https`）存在 `~/.local/share/simple-memory/git/<host__owner__repo>/`，其余存在 `~/.local/share/simple-memory/local/<absolute-path>/`；同一仓库的 clone 与 worktree 共享记忆（fork 有自己的 remote，因此有独立目录）。
 
 ## 安装
@@ -66,6 +67,8 @@ mkdir -p "$root" && mv ~/.pi/memory "$root/simple-memory"
   .dream-meta.json     — 上次 dream 的时间与会话数（提醒逻辑用它）
   sessions/            — headless 会话落盘目录，仅在开启 sessionPersistence 时使用
 ```
+
+放 `git/` 与 `local/` 的那个根下面还有 **`.sync/`** —— 跨设备同步自己的状态（设备身份、暂存 clone、每项目基线、根锁）。它只在开启同步后创建，永远不属于你的记忆，而 `local/` 下的内容永不同步。见[跨设备同步](#跨设备同步)。
 
 ### Entry 文件
 
@@ -145,6 +148,16 @@ staging 的 SSH 用 2222 端口，密钥在 ~/.ssh/staging。
     "maxContextTokens": 2000,
     "maxToolResultChars": 500,
     "maxAssistantChars": 2000
+  },
+  "sync": {
+    "enabled": false,
+    "remote": "",
+    "branch": "main",
+    "pullOnStart": true,
+    "pushOnWrite": true,
+    "pushDebounceMs": 5000,
+    "autoTimeoutMs": 5000,
+    "timeoutMs": 20000
   }
 }
 ```
@@ -184,6 +197,14 @@ staging 的 SSH 用 2222 端口，密钥在 ~/.ssh/staging。
 | `extractMemories.maxToolResultChars` | `500` | ⭐ 单条 `tool_result` 渲染的字符上限 |
 | `extractMemories.maxAssistantChars` | `2000` | ⭐ 单条 assistant 文本渲染的字符上限（user 消息从不截断） |
 | `extractMemories.sessionPersistence.*` | 继承 `defaults` | 把 extract 会话落盘 |
+| `sync.enabled` | `false` | ⭐ 开启跨设备同步。按**类型**校验：`"enabled": "false"` 这种字符串会报成「sync is disabled because …」，绝不会被当真值读成开 |
+| `sync.remote` | `""` | ⭐ git 远端 URL，**只供首次初始化**使用。空值只在 `enabled` 为真且尚未初始化时算错；初始化之后真相来源是暂存 clone 的 `origin` |
+| `sync.branch` | `"main"` | ⭐ 本项目同步的远端分支 |
+| `sync.pullOnStart` | `true` | ⭐ 会话启动时跑一轮收敛（一轮 push：先收敛再发布），排在索引值选定**之前**。`false` 仍会 prepare（并在首次使用时初始化），只是永不自动 fetch/pull/push |
+| `sync.pushOnWrite` | `true` | ⭐ 每次成功的记忆写入后自动发布，按 `pushDebounceMs` 去抖 |
+| `sync.pushDebounceMs` | `5000` | ⭐ 静默期，从**第一次**写入起算：一串写入（一轮 `/dream` 改十几个文件）合并成一轮 push |
+| `sync.autoTimeoutMs` | `5000` | ⭐ 一条自动路径（启动 prepare + 收敛轮、退出 flush）的总预算；同一次调用里的所有 git 子进程共享它 |
+| `sync.timeoutMs` | `20000` | ⭐ 手动命令的预算，用户正在显式等待（`/memory sync pull` / `push` / `status`） |
 
 headless 会话默认落在 `<项目记忆目录>/sessions/` —— 在项目记忆目录里，不在你的工作副本里。
 
@@ -197,7 +218,101 @@ pi-memory 没有自己的包级开关 —— `memory.json` 里原来的顶层 `e
 { "packages": [{ "source": "npm:@yandy0725/pi-memory", "extensions": [] }] }
 ```
 
-项目条目会替换个人条目，因此该项目不会加载本扩展。全局禁用：`pi remove npm:@yandy0725/pi-memory`，或用 `pi config` 关闭该包的资源（项目 scope 会写成 `autoload: false` + `extensions: ["-index.ts"]`）。扩展保持加载时，仍可用模块级开关（`autoSurfacing.enabled` / `extractMemories.enabled`）单独关掉某个行为。
+项目条目会替换个人条目，因此该项目不会加载本扩展。全局禁用：`pi remove npm:@yandy0725/pi-memory`，或用 `pi config` 关闭该包的资源（项目 scope 会写成 `autoload: false` + `extensions: ["-index.ts"]`）。扩展保持加载时，仍可用模块级开关（`autoSurfacing.enabled` / `extractMemories.enabled` / `sync.enabled`）单独关掉某个行为。
+
+## 跨设备同步
+
+pi-memory 可以把一个项目的记忆 entry 复制到**一个 git 远端**，同一仓库在另一台机器上打开时落到同一批记忆上。它**默认关闭** —— 同步会把记忆写到远端，这笔代价必须由用户显式承担（同 `extractMemories`）。
+
+### 配置即初始化：没有 `/memory sync init`
+
+1. 远端仓库由你自己准备（**空仓库可以**），并确保 pi 运行环境里的 `git` 能非交互地 `clone` / `push` 它 —— SSH key、credential helper、URL 里的 token，用你现有那套即可。pi-memory 自己**不保存任何凭据**、也从不提示输入；它只调用 `PATH` 上的 `git`。**私有**远端的预期用法：仓库与访问权限都由你自己开通。
+2. 在 `memory.json` 里指向它：
+
+```json
+{ "sync": { "enabled": true, "remote": "git@github.com:you/simple-memory.git" } }
+```
+
+3. 启动一个会话。带这份配置的第一次 `session_start` 会**自动初始化**：把远端 clone 到 `<memoryDir>/.sync/repo`，并写出这个项目的首份基线。这里刻意**没有 `/memory sync init`** 命令 —— 它第一次执行可能是一次慢 clone，而「敲了却没生效」又多一个要排查的状态（URL 写错？远端连不上？），并不比改一行配置省事。
+
+「origin 是真相来源」派生的规则：
+
+- **初始化之后，暂存 clone 的 `origin` 才是权威**，不是 `sync.remote`。之后把 `sync.remote` 留空，同步照常工作。
+- **配置 remote 与 `origin` 不一致是非致命的**：每个会话一条错误提醒（`sync.remote differs from the initialized origin; continuing to use origin`），`/memory sync status` 两行并报，之后每一轮仍按 `origin` 走。不禁用同步、不碰本地记忆。真要改用它：`/memory sync remote <url>`。
+- **首次初始化之前** `sync.enabled: true` + 空 `sync.remote` 才是配置错误（同步报不可用，其余记忆功能照常）。初始化之后空 `remote` 不再是错误。
+- `enabled`、`pullOnStart`、`pushOnWrite` 按**类型**校验，不看真值：`"enabled": "false"` 会报成 `sync is disabled because …`，绝不会被默默读成开。
+- 初始化失败（没有 `git`、断网、URL 写错、没有权限）一律**非致命**：会话只用本地记忆继续跑，一条可读的错误提醒解释原因。修好之后，下次会话启动 —— 或一次显式 `/memory sync pull` / `push` —— 会重走同一条幂等的初始化。
+- 若 `<memoryDir>` 自己就是 git 仓库：它的 remote 与目标 URL **相同**时初始化**拒绝**（两个写入者推同一个远端是丢数据的标准姿势）；指向别处只给一条 warning —— 暂存 clone 是独立的，绝不动你自己的仓库。
+
+### 同步范围与布局
+
+只有**当前项目**的 entry 文件参与同步：`<memoryDir>/git/<project>/` 下能解析成 v2 entry 的扁平 `*.md`。一个远端镜像整个记忆根（`git/<project-key>/…`），但一次会话只同步自己所在的那个项目；其他项目在各自的会话里同步。
+
+| 路径 | 是否同步 | 原因 |
+|---|---|---|
+| 当前项目的 entry `*.md` | **是** | 记忆本身 |
+| `MEMORY.md` | 否 | 本地派生文件，pull 后从磁盘重建；手写的标题与分组留在所在设备 |
+| `.lock` | 否 | 跨进程锁永不自动回收；同步过去等于在另一台设备上造一把假死锁 |
+| `.backups/` | 否 | 本地回滚点；同步会让体积在设备间乘倍 |
+| `sessions/` | 否 | headless 会话转录：体积大，且是本机执行痕迹。因此 `memory search scope=sessions` 只搜得到本机历史 |
+| `.dream-meta.json` | 否 | 「上次 dream」按设备本地更合理（每台机器各自累计会话数） |
+| `<memoryDir>/local/**` | 否 | 非 git 项目在 v1 不复制 |
+| `<memoryDir>/.sync/**` | 否 | 本功能自己的状态 |
+
+```
+<memoryDir>/                     例如 ~/.local/share/simple-memory
+  .sync/                         同步状态 —— 只在开启同步后才创建
+    device.json                  { id, hostname, createdAt }：每台设备自己的身份，永不同步
+    repo/                        暂存 clone（工作树 + .git）—— 全部传输通道都在这里
+    state/<project-key>.json     这个项目的基线 manifest（两侧上次达成一致的状态）
+    sync.lock                    根级跨进程锁（传输段与发布段各取一次）
+  git/<project>/                 你的记忆：这里不加 .git，也不写别的东西
+  local/<project>/               永不同步
+```
+
+`.sync` 在项目目录的**上一层**而不是里面：记忆目录保持干净，而所有扫描都会跳过它（点开头的目录不算 entry）。根级 `sync.lock` 与上面那个项目 `.lock` 是**两把不同的锁**：它按段持有 —— 传输段一次 `fetch`、发布段一次 `push` —— 绝不整轮持有。一旦被遗弃，此后每一轮同步都会失败并给出可操作的错误 —— `/memory sync unlock` 是唯一被认可的清除入口。
+
+### 生命周期
+
+```
+session_start
+  1. 配置 + 模型 + 记忆目录
+  2. 同步：prepare（检查暂存 clone；首次使用或缺基线时做初始化）
+     —— 无论 pullOnStart 是否开启，这一步都跑
+  3. pullOnStart === true → 一轮 push（收敛 + 补推），排在索引值被选定之前
+  4. 确定索引值（startup/new 读磁盘；resume/fork/reload 用 transcript 的录制值）
+
+每一次成功的记忆写入
+  → core 去抖：标脏，从第一次写入起算 pushDebounceMs 静默期后排一次 push
+
+session_shutdown
+  → 不看去抖，立刻 flush 一次，上限 sync.autoTimeoutMs
+```
+
+- **一轮 push 就是完整的一次收敛**：传输段（fetch）→ 对基线做三方差集并应用（快照、落盘、重建索引）→ 发布段。所以启动那一轮既把别的设备写的东西拉下来，也把上个会话没推出去的补推上去。这也正是「一轮 push」而不是「先 pull 再 push」的原因：进程内的脏标记只认得**本进程**写过的内容。
+- **`pullOnStart: false` 仍会 prepare** —— 只是永不自动 fetch/pull/push。首次初始化与「上次初始化失败」的恢复仍然发生在会话启动时。
+- **写入触发**：每一次成功的 entry 写入（`memory` 工具、一整轮 `/dream`、extract 的落盘）都会给去抖上弦。`pushOnWrite: false` 装的是空转触发器 —— 不自动发布任何东西，手动命令照常可用。
+- **退出兜底**：即使去抖还没到点也 flush 一次，这一轮的上限是 `sync.autoTimeoutMs`；在途等待的上限仍是既有写入用的 `lock.timeoutMs`。flush 失败只产生一条 `Memory sync flush failed: … local changes will be retried at the next session start.` —— 内容仍在本地，下一轮就会补推：下次会话启动（`pullOnStart` 默认开启）或下一次写入的去抖推送。若 `pushOnWrite` 与 `pullOnStart` 都关了，用 `/memory sync push`。
+- **录制索引（已知语义，不是 bug）**：`resume` / `fork` / `reload` 冻结 transcript 里录制的索引值。启动收敛照样跑、磁盘照样更新，但同步来的记忆**不会**出现在本会话的 `memory_index` 里，直到下一次 compaction（或下一个会话）。`/memory sync status` 的最后一行会说明这一点。
+
+### 命令
+
+```
+/memory sync              — 状态（等同 `/memory sync status`）；严格 dry-run
+/memory sync pull         — 把远端变更收敛到磁盘并重建索引；不发布
+/memory sync push         — 先收敛再发布
+/memory sync remote <url> — 把暂存 clone 的 origin 改到 <url>，并重置这个项目的基线
+/memory sync unlock       — 清除遗留的 .sync/sync.lock（会先要求确认）
+```
+
+`status` 是**严格 dry-run**：它算出与真跑一轮完全相同的三方差集，但不 clone、不初始化、不快照、不写基线、不改任何记忆文件（它的 `git fetch` 只动 `.sync/repo` 内的传输元数据）。报告内容：`Configured` / `Initialized`、`Origin` 与 `Configured remote`、`Branch`、`Device`、本地目录 → 远端 key 的映射、基线 revision、`Ahead` / `Behind` / `Conflicts` 文件清单、`Rejected`（带原因）、`Unparsable local`（既不算 entry、也不能安全当删除的文件，因此原地不动）、`Out of scope remote`（远端里不属于本项目 entry 的路径 —— 例如有人手工推了一个根 `MEMORY.md`）以及 `Errors`。
+
+`remote <url>` 是改 origin 的唯一入口：
+
+- 它会先关闸拒绝新的同步活动（再敲一次 `/memory sync remote` 会得到 `sync remote change is already in progress`），排空已登记的轮次，然后**持久失效本项目的基线**（删掉 `state/<project-key>.json`），再对新 origin 重跑一遍准备。基线缺失是**安全的空基线**：它表示「两侧还没达成过一致」，绝不是「用户把东西都删了」。
+- 因为基线为空，对新远端的第一轮可能看到同一条记忆两侧内容不同。**两份都保留**：`modified` 较新的那份留在原路径（时间相同则比内容 hash），另一份变成一条正常 entry，`name` 加上 ` (冲突 <date> <sha6>)` 后缀。后缀只由内容派生，所以两台设备各自解同一次冲突会写出**同一个**文件、收敛成一份，不会越同步越多；后续由 `/dream` 合并重复。
+- `memory.json` **绝不会被改写**（这一层没有配置写入能力）—— 通知里会明说。想让新地址成为下次启动的配置默认值，请自己改文件。
+- 首次初始化之前没有 origin 可改：它会告诉你改 `memory.json` 里的 `sync.remote`。
 
 ## 模型配置
 
@@ -222,11 +337,13 @@ pi-memory 没有自己的包级开关 —— `memory.json` 里原来的顶层 `e
 
 | 事件 | pi-memory 做什么 |
 |---|---|
-| `session_start` | 加载配置 → 校验必需模型（失败即什么都不初始化）→ 解析记忆目录 → **确定索引值并冻结**（`startup`/`new` 读磁盘；`resume`/`fork`/`reload` 重放 transcript 取录制值）→ 注册 `memory` 工具（仅首次，5 个 action）→ 重建清单缓存 → dream 提醒检查 |
+| `session_start` | 加载配置 → 校验必需模型（失败即什么都不初始化）→ 解析记忆目录 → **准备跨设备同步**（首次使用时自动初始化，即使 `pullOnStart: false` 也照做）→ `pullOnStart` 开启时跑一轮收敛（一轮 push）→ **确定索引值并冻结**（`startup`/`new` 读磁盘；`resume`/`fork`/`reload` 重放 transcript 取录制值）→ 注册 `memory` 工具（仅首次，5 个 action）→ 重建清单缓存 → dream 提醒检查 |
 | `before_agent_start` | 把冻结值写进 `sections["memory_index"]`（**每一轮、无条件**），然后做 auto-surfacing（主会话且非子 agent） |
 | `agent_end` | `extractMemories.enabled` 开启时触发异步 extract；写入成功通知 `Extracted N memories.`，失败通知 `Extract failed: …`（每会话一次） |
 | `session_compact` | 清空已注入集合，**并从磁盘重读索引** —— 会话内唯一的刷新点 |
-| `session_shutdown` | 等在途写入收尾（上限 `lock.timeoutMs`），避免退出时留下 stale 的 `.lock` |
+| `session_shutdown` | 把待发布的同步推送 flush 一次（上限 `sync.autoTimeoutMs`），并等在途写入收尾（上限 `lock.timeoutMs`），因此退出既不会留下 stale 的 `.lock`，也不会留下一批只到过本地磁盘的记忆 |
+
+每一次成功的记忆写入还会给同步的写入触发上弦，一串写入因此合并成一轮去抖推送。详见[跨设备同步](#跨设备同步)。
 
 ### 为什么索引要冻结
 
@@ -312,8 +429,13 @@ memory(action: "add" | "replace" | "remove" | "list" | "search",
 ### `/memory`
 
 ```
-/memory          — 查看状态
-/memory unlock   — 清除遗留的 .lock（会先要求确认）
+/memory                      — 查看状态
+/memory unlock               — 清除遗留的 .lock（会先要求确认）
+/memory sync                 — 同步状态（等同 `/memory sync status`）；严格 dry-run
+/memory sync pull            — 把远端变更收敛到磁盘并重建索引
+/memory sync push            — 先收敛再发布
+/memory sync remote <url>    — 改暂存 clone 的 origin，并重置这个项目的基线
+/memory sync unlock          — 清除遗留的 .sync/sync.lock（会先要求确认）
 ```
 
 状态输出：
@@ -326,12 +448,14 @@ Entries: 37
 Modules: dream=on(provider/model-a) extractMemories=off autoSurfacing=on(provider/model-b)
 Last dream: 2026-10-01T22:10:04.882Z
 Lock: free
+Sync: ready
 ```
 
 - `Index` 用**写入**口径（`memIndexMax*`），并报告索引里有多少非空行解析不出（`# Memory Index` 头行与手写标题会计入）。CRLF（以及单独的 CR）行尾在解析前就被归一为 LF，下一次写入也一律输出 LF，因此被 Windows 编辑器改过行尾的 `MEMORY.md` **不会**推高这个计数。注入侧同样做归一：CRLF 文件不会把 `\r` 送进 system prompt。
 - `Inject` 用**注入**口径（`memIndexInjectMax*`），统计窗口内的行数与字节数 —— 即真正会进 `memory_index` section 的索引文本（截断标记本身不计入）。它与真正注入的值由同一份窗口代码算出来，不可能漂移。注意两行的口径不同：`Index` 数的是**非空**行，`Inject` 数的是窗口内的**全部**行，所以规范索引（LF 行尾、以换行结尾、头部后有且仅有一个空行）下 `Inject` 会比 `Index` 多一行而字节数相同。system prompt 里的值是**会话内冻结**的（见[为什么索引是冻结的](#为什么索引是冻结的)）：`session_start` 之后写入的记忆会立刻出现在 `Index`，但要等 compaction 或下一个会话才出现在 `Inject`。
 - `Modules` 报三个模型驱动功能的激活状态：`on(<生效模型>)` / `off`。生效模型 = 该任务自己的 `model`，没有则用 `defaults.model`。`dream` 没有独立开关 —— 健康会话里它始终可用。
 - `Lock` 有三种：`free`、`held by <op> (pid N on <hostname>, started <ISO>)`、`unreadable — run /memory unlock`。`/memory unlock` 的确认框会显示同一行持有者信息。
+- `Sync` 有三种：`ready`（engine 已就绪）、`not initialized`（runtime 存在但准备还没完成 —— 跑一次 `/memory sync pull` 或 `push` 可重试）、`disabled`（没有 runtime）。这一行只在开启同步或发生降级时追加，所以默认安装仍然只打上面七行；同步错误作为 `- <error>` 行跟在它后面。详见[跨设备同步](#跨设备同步)。
 - 必需模型缺失或解析不出时不初始化任何东西，`/memory` 报 `Memory: misconfigured` + `Dir: not initialized` + 每行一条 `- <error>`；同样的错误在 session_start 时以 error 通知出现。
 
 ### `/dream`
@@ -399,5 +523,8 @@ pi-memory 在 Windows 上原生可用，不需要 WSL。
 | extract 写入了记忆 | `Extracted <N> memory.` / `Extracted <N> memories.` |
 | extract 失败 | `Extract failed: <message>` —— 每会话最多一次 |
 | `/dream` 结束 / 失败 | headless agent 的摘要 / `Dream failed: <message>` |
+| 启动时或手动命令同步失败 | `pi-memory sync error:` + 每行一条 `- <error>` / `Memory sync pull failed: <reason>` / `Memory sync push failed: …` / `Memory sync remote failed: …` / `Memory sync status failed: …` |
+| 手动同步命令成功 | `Memory sync pull:` / `Memory sync push:` / `Memory sync remote: <url>`，后面跟该轮的拉取 / 推送 / 冲突 / 拒收清单 |
+| 退出 flush 失败 | `Memory sync flush failed: <reason>; local changes will be retried at the next session start.` |
 
 headless 会话（`hasUI === false`）不发任何通知。
