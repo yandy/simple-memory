@@ -18,8 +18,8 @@ import type { DeviceIdentity } from "./device.js";
 import { type SyncConflict, diffThreeWay, type SyncDiff } from "./diff.js";
 import { sha256Hex } from "./hash.js";
 import { emptyManifest, MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "./manifest.js";
-import { type LocalScan, scanLocalEntries } from "./scan.js";
 import { remotePrefixFromKey } from "./paths.js";
+import { type LocalScan, scanLocalEntries } from "./scan.js";
 import { createSyncScheduler, type SyncScheduler } from "./scheduler.js";
 import type { SyncFileInfo, SyncFileSet } from "./types.js";
 
@@ -212,11 +212,11 @@ function describeError(err: unknown): string {
 }
 
 /**
- * 时间预算的入口兵底：只认「有限的正数」，其余一律退回 `fallback`。
+ * 时间预算的入口兜底：只认「有限的正数」，其余一律退回 `fallback`。
  *
  * 配置合并那一层不校验类型，`deepMerge` 还会把用户写的 `null` 原样带进来；而 `null` / `NaN` / `0`
  * 一路走到子进程的 `timeout` 上等于**无限等** —— 一次远端挂死就把「任何同步失败都不得阻塞会话」
- * 这条铁律桶穿（自动拉取是被 await 在会话启动路径上的）。所以预算只在入口这里认一次，
+ * 这条铁律捅穿（自动拉取是被 await 在会话启动路径上的）。所以预算只在入口这里认一次，
  * 里面每一层拿到的都已经是个能用的数。
  */
 function positiveMs(value: unknown, fallback: number): number {
@@ -507,7 +507,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 */
 	const activeSignals = new Set<AbortController>();
 
-	/** 跑一段会碰远端的工作：给它一个 signal，结束时从账本里摘掉（无论成败失败）。 */
+	/** 跑一段会碰远端的工作：给它一个 signal，结束时从账本里摘掉（无论成败）。 */
 	async function withAbortSignal<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
 		const controller = new AbortController();
 		activeSignals.add(controller);

@@ -108,9 +108,10 @@ function keepsFingerprint(file: string, fingerprint: string): boolean {
  * 做法：指纹永远拼在主干之后，主干被截断时就从末尾逐个码点回退，直到派生结果重新以指纹结尾。
  *
  * 回退用二分找起点（超长 name 上逐码点回退会退化成平方级）。二分的前提是 `fits` 对 `keep` 单调
- * （放得下的前缀越长越可能放不下），而它确实单调：`fits` 只看**结尾**是不是指纹，主干头部发生什么
- * （例如 `con.` 这类保留名让 `entryFileName` 补一个 `_` 前缀）都不影响结尾；`build` 的输入又恒以
- * `-<6 位十六进制>` 结尾，所以「截断后仍以指纹结尾」只取决于截断点。二分只依赖入参，因此是确定性的。
+ * （能放下的前缀越短越宽松），而它确实单调：**`build(keep)` 的字节长度对 `keep` 单调不减** ——
+ * 多保留一个码点只可能让它更长（空白连写归一会让长度不变，绝不会变短），而 `entryFileName` 截断时
+ * 保留的是**前缀**，所以「截断完还是不是以指纹结尾」只取决于 `build(keep)` 有没有超过上限。
+ * 二分只依赖入参，因此是确定性的。
  */
 function fileNameEndingWith(head: string, fingerprint: string): string {
 	const points = Array.from(head);

@@ -71,7 +71,7 @@ interface RunOptions {
 }
 
 /**
- * git 子进程的环境：**绍不向用户要凭据**。
+ * git 子进程的环境：**绝不向用户要凭据**。
  *
  * 同步是挂在会话里跑的，而 git 的凭据提示会直接打进用户正在用的终端：
  * `GIT_TERMINAL_PROMPT=0` 关掉 git 自己的提示，`ssh -oBatchMode=yes` 关掉 ssh 的 passphrase 提示 ——
@@ -531,7 +531,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 			try {
 				// 空仓库在现代 git 上是 clone **成功**的（只留一句 warning，本地分支 unborn），
 				// 所以 clone 失败基本等于「远端不可达 / 没有权限」。仍然退回本地 init：
-				// 紧跟其后的 push 会把不可达如实报出来，符合「init 只由显式命令触发，失败要让人看见」。
+				// 紧跟其后的 push 会把不可达如实报出来，符合「init 失败要让人看见」的约定。
 				await runGit(["clone", "--quiet", remote, repoDir], o);
 			} catch (cloneErr) {
 				// 不可达时紧随其后的 push 会以同一个远端为对象再报一次（同样带着远端地址，
