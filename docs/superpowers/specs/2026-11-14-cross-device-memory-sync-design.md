@@ -558,7 +558,7 @@ pi 的 `memory.json` / dsh 的行 `config:` 读出后交给 `mergeConfig`）：
 		"enabled": false,        // opt-in：自动往远端写数据必须由用户显式承担（同 extractMemories）
 		"remote": "",            // git 远端 URL：只在**未初始化**时用于自动初始化；已初始化后可留空（origin 才是真相来源，§6.12）
 		"branch": "main",
-		"pullOnStart": true,     // 会话开始时自动初始化（必要时）+ 一轮 push（收敛兼补推，§6.8）
+		"pullOnStart": true,     // 启动时自动初始化 + 一轮 push；push 含 pull，键名不改（§6.8）
 		"pushOnWrite": true,     // 写入后去抖自动 push（U7）
 		"pushDebounceMs": 5000,  // 写触发的静默期；一轮 dream = 一次推送
 		"autoTimeoutMs": 5000,   // 自动路径（自动初始化 + 启动收敛 / 兜底推）的总预算（一次调用内共享）
@@ -698,7 +698,7 @@ pi 在 `resume` / `fork` / `reload` 三种 reason 下**刻意**用 transcript �
 | 6 | 大小写 / Unicode 规范化碰撞（mac ↔ Windows 写穿同一 inode） | apply 前整批碰撞检测，命中就跳过 + 报告，不静默覆盖（§6.6、§6.11） | 我的判断 |
 | 7 | pi 的 push 按哪些 `reason` 触发；§6.7 自相矛盾（push 到底改不改本地） | 不按 `reason` 分支（切会话同样是换设备的信号）；矛盾修掉 —— push 轮先收敛，**会**改本地，因此**要**快照，仅当远端未动时零写入不快照（§6.7、§6.8） | 我的判断 |
 | 8 | `resume`/`fork`/`reload` 时 pull 结果进不进本会话 prompt | 不进（录制值不动，prompt cache 是用户契约）；作为已知语义写进文档与 `status`（§6.13） | 我的判断 |
-| 9 | 自动 pull 的时间预算与退避 | 两档预算：自动 `autoTimeoutMs` 5s、手动 `timeoutMs` 20s；不做退避状态（失败即跳过，下次会话再试）（§6.9） | 我的判断 |
+| 9 | 自动启动（初始化 + 收敛）的时间预算与退避 | 两档预算：自动 `autoTimeoutMs` 5s、手动 `timeoutMs` 20s；不做退避状态（失败即跳过，下次会话再试）。2026-11-15 细化：prepare 与启动 push 共用这份总预算（§6.9） | 我的判断 |
 | 10 | 根锁罩住整轮（含网络）→ 同机多项目互相跳过 | 锁拆两段（传输段持根锁、应用段持项目逻辑锁），两把锁永不嵌套 → 不可能成环（§6.7） | 我的判断 |
 | 11 | 远端布局 key 用平台相关的 `projectDirName()` 会静默分叉 | 远端 key 恒按 **POSIX** 规则派生（`remoteProjectKey`），与本地平台解耦；映射现算，`status` 报出（§6.1） | 我的判断 |
 | 12 | `list()` 的 hash 算法是不是端口契约 | **是**：sha256 写进端口注释，换算责任在 backend（§6.5） | 我的判断 |

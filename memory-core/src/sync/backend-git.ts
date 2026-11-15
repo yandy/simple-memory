@@ -2,10 +2,8 @@ import { type ExecFileOptionsWithBufferEncoding, execFile } from "node:child_pro
 import { randomBytes } from "node:crypto";
 import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { withLock } from "../store/fs-lock.js";
-import { normalizeRemoteUrl } from "../store/paths.js";
 import {
 	NonFastForwardError,
 	type RemoteView,
@@ -16,7 +14,7 @@ import {
 	type SyncScope,
 } from "./backend.js";
 import { sha256Hex } from "./hash.js";
-import { syncLockPath } from "./paths.js";
+import { sameSyncRemote, syncLockPath } from "./paths.js";
 
 /**
  * 端口的 git 实现：一个**暂存 clone** 当传输通道。
@@ -565,34 +563,6 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 	}
 
 	/**
-	 * 两个 remote 是不是「同一个地方」。
-	 *
-	 * 先用 `normalizeRemoteUrl`（http(s)/ssh/git 与 scp 写法都归一成 `host/path`，大小写、尾斜杠、
-	 * `.git` 后缀的差异都抹平）—— 它是仓内既有的**单一口径**，项目身份也靠它，两边必须一致。
-	 * 它认不出的（`file://`、本地绝对路径、win32 盘符）按 **resolved 字节**比 —— 与 git 自己对本地
-	 * 路径的解释同口径（相对路径按进程 cwd 解析）。比不出来宁可归成「不同」（多一条 warning），
-	 * 也不要拿一个猜测去拒绝用户初始化。
-	 */
-	function sameRemoteTarget(left: string, right: string): boolean {
-		return remoteCompareKey(left) === remoteCompareKey(right);
-	}
-
-	function remoteCompareKey(url: string): string {
-		const normalized = normalizeRemoteUrl(url);
-		if (normalized !== null) return normalized;
-		const raw = url.trim();
-		if (/^file:\/\//i.test(raw)) {
-			// `fileURLToPath` 会顺手把 win32 的 `file:///C:/x` 变成盘符路径；畸形 URL 退回去掉 scheme 的字节
-			try {
-				return resolve(fileURLToPath(raw));
-			} catch {
-				return resolve(raw.replace(/^file:\/\//i, ""));
-			}
-		}
-		return resolve(raw);
-	}
-
-	/**
 	 * 读用户自己那个仓库的 remote 列表（`<name> → <url>`）。只读 `git config`，不发网络请求。
 	 * 口径同 `store/paths.ts` 读 remote 的那一处：`--get-regexp` 无匹配时退出码是 **1**，那是
 	 * 「一个 remote 都没有」的正常出口，不是故障。
@@ -646,7 +616,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		}
 
 		const remotes = await readUserRemotes(o);
-		const clash = remotes.find((item) => sameRemoteTarget(item.url, remote));
+		const clash = remotes.find((item) => sameSyncRemote(item.url, remote));
 		if (clash !== undefined) {
 			// 文案里的 URL 必须过一遍脏敏：`https://user:token@host/...` 是 git 官方支持的凭据写法，
 			// 而这条错误会被宿主记进日志、被人贴进 issue。

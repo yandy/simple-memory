@@ -227,6 +227,7 @@ export {
 	remotePrefix,
 	remotePrefixFromKey,
 	remoteProjectKey,
+	sameSyncRemote,
 	syncLockPath,
 	syncRootPath,
 } from "./sync/paths.js";

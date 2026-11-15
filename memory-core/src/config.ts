@@ -74,7 +74,10 @@ export interface SyncConfig {
 	remote: string;
 	/** 远端的跟踪分支名。 */
 	branch: string;
-	/** 会话开始时自动拉取远端变更。同样是 `=== true` 才算开（见 `enabled`）。 */
+	/**
+	 * 会话开始时自动收敛远端变更并补推（一轮 push 同时包含 pull 与发布）。
+	 * 键名保留既有配置契约，不因为启动入口是 push 就改名；同样是 `=== true` 才算开（见 `enabled`）。
+	 */
 	pullOnStart: boolean;
 	/** 写入后去抖自动发布。同样是 `=== true` 才算开（见 `enabled`）。 */
 	pushOnWrite: boolean;
@@ -281,8 +284,12 @@ export function syncConfigErrors(cfg: MemoryConfig, options: { initialized?: boo
 	// 不是明确的 true 就到此为止：开关没开，它管辖的键不必逼用户先修（与消费方 `=== true` 同口径）。
 	if (sync.enabled !== true) return errors;
 
-	// 非字符串一律报错；initialized 只豁免空字符串。先查类型，避免 `.trim()` 把校验变成一次崩溃。
-	if (typeof sync.remote !== "string" || (options.initialized !== true && sync.remote.trim() === "")) {
+	// 非字符串是类型错误，不是「空」；initialized 只豁免空字符串。先查类型，避免 `.trim()` 把校验变成崩溃。
+	if (typeof sync.remote !== "string") {
+		errors.push(
+			`sync is enabled but "sync.remote" must be a string (got ${String(sync.remote)}) — set a remote URL or unset "sync.enabled"`,
+		);
+	} else if (options.initialized !== true && sync.remote.trim() === "") {
 		errors.push('sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"');
 	}
 	if (typeof sync.branch !== "string" || sync.branch.trim() === "") {

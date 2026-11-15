@@ -273,7 +273,7 @@ describe("sync 配置", () => {
 		expect(
 			syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true, remote: 42 } }), { initialized: true }),
 		).toEqual([
-			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
+			'sync is enabled but "sync.remote" must be a string (got 42) — set a remote URL or unset "sync.enabled"',
 		]);
 		// 开关本身仍然是无条件校验的：`initialized` 只放宽 remote，不放宽同意边界
 		expect(
@@ -319,13 +319,13 @@ describe("sync 配置", () => {
 		]);
 	});
 
-	// 非字符串的远端同样按「空」报，而不是在 `.trim()` 上抛错。
-	it("remote 不是字符串时按空报错，不抛 TypeError", () => {
+	// 非字符串是类型错误，不是「空字符串」：报错要指出真实原因，同时不在 `.trim()` 上抛错。
+	it("remote 不是字符串时按类型报错，不抛 TypeError", () => {
 		const cfg = mergeConfig(DEFAULT_CONFIG, {
 			sync: { enabled: true, remote: 42, branch: "main" },
 		});
 		expect(syncConfigErrors(cfg)).toEqual([
-			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
+			'sync is enabled but "sync.remote" must be a string (got 42) — set a remote URL or unset "sync.enabled"',
 		]);
 	});
 

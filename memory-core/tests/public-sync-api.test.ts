@@ -27,6 +27,7 @@ import {
 	resolveConflict,
 	scanLocalEntries,
 	sha256Hex,
+	sameSyncRemote,
 	syncLockPath,
 	syncRootPath,
 	writeManifest,
@@ -109,6 +110,13 @@ describe("公开出口上的同步符号", () => {
 		// 非快进是一个**可识别的类型**（引擎靠 `instanceof` 决定重跑整轮），所以它必须是类而不是文案
 		expect(new NonFastForwardError("x")).toBeInstanceOf(Error);
 		expect(new NonFastForwardError("x").name).toBe("NonFastForwardError");
+	});
+
+	it("远端等价比较只有一份公开实现，覆盖 URL、scp 与本地路径", () => {
+		expect(sameSyncRemote("https://github.com/o/r.git", "git@github.com:o/r.git")).toBe(true);
+		expect(sameSyncRemote("https://github.com/o/r", "git@github.com:o/r.git")).toBe(true);
+		expect(sameSyncRemote("file:///tmp/memory-remote.git", "/tmp/memory-remote.git")).toBe(true);
+		expect(sameSyncRemote("https://github.com/o/r.git", "https://github.com/o/other.git")).toBe(false);
 	});
 
 	it("manifest transport 的构造与匹配也从公开出口提供", async () => {

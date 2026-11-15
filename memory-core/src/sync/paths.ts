@@ -1,5 +1,6 @@
-import { join } from "node:path";
-import { projectDirName } from "../store/paths.js";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { normalizeRemoteUrl, projectDirName } from "../store/paths.js";
 
 /**
  * 远端的项目布局恒用 POSIX 命名规则，与宿主平台无关。
@@ -15,6 +16,30 @@ export function remoteProjectKey(identityKey: string): string {
 	// `NodeJS.Platform` 没有 `posix` 这个值，而 `projectDirName` 只在 win32 上分支 ——
 	// 取任一非 win32 值（与 `store/paths.ts` 的测试同用 `linux`）得到的就是 POSIX 规则。
 	return projectDirName(identityKey, { platform: "linux" });
+}
+
+/**
+ * 两个 remote 是否指向「同一个地方」。
+ *
+ * `normalizeRemoteUrl` 统一处理 http(s)/ssh/git 与 scp 写法；`file://` 与本地路径按 resolved 字节比较。
+ * 这是初始化共存检查与宿主配置漂移提示共用的唯一实现：两份比较器一旦漂移，一边会误拒初始化，
+ * 另一边却可能连提醒都不给。比不出来宁可归成「不同」（多一条 warning），不要拿猜测去拒绝用户。
+ */
+export function sameSyncRemote(left: string, right: string): boolean {
+	const key = (value: string): string => {
+		const normalized = normalizeRemoteUrl(value);
+		if (normalized !== null) return `url:${normalized}`;
+		const raw = value.trim();
+		if (/^file:\/\//i.test(raw)) {
+			try {
+				return `path:${resolve(fileURLToPath(raw))}`;
+			} catch {
+				return `path:${resolve(raw.replace(/^file:\/\//i, ""))}`;
+			}
+		}
+		return `path:${resolve(raw)}`;
+	};
+	return key(left) === key(right);
 }
 
 /**
