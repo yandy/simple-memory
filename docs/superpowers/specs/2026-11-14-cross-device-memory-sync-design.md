@@ -632,15 +632,21 @@ pi/dsh 也没有改用户配置文件的既有能力，而初始化收到的 URL
 
 1. `ready()` 为 true → 什么都不做（**幂等**：已初始化时不得重做一次会改变远端历史的初始化）。
 2. 否则读 `sync.remote`：为空 → 不初始化 + 一条非致命提示"在 `memory.json` 里设 `sync.remote`"。
-3. `git clone <remote>`（远端是空仓库时 `git init` + `remote add` + 建 `<branch>`）。这是最长的一步，
-   所以：不在根级 sync 锁内跑（否则期间每一次 `MemoryStore.save` 都排队），且受 `autoTimeoutMs` 约束。
-4. 写 `device.json`（uuid + hostname）。
-5. **接管检查**：若发现 `<root>/.git` 存在 —— 用户自己把记忆根做成了仓库（§4.9）：
+3. **接管检查（必须在任何 clone / 设备写入之前）**：若发现 `<root>/.git` 存在 —— 用户自己把记忆根
+   做成了仓库（§4.9）：
    - 它的 remote 与我们要配的**相同** → **拒绝**初始化并解释（两个写入者推同一个远端是丢数据的
-     标准姿势）；连 `.sync/repo` 也不建。
-   - **不同** → 允许，但带一条 warning（各推各自的地方，互不干扰；不动用户自己的仓库）。
+     标准姿势）；`.sync/repo` 与 `device.json` **都不建**，`ready()` 保持 false。
+   - **不同** → 允许（一条 warning：各推各自的地方，互不干扰；不动用户自己的仓库），继续第 4 步。
    *（我的判断：分界按"是否同一个远端"划，因为那才是真正会互相覆盖的情形。）* 比较用归一化后的
-   remote（本地绝对路径按 resolved 字节）；提示里不泄露 URL 中的凭据。
+   remote（本地绝对路径按 resolved 字节），只读 `<root>/.git` 的 origin，不发网络请求；提示里不泄露
+   URL 中的凭据。
+
+   这一步只能排在 clone 之前：clone 一旦跑过，`.sync/repo` 就已经在磁盘上，`ready()` 随即变 true ——
+   "拒绝了初始化、却已经把 clone 建好"会让拒绝分支变成假话（同一份 origin 仍然是两个写入者，
+   下一次启动还会按 origin 继续同步）。所以拒绝路径上不得留下任何可被认成"已初始化"的产物。
+4. `git clone <remote>`（远端是空仓库时 `git init` + `remote add` + 建 `<branch>`）。这是最长的一步，
+   所以：不在根级 sync 锁内跑（否则期间每一次 `MemoryStore.save` 都排队），且受 `autoTimeoutMs` 约束。
+5. clone 成功**之后**才写 `device.json`（uuid + hostname）：拒绝或 clone 失败时都不留半份设备身份。
 6. 若本地已有记忆：明确告知"与远端同名的条目会按 §6.4 产生带后缀的副本，下次 `/dream` 会合并"。
 7. 初始化交回 `SyncInitResult.revision`（远端真的有的那一个）；首份基线由适配层用
    `emptyManifest()` + 这个 revision 写出。`files` 必须是**空集**：base 为空时，一台空设备拉下全部
