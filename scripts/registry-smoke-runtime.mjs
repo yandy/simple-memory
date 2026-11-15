@@ -35,7 +35,9 @@ const installed = JSON.parse(
 ).version;
 assert.ok(
 	expected.includes(installed),
-	`装上的 @yandy0725/memory-core@${installed} 不在 registry 上满足 ${label} 范围的版本列表里：${expected.join(", ")}`,
+	`装上的 @yandy0725/memory-core@${installed} 不在${
+		source === "workspace" ? "仓内 tarball 声明" : `registry 上满足 ${label} 范围`
+	}的版本列表里：${expected.join(", ")}`,
 );
 
 // 3. 真跑一次读写：解析成功不等于产物可用（漏带 dist、或发布的是空包，都在这一步暴露）。
