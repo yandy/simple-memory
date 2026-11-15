@@ -501,6 +501,31 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(notify.mock.calls.at(-1)?.[0]).toContain("Memory sync pull");
 	});
 
+	it("previews possible conflict copies before the first startup push, and only once per baseline", async () => {
+		const config = memoryConfig({ pullOnStart: true });
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		await store.addEntry({ name: "Existing local memory", description: "local before first sync", body: "keep me" });
+		await enableSync({ pullOnStart: true });
+		const notify = vi.fn((_message: string, _type?: string) => syncEvents.push("conflict-preview"));
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify.mock.calls[0][0]).toContain("deterministic conflict copies");
+		expect(syncEvents.indexOf("conflict-preview")).toBeGreaterThanOrEqual(0);
+		expect(syncEvents.indexOf("conflict-preview")).toBeLessThan(syncEvents.indexOf("push:start"));
+
+		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+		expect(notify).toHaveBeenCalledTimes(1);
+	});
+
 	it("warns once about configured remote drift but keeps publishing to origin", async () => {
 		await enableSync({ pullOnStart: false });
 		const notify = vi.fn();

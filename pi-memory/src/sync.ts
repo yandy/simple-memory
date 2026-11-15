@@ -1,6 +1,5 @@
 import { unlink } from "node:fs/promises";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
 	createGitSyncBackend,
 	createSyncEngine,
@@ -10,10 +9,10 @@ import {
 	type MemoryStore,
 	manifestMatchesTransport,
 	manifestPath,
-	normalizeRemoteUrl,
 	type ProjectIdentity,
 	readManifest,
 	remoteProjectKey,
+	sameSyncRemote,
 	type SyncBackend,
 	type SyncEngine,
 	type SyncInitResult,
@@ -39,24 +38,6 @@ export interface PiSyncRuntime {
 	/** 已初始化后改 origin；先持久失效旧基线并排空旧轮次，再复核当前 origin。 */
 	changeRemote(remote: string, timeoutMs: number): Promise<PrepareResult>;
 	dispose(): void;
-}
-
-/** 与 git backend 相同的本地/URL 比较口径；适配层只用它判断要不要提醒配置漂移。 */
-function sameRemote(left: string, right: string): boolean {
-	const key = (value: string): string => {
-		const normalized = normalizeRemoteUrl(value);
-		if (normalized !== null) return `url:${normalized}`;
-		const raw = value.trim();
-		if (/^file:\/\//i.test(raw)) {
-			try {
-				return `path:${resolve(fileURLToPath(raw))}`;
-			} catch {
-				return `path:${resolve(raw.replace(/^file:\/\//i, ""))}`;
-			}
-		}
-		return `path:${resolve(raw)}`;
-	};
-	return key(left) === key(right);
 }
 
 /** core 已脱敏；这里守住适配层自己的通知边界，不把将来新增错误里的口令带进 UI。 */
@@ -137,7 +118,11 @@ export function renderSyncStatus(report: SyncStatusReport, configuredRemote: str
 			? "Errors: none"
 			: `Errors (${errors.length}):\n${errors.map((error) => `- ${error}`).join("\n")}`,
 	);
-	if (configuredRemote.trim() !== "" && report.remote.trim() !== "" && !sameRemote(configuredRemote, report.remote)) {
+	if (
+		configuredRemote.trim() !== "" &&
+		report.remote.trim() !== "" &&
+		!sameSyncRemote(configuredRemote, report.remote)
+	) {
 		lines.push(
 			'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)',
 		);
@@ -189,7 +174,7 @@ export async function createPiSyncRuntime(options: {
 	if (initialized && remote.trim() !== "") {
 		try {
 			const origin = await backend.getRemote();
-			if (origin !== null && !sameRemote(origin, remote)) {
+			if (origin !== null && !sameSyncRemote(origin, remote)) {
 				errors.push(
 					'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)',
 				);
@@ -293,9 +278,22 @@ export async function createPiSyncRuntime(options: {
 			}
 
 			if (disposed) return disposedResult();
+			const warnings = [...(initializedResult?.warnings ?? [])];
+			if (initializedResult !== null) {
+				const localEntries = await store.listEntries();
+				if (disposed) return disposedResult();
+				if (localEntries.length > 0) {
+					warnings.push(
+						`Memory sync initialized with ${localEntries.length} local ${
+							localEntries.length === 1 ? "entry" : "entries"
+						}; same-named entries with different content may be kept as deterministic conflict copies.`,
+					);
+				}
+			}
+			// 预告读取也可能失败：在它成功之前 engine 一直留在 pending 账本里，catch 才能负责收摊。
+			if (disposed) return disposedResult();
 			pendingEngine = null;
 			runtime.engine = engine;
-			const warnings = initializedResult?.warnings ?? [];
 			const warning = warnings.length > 0 ? warnings.map(errorMessage).join("\n") : undefined;
 			return warning === undefined ? { ok: true, engine } : { ok: true, engine, warning };
 		} catch (error) {

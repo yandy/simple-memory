@@ -355,6 +355,14 @@ export default function (pi: ExtensionAPI) {
 		// 同步配置、init、传输都只是非致命降级。准备与启动收敛全部结束后才选择索引来源：
 		// startup/new 读到同步后的磁盘；resume/fork/reload 仍逐字冻结 transcript 的录制值。
 		const syncErrors: string[] = [];
+		let notifiedSyncErrors = 0;
+		const notifyPendingSyncErrors = (): void => {
+			const pending = syncErrors.slice(notifiedSyncErrors);
+			if (pending.length === 0) return;
+			setSyncError(syncErrors);
+			notifySync(syncUi, `pi-memory sync error:\n${pending.map((error) => `- ${error}`).join("\n")}`);
+			notifiedSyncErrors = syncErrors.length;
+		};
 		try {
 			const identity = await projectIdentity(cwd);
 			if (!isCurrent()) return;
@@ -375,7 +383,11 @@ export default function (pi: ExtensionAPI) {
 				if (!prepared.ok) {
 					syncErrors.push(prepared.reason);
 				} else {
-					if (prepared.warning) syncErrors.push(prepared.warning);
+					if (prepared.warning) {
+						syncErrors.push(prepared.warning);
+						// 首次本地记忆的冲突预告必须发生在任何启动 push 之前，不能等副本已经落盘才说。
+						notifyPendingSyncErrors();
+					}
 					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
 					if (cfg.sync.pullOnStart === true) {
 						const remaining = startupDeadline - Date.now();
@@ -397,16 +409,8 @@ export default function (pi: ExtensionAPI) {
 			syncErrors.push(error instanceof Error ? error.message : String(error));
 		}
 		if (!isCurrent()) return;
-		setSyncError(syncErrors);
-		if (syncError) {
-			notifySync(
-				syncUi,
-				`pi-memory sync error:\n${syncError
-					.split("\n")
-					.map((error) => `- ${error}`)
-					.join("\n")}`,
-			);
-		}
+		// prepare 之后新发生的传输错误按增量通知：早期预告不重复，后续失败也不漏报。
+		notifyPendingSyncErrors();
 
 		// D13 / D14：索引值在整个 session 内**冻结**。resume / fork / reload 必须用 transcript 里的
 		// 录制值 —— 否则被恢复会话的 system prompt 头部会被改写，而 memory_index 是头部的最后一段，

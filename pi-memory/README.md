@@ -235,8 +235,8 @@ remote, so that cost has to be opted into, exactly like `extractMemories`.
 1. Prepare the remote repository yourself (**empty is fine**) and make sure plain `git` in the environment
    where pi runs can `clone` / `push` it non-interactively — SSH key, credential helper, token in the URL,
    whatever your setup already uses. pi-memory stores no credential of its own and never prompts; it shells
-   out to `git` from `PATH`. A **private** remote is the intended default: the repository and its access
-   permissions are yours to provision.
+   out to `git` from `PATH`. A **private** remote is the intended default: you provision both the repository
+   and its access permissions yourself.
 2. Point `memory.json` at it:
 
 ```json
@@ -255,7 +255,7 @@ Rules that follow from "the origin is the source of truth":
 - **Once initialised, the staging clone's `origin` is authoritative**, not `sync.remote`. You may empty
   `sync.remote` afterwards and sync keeps working.
 - **A configured remote that differs from `origin` is non-fatal**: one error notice per session
-  (`sync.remote differs from the initialized origin; continuing to use origin`), `/memory sync status`
+  (`sync.remote differs from the initialized origin; continuing to use origin …`), `/memory sync status`
   prints both values, and every round keeps using `origin`. Nothing is disabled and no local memory is
   touched. Use `/memory sync remote <url>` to actually change it.
 - `sync.enabled: true` with an empty `sync.remote` **before** the first initialisation is a config error
@@ -297,8 +297,8 @@ just the project it is in; other projects sync in their own sessions.
   local/<project>/               never synced
 ```
 
-`.sync` sits **next to** the project tree, not inside it: the memory directory stays clean, and every scan
-skips it (dot-directories are not entries). The root `sync.lock` is a **different lock** from the project
+`.sync` sits at the **memory root**, alongside `git/` and `local/`, not inside any project memory directory:
+the project directories stay clean, and every scan skips it (dot-directories are not entries). The root `sync.lock` is a **different lock** from the project
 `.lock` described above: sync rounds take it per segment — one `fetch` plus origin read in the transport
 segment, one `push` in the publish segment — never for a whole round. Management operations (`init` /
 `setRemote`) wait on the same lock with a bounded timeout and are never nested inside a round's lock.
@@ -329,7 +329,10 @@ session_shutdown
   share one `sync.autoTimeoutMs` deadline; if prepare exhausts it, push is skipped with a nonfatal next-round
   notice instead of starting a 1ms network round.
 - **`pullOnStart: false` still prepares** — it just never fetches, pulls or pushes automatically. First-time
-  initialisation and recovery from a failed one still happen at session start.
+  initialisation and recovery from a failed one still happen at session start. The key keeps its established
+  name: the startup push round includes pulling as well as publishing.
+- **Existing local entries**: when a new baseline is initialised, prepare warns about possible deterministic
+  conflict copies **before any startup push**. The notice is emitted once for that baseline, not on every start.
 - **Writes**: every successful entry write (the `memory` tool, a whole `/dream` round, extract's saves) arms
   the debounce. `pushOnWrite: false` installs a no-op trigger — nothing is published automatically, manual
   commands still work.
@@ -375,9 +378,14 @@ without throwing, so status never presents a stale base as current.
   before it can write into the new one.
 - Because the baseline is empty, the first round against the new remote may see the same memory on both
   sides with different content. **Both are kept**: the newer `modified` stays at the path (ties broken by the
-  content hash), the other becomes a normal entry whose `name` gains ` (冲突 <date> <sha6>)` (the suffix is Chinese in every locale — it is
-  part of the name contract). The suffix depends on content only, so two devices resolving the same conflict
-  write the **same** file and converge instead of multiplying copies; `/dream` merges duplicates afterwards.
+  content hash), the other becomes a normal entry whose `name` gains ` (冲突 <date> <sha6>)` (the suffix is
+  Chinese in every locale — it is part of the name contract). The suffix depends on content only, so two
+  devices resolving the same conflict write the **same** file and converge instead of multiplying copies;
+  `/dream` merges duplicates afterwards.
+- If the new origin is empty, the first publish starts from the staging clone's current HEAD. The new remote
+  can therefore receive the existing **whole memory-root history, including other projects**, not just this
+  project's latest files. Treat changing to an empty origin as a whole-root history migration and inspect the
+  target repository before running it.
 - `memory.json` is **never rewritten** (this layer has no config writer) — the notice says exactly that.
   Edit the file yourself if you want the value to be the configured default on the next start.
 - Before the first initialisation there is no origin to change: it tells you to set `sync.remote` in

@@ -5,7 +5,7 @@
  */
 import type { SyncRoundResult } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureUnhandledRejections, createFakePi, disposableCtx, enableTestSync, resetWiringMocks, runTaskMock, setupSession, syncEngines, uiCtx, uiWith, waitFor } from "./helpers/wiring-harness";
+import { captureUnhandledRejections, createFakePi, disposableCtx, enableTestSync, flush, resetWiringMocks, runTaskMock, setupSession, syncEngines, uiCtx, uiWith, waitFor } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { loadConfig } from "../src/config";
 
@@ -266,6 +266,33 @@ describe("index wiring — session_shutdown", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("warns only once when the flush times out first and rejects later", async () => {
+		await enableTestSync(s);
+		await s.writeConfig({ lock: { timeoutMs: 30, snapshotKeep: 5 } });
+		const notify = vi.fn();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+		const engine = syncEngines.at(-1);
+		if (!engine) throw new Error("sync engine was not prepared");
+		let rejectFlush!: (reason: Error) => void;
+		vi.spyOn(engine, "flush").mockImplementation(
+			() =>
+				new Promise((_resolve, reject) => {
+					rejectFlush = reject;
+				}),
+		);
+
+		const shutdown = handlers["session_shutdown"][0]({ reason: "quit" }, s.uiCtx(uiWith(notify)));
+		await waitFor(() => notify.mock.calls.length === 1, "shutdown timeout warning");
+		await expect(shutdown).resolves.toBeUndefined();
+		rejectFlush(new Error("late remote failure"));
+		await flush();
+
+		expect(notify).toHaveBeenCalledTimes(1);
+		expect(notify.mock.calls[0][0]).toContain("timed out");
 	});
 
 	it("handles a late flush rejection after the session context is disposed", async () => {

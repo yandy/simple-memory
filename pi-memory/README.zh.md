@@ -226,7 +226,7 @@ pi-memory 可以把一个项目的记忆 entry 复制到**一个 git 远端**，
 
 ### 配置即初始化：没有 `/memory sync init`
 
-1. 远端仓库由你自己准备（**空仓库可以**），并确保 pi 运行环境里的 `git` 能非交互地 `clone` / `push` 它 —— SSH key、credential helper、URL 里的 token，用你现有那套即可。pi-memory 自己**不保存任何凭据**、也从不提示输入；它只调用 `PATH` 上的 `git`。**私有**远端的预期用法：仓库与访问权限都由你自己开通。
+1. 远端仓库由你自己准备（**空仓库可以**），并确保 pi 运行环境里的 `git` 能非交互地 `clone` / `push` 它 —— SSH key、credential helper、URL 里的 token，用你现有那套即可。pi-memory 自己**不保存任何凭据**、也从不提示输入；它只调用 `PATH` 上的 `git`。预期默认使用**私有**远端：仓库与访问权限都由你自己开通。
 2. 在 `memory.json` 里指向它：
 
 ```json
@@ -238,7 +238,7 @@ pi-memory 可以把一个项目的记忆 entry 复制到**一个 git 远端**，
 「origin 是真相来源」派生的规则：
 
 - **初始化之后，暂存 clone 的 `origin` 才是权威**，不是 `sync.remote`。之后把 `sync.remote` 留空，同步照常工作。
-- **配置 remote 与 `origin` 不一致是非致命的**：每个会话一条错误提醒（`sync.remote differs from the initialized origin; continuing to use origin`），`/memory sync status` 两行并报，之后每一轮仍按 `origin` 走。不禁用同步、不碰本地记忆。真要改用它：`/memory sync remote <url>`。
+- **配置 remote 与 `origin` 不一致是非致命的**：每个会话一条错误提醒（`sync.remote differs from the initialized origin; continuing to use origin …`），`/memory sync status` 两行并报，之后每一轮仍按 `origin` 走。不禁用同步、不碰本地记忆。真要改用它：`/memory sync remote <url>`。
 - **首次初始化之前** `sync.enabled: true` + 空 `sync.remote` 才是配置错误（同步报不可用，其余记忆功能照常）。初始化之后空 `remote` 不再是错误。
 - `enabled`、`pullOnStart`、`pushOnWrite` 按**类型**校验，不看真值：`"enabled": "false"` 会报成 `sync is disabled because …`，绝不会被默默读成开。
 - 初始化失败（没有 `git`、断网、URL 写错、没有权限）一律**非致命**：会话只用本地记忆继续跑，一条可读的错误提醒解释原因。修好之后，下次会话启动 —— 或一次显式 `/memory sync pull` / `push` —— 会重走同一条幂等的初始化。
@@ -270,7 +270,7 @@ pi-memory 可以把一个项目的记忆 entry 复制到**一个 git 远端**，
   local/<project>/               永不同步
 ```
 
-`.sync` 在项目目录的**上一层**而不是里面：记忆目录保持干净，而所有扫描都会跳过它（点开头的目录不算 entry）。根级 `sync.lock` 与上面那个项目 `.lock` 是**两把不同的锁**：同步轮按段持有 —— 传输段一次 `fetch` + origin 读取、发布段一次 `push` —— 绝不整轮持有。管理操作（`init` / `setRemote`）在同一把锁上做有界等待，且绝不嵌套在轮次锁内。一旦被遗弃，此后每一轮同步都会失败并给出可操作的错误 —— `/memory sync unlock` 是唯一被认可的清除入口。
+`.sync` 位于**记忆根**，与 `git/`、`local/` 同级，不在任何项目记忆目录里面：项目目录保持干净，而所有扫描都会跳过它（点开头的目录不算 entry）。根级 `sync.lock` 与上面那个项目 `.lock` 是**两把不同的锁**：同步轮按段持有 —— 传输段一次 `fetch` + origin 读取、发布段一次 `push` —— 绝不整轮持有。管理操作（`init` / `setRemote`）在同一把锁上做有界等待，且绝不嵌套在轮次锁内。一旦被遗弃，此后每一轮同步都会失败并给出可操作的错误 —— `/memory sync unlock` 是唯一被认可的清除入口。
 
 ### 生命周期
 
@@ -290,7 +290,8 @@ session_shutdown
 ```
 
 - **一轮 push 就是完整的一次收敛**：传输段（fetch）→ 对基线做三方差集并应用（快照、落盘、重建索引）→ 发布段。所以启动那一轮既把别的设备写的东西拉下来，也把上个会话没推出去的补推上去。这也正是「一轮 push」而不是「先 pull 再 push」的原因：进程内的脏标记只认得**本进程**写过的内容。prepare 与启动 push 共用一份 `sync.autoTimeoutMs` deadline；prepare 耗尽时就跳过 push 并给出非致命的「下一轮再推」提示，绝不再发起一次 1ms 网络轮。
-- **`pullOnStart: false` 仍会 prepare** —— 只是永不自动 fetch/pull/push。首次初始化与「上次初始化失败」的恢复仍然发生在会话启动时。
+- **`pullOnStart: false` 仍会 prepare** —— 只是永不自动 fetch/pull/push。首次初始化与「上次初始化失败」的恢复仍然发生在会话启动时。键名保持既有契约：启动那一轮 push 本身就包含拉取与发布。
+- **已有本地 entry**：初始化新基线时，prepare 会在任何启动 push **之前**提示可能产生确定性的冲突副本；同一份基线只提示一次，不会每次启动都重复。
 - **写入触发**：每一次成功的 entry 写入（`memory` 工具、一整轮 `/dream`、extract 的落盘）都会给去抖上弦。`pushOnWrite: false` 装的是空转触发器 —— 不自动发布任何东西，手动命令照常可用。
 - **退出兜底**：即使去抖还没到点也 flush 一次，这一轮的上限是 `sync.autoTimeoutMs`；在途等待的上限仍是既有写入用的 `lock.timeoutMs`。flush 失败只产生一条 `Memory sync flush failed: … local changes will be retried at the next session start.` —— 内容仍在本地，下一轮就会补推：下次会话启动（`pullOnStart` 默认开启）或下一次写入的去抖推送。若 `pushOnWrite` 与 `pullOnStart` 都关了，用 `/memory sync push`。
 - **录制索引（已知语义，不是 bug）**：`resume` / `fork` / `reload` 冻结 transcript 里录制的索引值。启动收敛照样跑、磁盘照样更新，但同步来的记忆**不会**出现在本会话的 `memory_index` 里，直到下一次 compaction（或下一个会话）。`/memory sync status` 的最后一行会说明这一点。
@@ -312,6 +313,7 @@ session_shutdown
 - 它会先关闸拒绝新的同步活动（再敲一次 `/memory sync remote` 会得到 `sync remote change is already in progress`），排空已登记的轮次，然后**持久失效本项目的基线**（删掉 `state/<project-key>.json`），再对新 origin 重跑一遍准备。基线缺失是**安全的空基线**：它表示「两侧还没达成过一致」，绝不是「用户把东西都删了」。
 - 每份 v2 manifest 还绑定 `sha256(实际 origin)` 与 `branch`，不存可能带凭据的原始 URL。另一个进程晚写的旧 manifest 因此会在新传输端被忽略 —— 对**所有项目**都成立，不只是正在换远端的这个。旧发布也带着 fetch 时的 origin，若与当前 origin 不同，在写入新远端之前就会被拒绝。
 - 因为基线为空，对新远端的第一轮可能看到同一条记忆两侧内容不同。**两份都保留**：`modified` 较新的那份留在原路径（时间相同则比内容 hash），另一份变成一条正常 entry，`name` 加上 ` (冲突 <date> <sha6>)` 后缀。后缀只由内容派生，所以两台设备各自解同一次冲突会写出**同一个**文件、收敛成一份，不会越同步越多；后续由 `/dream` 合并重复。
+- 若新 origin 是空仓库，第一次发布会从暂存 clone 当前的 HEAD 起步，因此新远端可能收到既有的**整个记忆根历史，包括其他项目**，而不只是当前项目的最新文件。把「换成空 origin」理解为整根历史迁移，执行前先检查目标仓库。
 - `memory.json` **绝不会被改写**（这一层没有配置写入能力）—— 通知里会明说。想让新地址成为下次启动的配置默认值，请自己改文件。
 - 首次初始化之前没有 origin 可改：它会告诉你改 `memory.json` 里的 `sync.remote`。
 
