@@ -410,39 +410,55 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(syncEvents).toContain("push:end");
 	});
 
+	/** 预算用例先做一次真初始化，之后只控制时钟：Windows 的 git 速度不再参与断言，也不会留下超时子进程。 */
+	async function initializeForBudgetTest(): Promise<void> {
+		const config = memoryConfig({ pullOnStart: true });
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		const { runtime, errors } = await createPiSyncRuntime({ config, store, projectDir: s.dir, identity: gitIdentity(s.cwd) });
+		expect(errors).toEqual([]);
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`budget fixture prepare failed: ${prepared.reason}`);
+		runtime.dispose();
+		syncEvents.length = 0;
+		syncPushTimeouts.length = 0;
+	}
+
 	it("prepare and startup push share one automatic deadline", async () => {
 		await enableSync({ pullOnStart: true, autoTimeoutMs: 1_000 });
+		await initializeForBudgetTest();
+		const start = 1_700_000_000_000;
+		// 第一次用于 startupDeadline；之后 prepare 已结束，剩余预算必须是 600，而不是重新给 1000。
+		const clock = vi.spyOn(Date, "now").mockReturnValueOnce(start).mockReturnValue(start + 400);
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		let release!: () => void;
-		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
-			release = resolveBarrier;
-		});
-		const starting = handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
-		await waitFor(() => syncEvents.includes("init:start"), "startup prepare to reach init");
-		await new Promise((resolveWait) => setTimeout(resolveWait, 80));
-		release();
-		await starting;
+		try {
+			await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		} finally {
+			clock.mockRestore();
+		}
 
-		expect(syncPushTimeouts).toHaveLength(1);
-		expect(syncPushTimeouts[0]).toBeGreaterThan(0);
-		expect(syncPushTimeouts[0]).toBeLessThan(1_000);
+		expect(syncPushTimeouts).toEqual([600]);
 	});
 
 	it("an exhausted prepare budget skips startup push with a nonfatal next-round reason", async () => {
 		await enableSync({ pullOnStart: true, autoTimeoutMs: 300 });
+		await initializeForBudgetTest();
+		const start = 1_700_000_000_000;
+		const clock = vi.spyOn(Date, "now").mockReturnValueOnce(start).mockReturnValue(start + 400);
 		const notify = vi.fn();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
-		let release!: () => void;
-		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
-			release = resolveBarrier;
-		});
-		const starting = handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
-		await waitFor(() => syncEvents.includes("init:start"), "startup prepare to reach init");
-		await new Promise((resolveWait) => setTimeout(resolveWait, 400));
-		release();
-		await starting;
+		try {
+			await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+		} finally {
+			clock.mockRestore();
+		}
 
 		expect(syncPushTimeouts).toEqual([]);
 		expect(notify.mock.calls[0]?.[0]).toMatch(/startup budget.*next round/i);
