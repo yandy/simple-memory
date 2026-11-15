@@ -3,7 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { configFiles, loadConfig, modelConfigErrors, requiredModels, PI_HOST_DEFAULTS } from "../src/config";
+import { configFiles, loadConfig, modelConfigErrors, requiredModels, syncConfigErrors, PI_HOST_DEFAULTS, type SyncConfig } from "../src/config";
 
 /**
  * pi 侧配置层的全部职责：**读哪些文件、怎么把它们合并成 `MemoryConfig`**。
@@ -238,6 +238,17 @@ describe("loadConfig", () => {
 
 	it("has lock defaults", async () => {
 		expect((await loadConfig(ctx(false))).config.lock).toEqual({ timeoutMs: 5000, snapshotKeep: 5 });
+	});
+
+	it("re-exports sync validation separately from fatal model validation", async () => {
+		const { config: cfg } = await loadConfig(ctx(false));
+		const sync: SyncConfig = { ...cfg.sync, enabled: true, remote: "" };
+		const withBadSync = { ...cfg, defaults: { model: "test/model" }, sync };
+
+		expect(syncConfigErrors(withBadSync)).toEqual([
+			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
+		]);
+		expect(modelConfigErrors(withBadSync, () => true)).toEqual([]);
 	});
 
 	it("deep-merges the lock section, keeping the untouched sibling", async () => {

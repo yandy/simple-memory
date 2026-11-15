@@ -2,8 +2,18 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, mergeConfig, type MemoryConfig } from "@yandy0725/memory-core";
+import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, type MemoryConfig, mergeConfig } from "@yandy0725/memory-core";
 
+export type {
+	AutoSurfacingConfig,
+	DefaultsConfig,
+	ExtractMemoriesConfig,
+	MemoryConfig,
+	ModelTask,
+	SessionPersistenceConfig,
+	SyncConfig,
+	ThinkLevel,
+} from "@yandy0725/memory-core";
 /**
  * pi 侧的配置层负责两件事：把「配置文件在哪」这条宿主知识组装成文件列表，然后**自己读**它们。
  *
@@ -17,15 +27,7 @@ export {
 	expandTilde,
 	modelConfigErrors,
 	requiredModels,
-} from "@yandy0725/memory-core";
-export type {
-	AutoSurfacingConfig,
-	DefaultsConfig,
-	ExtractMemoriesConfig,
-	MemoryConfig,
-	ModelTask,
-	SessionPersistenceConfig,
-	ThinkLevel,
+	syncConfigErrors,
 } from "@yandy0725/memory-core";
 
 /**

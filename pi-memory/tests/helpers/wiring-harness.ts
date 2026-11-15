@@ -31,6 +31,11 @@ const mocks = vi.hoisted(() => ({
 	runTaskMock: vi.fn(),
 	shouldNudgeMock: vi.fn(),
 	readRecordedMemoryIndexMock: vi.fn(),
+	projectIdentityMock: vi.fn(),
+	/** 真 backend/engine 的观察带：只记顺序，调用仍委托 core 的真实现。 */
+	syncEvents: [] as string[],
+	/** dispose 竞争测试只延迟真实 push 的起点，不替换其结果或行为。 */
+	syncPushBarrier: { current: null as Promise<void> | null },
 	readDreamMetaMock: vi.fn(),
 	writeDreamMetaMock: vi.fn().mockResolvedValue(undefined),
 	detectLegacyMemoryDirMock: vi.fn().mockResolvedValue(null),
@@ -70,6 +75,63 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 			// 真实 config 的 memoryDir + cwd 末段：不 spawn git，也不依赖任何可变引用
 			return join((cfg as { memoryDir: string }).memoryDir, config.basename(cwd));
 		}),
+		// 与 resolveMemoryDir 的 stub 一样按 cwd 末段派生稳定身份；backend/engine/device 保持真实。
+		projectIdentity: mocks.projectIdentityMock.mockImplementation(async (cwd: string) => ({
+			kind: "git",
+			key: `example.com/org/${config.basename(cwd)}`,
+		})),
+		createGitSyncBackend: (options: Parameters<typeof actual.createGitSyncBackend>[0]) => {
+			const backend = actual.createGitSyncBackend(options);
+			return {
+				...backend,
+				init: async (opts: Parameters<typeof backend.init>[0]) => {
+					mocks.syncEvents.push("init:start");
+					try {
+						return await backend.init(opts);
+					} finally {
+						mocks.syncEvents.push("init:end");
+					}
+				},
+				fetch: async (scope: Parameters<typeof backend.fetch>[0], opts: Parameters<typeof backend.fetch>[1]) => {
+					mocks.syncEvents.push("fetch");
+					return backend.fetch(scope, opts);
+				},
+			};
+		},
+		createSyncEngine: (options: Parameters<typeof actual.createSyncEngine>[0]) => {
+			const engine = actual.createSyncEngine(options);
+			return {
+				...engine,
+				pull: async (timeoutMs?: number) => {
+					mocks.syncEvents.push("pull");
+					return engine.pull(timeoutMs);
+				},
+				push: async (timeoutMs?: number) => {
+					mocks.syncEvents.push("push:start");
+					if (mocks.syncPushBarrier.current) await mocks.syncPushBarrier.current;
+					try {
+						return await engine.push(timeoutMs);
+					} finally {
+						mocks.syncEvents.push("push:end");
+					}
+				},
+				flush: async (timeoutMs?: number) => {
+					mocks.syncEvents.push("flush");
+					return engine.flush(timeoutMs);
+				},
+				dispose: () => {
+					mocks.syncEvents.push("dispose");
+					engine.dispose();
+				},
+				get inFlight() {
+					return engine.inFlight;
+				},
+			};
+		},
+		buildIndexSection: async (...args: Parameters<typeof actual.buildIndexSection>) => {
+			mocks.syncEvents.push("index");
+			return actual.buildIndexSection(...args);
+		},
 		scanEntries: mocks.scanEntriesMock,
 		runTask: mocks.runTaskMock,
 	};
@@ -102,11 +164,20 @@ vi.mock("../../src/session-search", () => ({
 // 「哪个 reason 走录制值、拿到/拿不到分别怎么办」。
 vi.mock("../../src/index-source", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../src/index-source")>();
-	return { ...actual, readRecordedMemoryIndex: mocks.readRecordedMemoryIndexMock };
+	return {
+		...actual,
+		readRecordedMemoryIndex: (...args: Parameters<typeof actual.readRecordedMemoryIndex>) => {
+			mocks.syncEvents.push("recorded-index");
+			return mocks.readRecordedMemoryIndexMock(...args);
+		},
+	};
 });
 
 export const loadConfigMock = mocks.loadConfigMock;
 export const resolveMemoryDirMock = mocks.resolveMemoryDirMock;
+export const projectIdentityMock = mocks.projectIdentityMock;
+export const syncEvents = mocks.syncEvents;
+export const syncPushBarrier = mocks.syncPushBarrier;
 export const scanEntriesMock = mocks.scanEntriesMock;
 export const runTaskMock = mocks.runTaskMock;
 export const shouldNudgeMock = mocks.shouldNudgeMock;
@@ -146,6 +217,13 @@ export function resetWiringMocks(): void {
 	// `mockImplementationOnce` 队列也不会串到下一条用例。
 	mocks.loadConfigMock.mockReset();
 	if (config.loadConfigDispatch.current) mocks.loadConfigMock.mockImplementation(config.loadConfigDispatch.current);
+	projectIdentityMock.mockReset();
+	projectIdentityMock.mockImplementation(async (cwd: string) => ({
+		kind: "git",
+		key: `example.com/org/${config.basename(cwd)}`,
+	}));
+	syncEvents.length = 0;
+	syncPushBarrier.current = null;
 	scanEntriesMock.mockReset();
 	runTaskMock.mockReset();
 	runTaskMock.mockImplementation((task: { id?: string }, _input: unknown, ctx?: { cfg?: MemoryConfig }) => {
@@ -174,6 +252,11 @@ export function resetWiringMocks(): void {
 /** 「cwd → 目录末段」的唯一实现：`setupSession` 与 `resolveMemoryDir` 的 stub 必须用同一条规则。 */
 export function expectedDir(memoryDirRoot: string, cwd: string): string {
 	return join(memoryDirRoot, String(cwd).split(/[\\/]/).filter(Boolean).pop() ?? "");
+}
+
+/** 直接装配 runtime 的测试与 projectIdentity stub 共用同一个稳定 git 身份。 */
+export function gitIdentity(cwd: string) {
+	return { kind: "git" as const, key: `example.com/org/${config.basename(cwd)}` };
 }
 
 export interface SessionSetup {

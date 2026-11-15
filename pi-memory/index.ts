@@ -1,33 +1,35 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
-	LOCK_FILE,
-	type LockInfo,
-	MemoryStore,
-	TASKS,
 	buildIndexSection,
 	indexCapacity,
 	indexInjectionCapacity,
-	parseEntryIndex,
+	LOCK_FILE,
+	type LockInfo,
+	MemoryStore,
 	moduleStatusRows,
+	parseEntryIndex,
+	projectIdentity,
 	readLockStatus,
 	resolveMemoryDir,
 	runTask,
 	scanEntries,
+	TASKS,
 	withFsRetry,
 } from "@yandy0725/memory-core";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { legacyMemoryRoot, loadConfig, modelConfigErrors, type LoadedConfig, type MemoryConfig } from "./src/config";
-import { readRecordedMemoryIndex } from "./src/index-source";
-import { detectLegacyMemoryDir } from "./src/legacy-hint";
-import { applyIndexSection, buildInjection } from "./src/inject-pi";
 import { createPiHeadlessAgent } from "./src/agent-runner";
+import { type LoadedConfig, legacyMemoryRoot, loadConfig, type MemoryConfig, modelConfigErrors } from "./src/config";
 import { createPiTranscript } from "./src/host-transcript";
+import { readRecordedMemoryIndex } from "./src/index-source";
+import { applyIndexSection, buildInjection } from "./src/inject-pi";
+import { detectLegacyMemoryDir } from "./src/legacy-hint";
 import { createMemoryTool, type MemoryToolDeps } from "./src/memory-tool";
 import { resolveModel } from "./src/model-resolver";
 import { readDreamMeta, shouldNudge, writeDreamMeta } from "./src/nudge";
 import { searchSessions } from "./src/session-search";
+import { createPiSyncRuntime, type PiSyncRuntime } from "./src/sync";
 
 function extractAgentsMdBlocks(systemPrompt: string): string[] {
 	const blocks: string[] = [];
@@ -156,6 +158,11 @@ export default function (pi: ExtensionAPI) {
 	let store: MemoryStore | null = null;
 	/** 配置错误态（模型校验失败或初始化失败）。/memory 重复显示它，直到用户改好配置并重启。 */
 	let configError: string | null = null;
+	/** 同步错误是独立的非致命通道：健康 store/tool/index 绝不被它清空。 */
+	let syncError: string | null = null;
+	let syncRuntime: PiSyncRuntime | null = null;
+	/** create 阶段仍成立的错误（如 origin 漂移）；手动恢复成功时只清瞬时错误，保留这些。 */
+	let syncPersistentErrors: string[] = [];
 	let indexSnapshot = "";
 	let toolRegistered = false;
 	let currentCwd = "";
@@ -170,23 +177,49 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const inFlight = new Set<Promise<unknown>>();
 
+	/** 每次 session_start 先收掉旧 engine；engine.dispose 自身不抛，这里仍守住宿主事件边界。 */
+	function disposeSyncRuntime(): void {
+		try {
+			syncRuntime?.engine?.dispose();
+		} catch {
+			/* 同步收摊不得影响新会话 */
+		} finally {
+			syncRuntime = null;
+		}
+	}
+
 	/**
 	 * 清空本 session 的运行时状态。两条早退路径（配置错误 / 初始化失败）共用：
 	 * 残留上一 session 的 store 会让后续写入落到别的项目目录（Plan C ledger R51）。
 	 */
 	function resetSessionState(): void {
+		disposeSyncRuntime();
 		memoryDir = null;
 		store = null;
 		indexSnapshot = "";
 		injectedFiles.clear();
 	}
 
+	function setSyncError(errors: string[]): void {
+		const unique = [...new Set(errors.map((error) => error.trim()).filter((error) => error !== ""))];
+		syncError = unique.length > 0 ? unique.join("\n") : null;
+	}
+
+	function notifySync(ui: ExtensionUIContext | undefined, message: string, level: "info" | "error" = "error"): void {
+		try {
+			ui?.notify(message, level);
+		} catch {
+			/* session 在 await 期间 dispose：同步降级不能因此拖垮宿主 */
+		}
+	}
+
 	/** 统一的配置错误态：记录 → 清空运行时 → 通知。无 UI 时只记录（`/memory` 仍可读到）。 */
-	function failConfig(errors: string[], ctx: ExtensionContext): void {
+	function failConfig(errors: string[], ui: ExtensionUIContext | undefined): void {
 		configError = errors.join("\n");
+		syncError = null;
+		syncPersistentErrors = [];
 		resetSessionState();
-		if (!ctx.hasUI) return;
-		ctx.ui.notify(`pi-memory config error:\n${errors.map((e) => `- ${e}`).join("\n")}`, "error");
+		notifySync(ui, `pi-memory config error:\n${errors.map((e) => `- ${e}`).join("\n")}`);
 	}
 
 	/** 登记一个后台 promise，settle 后自动摘掉；返回同一个 promise 以便调用方继续链式处理。 */
@@ -216,9 +249,9 @@ export default function (pi: ExtensionAPI) {
 	 * `headless` 每次现造：`ctx.modelRegistry` 来自事件上下文，不在工厂作用域里。
 	 */
 	const piTranscript = createPiTranscript();
-	const headlessFor = (ctx: ExtensionContext) =>
+	const headlessFor = (modelRegistry: ExtensionContext["modelRegistry"]) =>
 		createPiHeadlessAgent({
-			modelRegistry: ctx.modelRegistry,
+			modelRegistry,
 			buildMemoryTool: (spec) => createMemoryTool(toolDeps, spec),
 		});
 
@@ -229,11 +262,16 @@ export default function (pi: ExtensionAPI) {
 	 * 抛错 = 初始化失败，由调用方转成配置错误态（`configError`）。
 	 * `reason` 只有 `session_start` 会传：resume / fork / reload 用 transcript 的录制值（D14）。
 	 */
-	async function initMemory(ctx: ExtensionContext, reason?: string): Promise<void> {
+	async function initMemory(
+		cwd: string,
+		sessionManager: ExtensionContext["sessionManager"],
+		reason: string | undefined,
+		syncUi: ExtensionUIContext | undefined,
+	): Promise<void> {
 		// biome-ignore lint/style/noNonNullAssertion: 调用方已通过模型校验
 		const cfg = config!;
-		currentCwd = ctx.cwd;
-		const dir = await resolveMemoryDir(cfg, ctx.cwd);
+		currentCwd = cwd;
+		const dir = await resolveMemoryDir(cfg, cwd);
 		const activeStore = new MemoryStore({
 			memoryDir: dir,
 			indexMaxLines: cfg.memIndexMaxLines,
@@ -243,6 +281,43 @@ export default function (pi: ExtensionAPI) {
 		memoryDir = dir;
 		store = activeStore;
 
+		// 同步配置、init、传输都只是非致命降级。准备与启动收敛全部结束后才选择索引来源：
+		// startup/new 读到同步后的磁盘；resume/fork/reload 仍逐字冻结 transcript 的录制值。
+		const syncErrors: string[] = [];
+		try {
+			const identity = await projectIdentity(cwd);
+			const assembled = await createPiSyncRuntime({ config: cfg, store: activeStore, projectDir: dir, identity });
+			syncRuntime = assembled.runtime;
+			syncPersistentErrors = [...assembled.errors];
+			syncErrors.push(...assembled.errors);
+			const activeRuntime = syncRuntime;
+			if (activeRuntime) {
+				const prepared = await activeRuntime.prepare(cfg.sync.autoTimeoutMs);
+				if (!prepared.ok) {
+					syncErrors.push(prepared.reason);
+				} else {
+					if (prepared.warning) syncErrors.push(prepared.warning);
+					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
+					if (cfg.sync.pullOnStart === true) {
+						const round = await prepared.engine.push(cfg.sync.autoTimeoutMs);
+						if (!round.ok) syncErrors.push(round.skipped?.reason ?? "memory sync startup round failed");
+					}
+				}
+			}
+		} catch (error) {
+			syncErrors.push(error instanceof Error ? error.message : String(error));
+		}
+		setSyncError(syncErrors);
+		if (syncError) {
+			notifySync(
+				syncUi,
+				`pi-memory sync error:\n${syncError
+					.split("\n")
+					.map((error) => `- ${error}`)
+					.join("\n")}`,
+			);
+		}
+
 		// D13 / D14：索引值在整个 session 内**冻结**。resume / fork / reload 必须用 transcript 里的
 		// 录制值 —— 否则被恢复会话的 system prompt 头部会被改写，而 memory_index 是头部的最后一段，
 		// 折叠路径下其后的整段对话全部失去缓存。录制值拿不到（更老的 session、旧 SDK 没有
@@ -250,7 +325,7 @@ export default function (pi: ExtensionAPI) {
 		// 录制值**不再 re-sanitize**：写入当年已经净化过，而 sanitizeForInjection 是幂等的 ——
 		// 保持字节恒等更利于缓存。
 		const useRecorded = reason === "resume" || reason === "fork" || reason === "reload";
-		const recorded = useRecorded ? readRecordedMemoryIndex(ctx.sessionManager) : null;
+		const recorded = useRecorded ? readRecordedMemoryIndex(sessionManager) : null;
 		indexSnapshot =
 			recorded ?? (await buildIndexSection(activeStore, cfg.memIndexInjectMaxLines, cfg.memIndexInjectMaxBytes));
 
@@ -273,7 +348,15 @@ export default function (pi: ExtensionAPI) {
 		// `configError = null` 是纯防御：所有把 store 置空的路径都会经 failConfig 覆写它，所以这次复位
 		// 本身不可观测 —— 没有测试钉它，删掉也不会让任何用例变红（2026-10-03 final review 的结论）。
 		configError = null;
+		syncError = null;
+		syncPersistentErrors = [];
 		resetSessionState();
+		// 同步段可能等待远端预算：所有宿主值都在其第一个 await 之前快照，之后绝不回读已 dispose 的 ctx。
+		const syncUi = ctx.hasUI ? ctx.ui : undefined;
+		const sessionCwd = ctx.cwd;
+		const sessionManager = ctx.sessionManager;
+		const modelRegistry = ctx.modelRegistry;
+		const startupHeadless = headlessFor(modelRegistry);
 		// `loadConfig` 抛错（`getAgentDir` / `isProjectTrusted` 属宿主契约）与初始化失败同一处理：
 		// 转成配置错误态，不把裸 reject 冒给宿主（spec §2.4）。用局部变量承接是为了让后面的收窄
 		// 不受 `config` 这个工厂作用域 let 影响。（nudge 块仍可能抛错，属既有暴露面，不在本次范围。）
@@ -281,7 +364,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			loaded = await loadConfig(ctx);
 		} catch (e) {
-			failConfig([`Failed to load memory config: ${e instanceof Error ? e.message : String(e)}`], ctx);
+			failConfig([`Failed to load memory config: ${e instanceof Error ? e.message : String(e)}`], syncUi);
 			return;
 		}
 		config = loaded.config;
@@ -289,25 +372,25 @@ export default function (pi: ExtensionAPI) {
 			// 启动校验（spec §2.3）：模型键缺失 / 不可解析 → 本会话**完全不初始化**
 			//（不解析目录、不建 store、不注册工具），错误态由 `/memory` 重复显示。
 			// 校验本身抛错（registry 不合契约）也走同一个 catch：failConfig 自己会复位运行时。
-			const errors = modelConfigErrors(loaded.config, (value) => resolveModel(value, ctx.modelRegistry) !== undefined);
+			const errors = modelConfigErrors(loaded.config, (value) => resolveModel(value, modelRegistry) !== undefined);
 			if (errors.length > 0) {
-				failConfig(errors, ctx);
+				failConfig(errors, syncUi);
 				return;
 			}
-			await initMemory(ctx, (event as { reason?: string }).reason);
+			await initMemory(sessionCwd, sessionManager, (event as { reason?: string }).reason, syncUi);
 		} catch (e) {
 			// spec §2.4：初始化失败走同一个错误态，不冒泡给宿主（那只会变成一条裸报错）。
-			failConfig([`Failed to initialize memory: ${e instanceof Error ? e.message : String(e)}`], ctx);
+			failConfig([`Failed to initialize memory: ${e instanceof Error ? e.message : String(e)}`], syncUi);
 			return;
 		}
 
 		// nudge
 		// 先拷到 const：initMemory 里赋的值，TS 在本函数的控制流里看不到收窄。
 		const nudgeDir = memoryDir;
-		if (ctx.hasUI && nudgeDir) {
+		if (syncUi && nudgeDir) {
 			// 同步段快照：shouldNudge / confirm 之后的 fire-and-forget 链不再碰 ctx（见 notifyDream）。
-			const ui = ctx.ui;
-			const { nudge, message, sessions } = await shouldNudge(nudgeDir, loaded.host, ctx.cwd);
+			const ui = syncUi;
+			const { nudge, message, sessions } = await shouldNudge(nudgeDir, loaded.host, currentCwd);
 			if (nudge) {
 				const ok = await ui.confirm("Memory Consolidation", `${message}\n\nConsolidate memory files now?`);
 				// dream 需要 store（整轮逻辑锁 + 快照都挂在它上面）；这里必然非空，但 const 拷贝让 TS 也能看到。
@@ -321,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 					const dreamRun = runTask(
 						TASKS.dream,
 						{},
-						{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } },
+						{ cfg: config, cwd: dir, store: activeStore, ports: { headless: startupHeadless } },
 					);
 					ui.setStatus("dream", "Consolidating memory...");
 					// dream 的 7 个 action 只注入它自己的 headless 子会话；整轮持锁与进入时的
@@ -353,6 +436,7 @@ export default function (pi: ExtensionAPI) {
 		// 先拷到 const：`store` 是工厂作用域的 let，在异步回调里 TS 不会保留它的外层收窄。
 		const activeStore = store;
 		if (!config || !memoryDir || !activeStore) return;
+		const headless = headlessFor(ctx.modelRegistry);
 
 		// 索引 section：**每一轮无条件**写入冻结值（含 resume / fork / reload）。
 		// 省略这个键 = pi 的 diffSystemPromptSections 生成 { memory_index: null } = 把索引从
@@ -378,7 +462,7 @@ export default function (pi: ExtensionAPI) {
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
 						{ userPrompt: event.prompt.slice(0, 4000), injectedFiles, manifest },
-						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless: headlessFor(ctx) } },
+						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless } },
 					);
 					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
 					if (content !== "") {
@@ -463,7 +547,12 @@ export default function (pi: ExtensionAPI) {
 					written += 1;
 				},
 			},
-			{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx), transcript: piTranscript } },
+			{
+				cfg: config,
+				cwd: dir,
+				store: activeStore,
+				ports: { headless: headlessFor(ctx.modelRegistry), transcript: piTranscript },
+			},
 		);
 		track(extractRun);
 		// 用两参 `.then`（而不是 `.then().catch()`）：成功通知自己抛错只会进它自己的分支，
@@ -493,6 +582,43 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
+	/** Task 3 只需要的手动恢复入口：同一 runtime 上重试 prepare，然后严格只 pull、不发布。 */
+	async function pullMemorySync(ctx: ExtensionContext): Promise<void> {
+		const ui = ctx.ui;
+		const cfg = config;
+		const activeRuntime = syncRuntime;
+		if (!cfg || !activeRuntime) {
+			notifySync(ui, `Memory sync unavailable${syncError ? `:\n${syncError}` : ": sync is not enabled."}`, "info");
+			return;
+		}
+		try {
+			const prepared = await activeRuntime.prepare(cfg.sync.timeoutMs);
+			if (!prepared.ok) {
+				setSyncError([...syncPersistentErrors, prepared.reason]);
+				notifySync(ui, `Memory sync pull failed: ${prepared.reason}`);
+				return;
+			}
+			const round = await prepared.engine.pull(cfg.sync.timeoutMs);
+			const errors = [...syncPersistentErrors];
+			if (prepared.warning) errors.push(prepared.warning);
+			if (!round.ok) errors.push(round.skipped?.reason ?? "unknown sync pull failure");
+			setSyncError(errors);
+			if (!round.ok) {
+				notifySync(ui, `Memory sync pull failed: ${round.skipped?.reason ?? "unknown sync pull failure"}`);
+				return;
+			}
+			notifySync(
+				ui,
+				`Memory sync pull: ${round.pulled.length} pulled, ${round.conflicts.length} conflicts, ${round.rejected.length} rejected.`,
+				"info",
+			);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			setSyncError([...syncPersistentErrors, reason]);
+			notifySync(ui, `Memory sync pull failed: ${reason}`);
+		}
+	}
+
 	pi.registerCommand("memory", {
 		description: "Show memory status or remove a stale lock",
 		handler: async (args, ctx) => {
@@ -507,6 +633,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify("Memory not initialized.", "info");
+				return;
+			}
+			if (args.trim() === "sync pull") {
+				await pullMemorySync(ctx);
 				return;
 			}
 			if (args === "unlock") {
@@ -554,6 +684,11 @@ export default function (pi: ExtensionAPI) {
 				`Last dream: ${(await readDreamMeta(dir))?.lastDreamAt ?? "never"}`,
 				`Lock: ${await lockStatusLine(dir)}`,
 			];
+			// 默认未启用时保留既有 7 行状态；启用/降级后追加同步段，且不调用 engine.status/init。
+			if (syncRuntime || syncError) {
+				summaryLines.push(`Sync: ${syncRuntime?.engine ? "ready" : syncRuntime ? "not initialized" : "disabled"}`);
+				if (syncError) summaryLines.push(...syncError.split("\n").map((error) => `- ${error}`));
+			}
 			// 2.x 数据根的迁移提示：只提示、不动数据。探测失败不得让 `/memory` 报错 ——
 			// 状态块本身才是这个命令的交付物。
 			try {
@@ -585,16 +720,13 @@ export default function (pi: ExtensionAPI) {
 			// 完成回调里的 `SessionManager.list` 在 await 之后才读它（见 notifyDream 的说明）。
 			const ui = ctx.hasUI ? ctx.ui : undefined;
 			const cwd = ctx.cwd;
+			const headless = headlessFor(ctx.modelRegistry);
 			const ok = await ctx.ui.confirm("Dream", "Consolidate all memory files? This rewrites them in-place.");
 			if (!ok) return;
 			const dir = memoryDir;
 			// `runTask` 是 async：缺模型不在这里同步抛，而是作为 rejection 走下面的两参
 			// `.then` 失败分支（报「Dream failed」）；状态行由 `.finally` 兜底清除，不会残留。
-			const dreamRun = runTask(
-				TASKS.dream,
-				{},
-				{ cfg: config, cwd: dir, store: activeStore, ports: { headless: headlessFor(ctx) } },
-			);
+			const dreamRun = runTask(TASKS.dream, {}, { cfg: config, cwd: dir, store: activeStore, ports: { headless } });
 			ui?.setStatus("dream", "Consolidating memory...");
 			track(dreamRun);
 			void dreamRun
