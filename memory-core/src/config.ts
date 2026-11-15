@@ -281,8 +281,8 @@ export function syncConfigErrors(cfg: MemoryConfig, options: { initialized?: boo
 	// 不是明确的 true 就到此为止：开关没开，它管辖的键不必逼用户先修（与消费方 `=== true` 同口径）。
 	if (sync.enabled !== true) return errors;
 
-	// 非字符串也算空：`mergeConfig` 不校验类型，这里一 `.trim()` 就把非致命校验变成一次崩溃。
-	if (options.initialized !== true && (typeof sync.remote !== "string" || sync.remote.trim() === "")) {
+	// 非字符串一律报错；initialized 只豁免空字符串。先查类型，避免 `.trim()` 把校验变成一次崩溃。
+	if (typeof sync.remote !== "string" || (options.initialized !== true && sync.remote.trim() === "")) {
 		errors.push('sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"');
 	}
 	if (typeof sync.branch !== "string" || sync.branch.trim() === "") {

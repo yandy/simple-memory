@@ -252,7 +252,7 @@ describe("sync 配置", () => {
 	});
 
 	// 已初始化之后，origin 才是「同步到底去哪儿」的真相来源，配置里的 remote 只是「未初始化时的输入」。
-	it("★{ initialized: true } 时 remote 为空不算错，其余键照旧校验", () => {
+	it("★{ initialized: true } 只豁免空字符串 remote，其余键与非字符串 remote 照旧校验", () => {
 		const cfg = mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true, remote: "" } });
 		expect(syncConfigErrors(cfg, { initialized: true })).toEqual([]);
 		expect(syncConfigErrors(cfg, { initialized: false })).toHaveLength(1);
@@ -269,10 +269,12 @@ describe("sync 配置", () => {
 		expect(errors[1]).toContain('"sync.pushDebounceMs"');
 		expect(errors.join("\n")).not.toContain('"sync.remote"');
 
-		// 非字符串的 remote 同理：已初始化时它压根不会被读（origin 才是真相），所以也不报
+		// 豁免只针对空字符串：非字符串仍是配置类型错误，不能因为已初始化就静默通过
 		expect(
 			syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true, remote: 42 } }), { initialized: true }),
-		).toEqual([]);
+		).toEqual([
+			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
+		]);
 		// 开关本身仍然是无条件校验的：`initialized` 只放宽 remote，不放宽同意边界
 		expect(
 			syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: "false" } }), { initialized: true }),

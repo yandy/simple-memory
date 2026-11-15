@@ -900,28 +900,31 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// 增量为空 = 远端已经有我们全部的字节：不取锁、不做一次注定「无变化」的远端往返。
 		// 这条出口先于预算检查：没有发布工作要做时，传输段花光预算也不该把成功改成失败。
 		if (delta.writes.length === 0 && delta.deletions.length === 0) return result;
-		// `remainingMs` 为了给子进程规避 timeout: 0 会把耗尽钳成 1ms；在发起发布前先拦住，
-		// 否则用户看到的是一次注定失败的 “timed out after 1ms”，而不是真正的预算耗尽原因。
-		if (deadline - Date.now() <= 0) {
-			return failedRound(
+		const budgetExceeded = (): SyncRoundResult =>
+			failedRound(
 				`the round budget of ${roundBudgetMs}ms ran out before publishing; ` +
 					"local changes converged and will be published next time",
 				result,
 			);
-		}
+		// `remainingMs` 为了给子进程规避 timeout: 0 会把耗尽钳成 1ms；在发起发布前先拦住，
+		// 否则用户看到的是一次注定失败的 “timed out after 1ms”，而不是真正的预算耗尽原因。
+		if (deadline - Date.now() <= 0) return budgetExceeded();
 
-		const locked = await withRootLock(() =>
-			backend.publish(
+		const locked = await withRootLock(async () => {
+			// mkdir/open/写锁记录都是异步的，预算可能在取锁期间耗尽；真正调用 backend 前必须再查一次。
+			if (deadline - Date.now() <= 0) return budgetExceeded();
+			return backend.publish(
 				scope,
 				delta,
 				{ revision: snapshot.revision },
 				{ timeoutMs: remainingMs(deadline), signal, message: publishMessage(delta), author: commitAuthor(device) },
-			),
-		);
+			);
+		});
 		if (!locked.acquired) {
 			// 本轮不发布：本地已经收敛好了，脏状态原样留着，下一次触发接着推
 			return failedRound(`${ROOT_LOCK_BUSY}; local changes converged and will be published next time`, result);
 		}
+		if (typeof locked.value !== "string") return locked.value;
 
 		const revision = locked.value;
 		result.pushed = delta.writes.map((item) => item.path);

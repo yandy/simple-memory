@@ -780,6 +780,58 @@ describe.skipIf(!GIT)(
 			expect(await fixtureGit(["rev-list", "--count", "main"], remote)).toBe(commits);
 		});
 
+		it("setRemote() 切到空 origin 后，幂等 init 交回空 revision 而不是旧 tracking ref", async () => {
+			const a = await onlineDevice("a");
+			const oldRevision = await a.publish(
+				scope,
+				{ writes: [{ path: "old.md", content: "旧远端" }], deletions: [] },
+				{ revision: "" },
+				publishOpts,
+			);
+			const oldCommits = await fixtureGit(["rev-list", "--count", "main"], remote);
+			const other = join(dir, "other-empty.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await a.setRemote(other, runOpts);
+
+			const again = await a.init(runOpts);
+			expect(again.revision).toBe("");
+			expect(again.warnings).toEqual([]);
+			expect(await fixtureGit(["ls-remote", "--heads", other], dir)).toBe("");
+			// 幂等复核既不引导新远端，也不改旧远端或本地提交
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], remote)).toBe(oldRevision);
+			expect(await fixtureGit(["rev-list", "--count", "main"], remote)).toBe(oldCommits);
+			expect(await fixtureGit(["rev-parse", "HEAD"], repoDir("a"))).toBe(oldRevision);
+		});
+
+		it("setRemote() 切到非空 origin 后，幂等 init 交回新 head 且不造提交", async () => {
+			const a = await onlineDevice("a");
+			const oldRevision = await a.publish(
+				scope,
+				{ writes: [{ path: "old.md", content: "旧远端" }], deletions: [] },
+				{ revision: "" },
+				publishOpts,
+			);
+			const other = join(dir, "other-nonempty.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			const seed = device("seed", { remote: other });
+			const seeded = await seed.init(runOpts);
+			const newRevision = await seed.publish(
+				scope,
+				{ writes: [{ path: "new.md", content: "新远端" }], deletions: [] },
+				{ revision: seeded.revision },
+				publishOpts,
+			);
+			const newCommits = await fixtureGit(["rev-list", "--count", "main"], other);
+			await a.setRemote(other, runOpts);
+
+			const again = await a.init(runOpts);
+			expect(again.revision).toBe(newRevision);
+			expect(again.revision).not.toBe(oldRevision);
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], other)).toBe(newRevision);
+			expect(await fixtureGit(["rev-list", "--count", "main"], other)).toBe(newCommits);
+			expect(await fixtureGit(["rev-parse", "refs/heads/main"], remote)).toBe(oldRevision);
+		});
+
 		it("构造时没给 remote 而尚未初始化 → init 报一句指向 sync.remote 的错误（不是 git 那句 clone 用法）", async () => {
 			// 适配层重建 backend 时手上的 `sync.remote` 可能就是空的（已初始化时合法），
 			// 而它无法自己分辨「空 remote 但已初始化」与「空 remote 且从未初始化」—— 后者由这里报。

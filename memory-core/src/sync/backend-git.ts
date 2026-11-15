@@ -544,16 +544,14 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 	}
 
 	/**
-	 * 本地已知的远端 head（**不联网**）：优先远端跟踪 ref，它不在时退回本地 HEAD。
+	 * 当前 origin 的远端 head；远端没有这个分支时交回空串。
 	 *
-	 * 幂等 init 靠它交回 revision：适配层每次启动都会调 `init()`，为「什么都没做」的那一次
-	 * 多跑一次 `git fetch` 就白耗一份启动预算。退回本地 HEAD 是安全的：下面每一条成功路径都把
-	 * HEAD 推上去过（引导分支那次是 `push -u`，对齐那次 HEAD 就是从远端 checkout 出来的）。
+	 * 已初始化的 init 也不能只读 tracking ref：`setRemote()` 只改 origin 地址，旧远端的
+	 * `refs/remotes/origin/<branch>` 仍会留着。重新 fetch 当前 origin 才能保证交回的 revision
+	 * 真的属于它；空 origin 则由 `remoteHead()` 的 ls-remote 复核明确识别成「没有基线」。
 	 */
-	async function knownRemoteRevision(o: SyncRunOptions): Promise<string> {
-		const tracked = await localRef(`refs/remotes/origin/${branch}`, o);
-		if (tracked !== null) return tracked;
-		return await localHead(o).catch(() => "");
+	async function currentRemoteRevision(o: SyncRunOptions): Promise<string> {
+		return (await remoteHead(o)) ?? "";
 	}
 
 	/**
@@ -708,9 +706,9 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 	async function init(opts: SyncRunOptions): Promise<SyncInitResult> {
 		// 共享预算（同 `fetch`）：init 是 clone + 引导提交，子进程最多的一条路径。
 		const o = budgeted(opts);
-		// 幂等：已经初始化过就什么都不做。换远端是 `setRemote` 的职责 —— 这里悄悄改掉 origin，
-		// 用户会以为同步去了他刚配的地方。
-		if (await ready()) return { revision: await knownRemoteRevision(o), warnings: [] };
+		// 幂等是不重建仓库、不造提交，不是交回缓存的 revision。这里不改 origin（那是 setRemote 的职责），
+		// 但必须按当前 origin 重新核对 head，否则 setRemote 后旧 tracking ref 会污染首份基线。
+		if (await ready()) return { revision: await currentRemoteRevision(o), warnings: [] };
 		// 未初始化而手上根本没地址：给一句指回配置的错误，而不是 git 那句 “You must specify a repository”。
 		// 排在幂等那个 return **之后**：已初始化时 remote 留空是合法的（origin 才是真相来源）。
 		if (remote.trim() === "") {

@@ -1599,6 +1599,37 @@ describe("sync engine（假 backend）", () => {
 		eng.dispose();
 	});
 
+	it("★发布根锁获取期间预算耗尽 → 不调用 publish，失败结果保留已拉取的部分", async () => {
+		const budgetMs = 20;
+		const start = 1_000_000;
+		await remote.write(prefix, "remote.md", raw("Remote"));
+		await store.addEntry({ name: "Local", body: "local" });
+		const eng = engineWith(remote, { autoTimeoutMs: budgetMs });
+		let fetched = false;
+		remote.hooks.onFetch = () => {
+			fetched = true;
+		};
+		// 取锁前时间不变； publish 根锁真正建立后才越过 deadline。这样第一次发布前检查通过，
+		// 锁内若不复查就会把 remainingMs 钳成 1ms 并发起一次本应禁止的发布。
+		const clock = vi.spyOn(Date, "now").mockImplementation(() =>
+			fetched && existsSync(join(syncRoot, "sync.lock")) ? start + budgetMs + 1 : start,
+		);
+		try {
+			const res = await eng.push();
+			expect(remote.publishAttempts).toBe(0);
+			expect(res.ok).toBe(false);
+			expect(res.skipped?.reason).toMatch(/round budget of 20ms ran out before publishing/);
+			expect(res.pulled).toEqual(["remote.md"]);
+			expect(res.pushed).toEqual([]);
+			expect(await readFile(join(projectDir, "remote.md"), "utf8")).toContain("name: Remote");
+			expect(await remote.names(prefix)).toEqual(["remote.md"]);
+		} finally {
+			clock.mockRestore();
+			remote.hooks.onFetch = undefined;
+			eng.dispose();
+		}
+	});
+
 	it("预算耗尽但没有待发布的增量 → 仍然算成功（发布段本来就一个字节也不发）", async () => {
 		const seen: SeenCall[] = [];
 		const eng = engineWith(instrumented(seen, 80), { autoTimeoutMs: 20 });
