@@ -111,6 +111,16 @@ describe("公开出口上的同步符号", () => {
 		expect(new NonFastForwardError("x").name).toBe("NonFastForwardError");
 	});
 
+	it("manifest transport 的构造与匹配也从公开出口提供", async () => {
+		const api = await import("../src/index.js");
+		const transport = api.syncTransport("https://token@example.invalid/o/r.git", "main");
+		const manifest = api.emptyManifest(transport);
+		expect(api.manifestMatchesTransport(manifest, transport)).toBe(true);
+		expect(api.manifestMatchesTransport(manifest, api.syncTransport("https://other.invalid/o/r.git", "main"))).toBe(false);
+		expect(api.manifestMatchesTransport(manifest, { ...transport, branch: "next" })).toBe(false);
+		expect(JSON.stringify(manifest)).not.toContain("token@example.invalid");
+	});
+
 	it("端口的自省面也在出口上：init 的结果形状、getRemote / setRemote", () => {
 		// 构造不碰盘：这里只看装配出来的对象上有没有那几个方法
 		const backend = createGitSyncBackend({

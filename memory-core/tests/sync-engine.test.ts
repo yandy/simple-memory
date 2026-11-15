@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,7 +16,13 @@ import {
 import type { DeviceIdentity } from "../src/sync/device.js";
 import { createSyncEngine, type SyncEngine } from "../src/sync/engine.js";
 import { sha256Hex } from "../src/sync/hash.js";
-import { MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "../src/sync/manifest.js";
+import {
+	MANIFEST_VERSION,
+	type SyncManifest,
+	manifestPath,
+	readManifest,
+	writeManifest,
+} from "../src/sync/manifest.js";
 import { remoteProjectKey } from "../src/sync/paths.js";
 import { serializeEntryFile } from "../src/store/entry-file.js";
 import { tryWithLock } from "../src/store/fs-lock.js";
@@ -322,6 +329,36 @@ async function makeDevice(
 	};
 }
 
+/** 同一记忆根里的另一个项目：共享暂存 clone、根锁与 state 目录，但本地目录和 projectKey 不同。 */
+async function makeSharedProject(name: string, identityKey: string, config: SyncConfig = SYNC_CONFIG): Promise<Device> {
+	const project = join(device.root, "git", name);
+	await mkdir(project, { recursive: true });
+	const memoryStore = new MemoryStore(CFG(project));
+	const key = remoteProjectKey(identityKey);
+	return {
+		root: device.root,
+		syncRoot,
+		projectDir: project,
+		projectKey: key,
+		prefix: `git/${key}`,
+		store: memoryStore,
+		engine: createSyncEngine({
+			syncRoot,
+			projectDir: project,
+			projectKey: key,
+			store: memoryStore,
+			backend: remote,
+			device: DEVICE,
+			config,
+			now: NOW,
+		}),
+	};
+}
+
+function withTransport(manifest: SyncManifest, branch = "main", remoteHash = "0".repeat(64)): SyncManifest {
+	return { ...manifest, transport: { remoteHash, branch } };
+}
+
 /** 目录的「名字 + mtime」指纹：用来断言「一个字都没动」。 */
 async function fingerprint(target: string): Promise<Array<[string, number]>> {
 	const out: Array<[string, number]> = [];
@@ -366,6 +403,10 @@ describe("sync engine（假 backend）", () => {
 		expect(res.revision).toBe(remote.revision);
 		const manifest = await readManifest(manifestPath(syncRoot, projectKey));
 		expect(manifest?.base.revision).toBe(remote.revision);
+		expect(manifest?.transport).toEqual({
+			remoteHash: createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex"),
+			branch: "main",
+		});
 		expect(manifest?.files["a.md"].hash).toBe(sha256Hex(raw("A")));
 	});
 
@@ -394,6 +435,10 @@ describe("sync engine（假 backend）", () => {
 
 		const res = await engine.push();
 		expect(res.pushed).toEqual(["B.md"]);
+		expect((await readManifest(manifestPath(syncRoot, projectKey)))?.transport).toEqual({
+			remoteHash: createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex"),
+			branch: "main",
+		});
 		// 名字与 mtime 都没变 = 本轮真的一个字都没写（含 MEMORY.md 没被重写）
 		expect(await fingerprint(projectDir)).toEqual(before);
 		expect(await backupNames(projectDir, "sync")).toEqual([]); // 没有收敛动作 → 不快照
@@ -479,6 +524,10 @@ describe("sync engine（假 backend）", () => {
 			await one.store.applyEntryFiles({ writes: [{ file: "发布状态.md", raw: desktop }], deletes: [] });
 			await writeManifest(manifestPath(one.syncRoot, one.projectKey), {
 				version: MANIFEST_VERSION,
+				transport: {
+					remoteHash: createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex"),
+					branch: "main",
+				},
 				base: { revision: remote.revision, syncedAt: "" },
 				files: {
 					"发布状态.md": {
@@ -1317,6 +1366,78 @@ describe("sync engine（假 backend）", () => {
 		const second = await readManifest(manifestPath(syncRoot, projectKey));
 		expect(second?.version).toBe(MANIFEST_VERSION);
 		expect(second?.files["A.md"].hash).toBe(first?.files["A.md"].hash);
+	});
+
+	it.each([
+		{ label: "空的新 origin", unrelated: false },
+		{ label: "无关且非空的新 origin", unrelated: true },
+	])("$label：A 换传输后写入的旧清单绝不删除 B 的未改本地条目", async ({ unrelated }) => {
+		const other = await makeSharedProject("other", "example.com/org/other");
+		await store.addEntry({ name: "A", body: "a" });
+		await other.store.addEntry({ name: "B", body: "b" });
+		expect((await engine.push()).ok).toBe(true);
+		expect((await other.engine.push()).ok).toBe(true);
+		const oldA = await readManifest(manifestPath(syncRoot, projectKey));
+		const oldB = await readManifest(manifestPath(syncRoot, other.projectKey));
+		if (!oldA || !oldB) throw new Error("old baselines were not written");
+
+		// 模拟另一个进程把共享 clone 切到 O2 后，旧轮次才把自己的 O1 清单写回来。
+		remote.origin = join(dir, "new-origin.git");
+		await remote.remove(prefix, "A.md");
+		await remote.remove(other.prefix, "B.md");
+		if (unrelated) await remote.write(other.prefix, "unrelated.md", raw("Unrelated"));
+		await writeManifest(manifestPath(syncRoot, projectKey), withTransport(oldA));
+		await writeManifest(manifestPath(syncRoot, other.projectKey), withTransport(oldB));
+
+		const report = await other.engine.status();
+		expect(report.base).toBeNull();
+		expect(report.errors.join("\n")).toMatch(/transport.*(ignor|reset)/i);
+		const round = await other.engine.pull();
+		expect(round.ok).toBe(true);
+		expect(round.deletedLocal).toEqual([]);
+		expect(await readFile(join(other.projectDir, "B.md"), "utf8")).toContain("b");
+	});
+
+	it("branch 变化同样作废旧基线，不把新分支的空状态解释成本地删除", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		expect((await engine.push()).ok).toBe(true);
+		const old = await readManifest(manifestPath(syncRoot, projectKey));
+		if (!old) throw new Error("old baseline was not written");
+		const actualHash = createHash("sha256").update(SYNC_CONFIG.remote, "utf8").digest("hex");
+		await writeManifest(manifestPath(syncRoot, projectKey), withTransport(old, "main", actualHash));
+		await remote.remove(prefix, "A.md");
+		const branchEngine = createSyncEngine({
+			syncRoot,
+			projectDir,
+			projectKey,
+			store,
+			backend: remote,
+			device: DEVICE,
+			config: { ...SYNC_CONFIG, branch: "next" },
+			now: NOW,
+		});
+
+		const round = await branchEngine.pull();
+		expect(round.ok).toBe(true);
+		expect(round.deletedLocal).toEqual([]);
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("a");
+	});
+
+	it("v1 清单在新传输状态下必须被忽略，而不是继续参与删除差集", async () => {
+		await store.addEntry({ name: "A", body: "a" });
+		expect((await engine.push()).ok).toBe(true);
+		const path = manifestPath(syncRoot, projectKey);
+		const old = await readManifest(path);
+		if (!old) throw new Error("old baseline was not written");
+		const { transport: _transport, ...v1 } = { ...old, version: 1 };
+		await writeFile(path, JSON.stringify(v1), "utf8");
+		remote.origin = join(dir, "another-origin.git");
+		await remote.remove(prefix, "A.md");
+
+		const round = await engine.pull();
+		expect(round.ok).toBe(true);
+		expect(round.deletedLocal).toEqual([]);
+		expect(await readFile(join(projectDir, "A.md"), "utf8")).toContain("a");
 	});
 
 	it("同一台机器上两个项目的引擎可以先后完成同步（根锁不整轮互斥）", async () => {

@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NonFastForwardError, type SyncBackend, type SyncRunOptions, type SyncScope } from "../src/sync/backend.js";
 import { type GitSyncBackendOptions, createGitSyncBackend, gitAvailable } from "../src/sync/backend-git.js";
 import { sha256Hex } from "../src/sync/hash.js";
+import { syncLockPath } from "../src/sync/paths.js";
+import { withLock } from "../src/store/fs-lock.js";
 
 const execFileP = promisify(execFile);
 
@@ -883,6 +885,44 @@ describe.skipIf(!GIT)(
 			const stale = device("a");
 			expect(await stale.getRemote()).toBe(other);
 			expect((await stale.fetch(scope, runOpts)).revision).toBe(next);
+		});
+
+		it("setRemote 与传输轮共用根锁：锁忙时有界失败且 origin 不变", async () => {
+			const a = await onlineDevice("a");
+			const other = join(dir, "locked-remote.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await withLock(syncLockPath(join(dir, "a")), "test-holder", { timeoutMs: 1_000 }, async () => {
+				await expect(a.setRemote(other, { timeoutMs: 30 })).rejects.toThrow(/lock/i);
+			});
+			expect(await a.getRemote()).toBe(remote);
+		});
+
+		it("旧 fetch 的 base.remote 与当前 origin 不同 → NonFastForward，绝不写入新远端", async () => {
+			const a = await onlineDevice("a");
+			const oldOrigin = await a.getRemote();
+			if (!oldOrigin) throw new Error("old origin is missing");
+			const other = join(dir, "stale-publish.git");
+			await fixtureGit(["init", "--bare", "--quiet", other], dir);
+			await a.setRemote(other, runOpts);
+
+			await expect(
+				a.publish(
+					scope,
+					{ writes: [{ path: "poison.md", content: "旧轮次" }], deletions: [] },
+					{ revision: "", remote: oldOrigin },
+					publishOpts,
+				),
+			).rejects.toBeInstanceOf(NonFastForwardError);
+			expect(await fixtureGit(["ls-remote", "--heads", other], dir)).toBe("");
+
+			const revision = await a.publish(
+				scope,
+				{ writes: [{ path: "fresh.md", content: "新轮次" }], deletions: [] },
+				{ revision: "", remote: other },
+				publishOpts,
+			);
+			expect(revision).toMatch(/^[0-9a-f]{40}$/);
+			expect(await fixtureGit(["ls-tree", "--name-only", "-r", "main"], repoDir("a"))).toContain("fresh.md");
 		});
 
 		it("setRemote()：未初始化时什么都不改（那是配置的活），空地址 fail-closed", async () => {

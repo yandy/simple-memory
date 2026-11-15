@@ -227,7 +227,8 @@ manifest（`.sync/state/<project-key>.json`）：
 
 ```jsonc
 {
-	"version": 1,
+	"version": 2,
+	"transport": { "remoteHash": "<sha256(actual origin string)>", "branch": "main" },
 	"base": { "revision": "<git commit sha>", "syncedAt": "<ISO>" },
 	"files": {
 		"foo.md": { "hash": "<sha256(bytes)>", "modified": "<frontmatter modified>", "bytes": 1234 }
@@ -260,8 +261,14 @@ hash 用 sha256（`node:crypto`，`store/paths.ts` 已在用）。**内容相同
 
 首次同步（无 manifest）时 base 为空集：一台**空**的新设备拉下全部远端条目、零冲突（最常见的
 onboarding 路径）；一台**已有**记忆的设备与远端同名的条目会走冲突分支，产生带后缀的副本，交给
-`/dream` 合并（§6.12 会在初始化时明确告知）。manifest 读不懂（版本不认识、JSON 坏）一律当"无 base"
-处理，等价首次同步 —— 不会静默丢东西，最坏是多产生几条冲突副本。
+`/dream` 合并（§6.12 会在初始化时明确告知）。manifest 读不懂（v1、版本不认识、JSON 坏、transport
+形状不对）一律当"无 base"处理，等价首次同步 —— 不会静默丢东西，最坏是多产生几条冲突副本。
+
+v2 的 `transport` 是差集的安全边界：`remoteHash` 是**实际 origin 字符串**的 sha256（绝不写原始 URL，
+避免把 token 复制进 state），`branch` 是配置分支。引擎在同一把根锁内完成 `fetch()` + `getRemote()`，
+在任何差集之前核对二者；origin 或 branch 不匹配就只使用空 base。`status` 同样以空 base 计算并在
+`Errors` 中说明 reset，不抛错。换远端不必删除其它项目的 manifest，另一个进程晚写的旧 manifest
+也因仍带旧 transport 而被忽略，绝不会被解释成"用户删光了本地条目"。
 
 ### 6.4 冲突收敛
 
@@ -359,11 +366,13 @@ export interface SyncBackend {
 	 * 端口不承诺原子，但要求 backend **要么整体成功、要么抛错且不留下半推状态**
 	 * （git 天然是一个 commit；S3 需要清单对象 + 条件写）。
 	 * `base.revision` 用于乐观并发：远端已经不在 base 上时抛 NonFastForward（§6.11）。
+	 * `base.remote` 是 fetch 同一把根锁内读到的实际 origin；git 在任何远端 mutation 前复核它，
+	 * 不同则同样抛 NonFastForward，防止旧进程把 stale delta 写进新 origin。
 	 */
 	publish(
 		scope: SyncScope,
 		changes: { writes: Array<{ path: string; content: string }>; deletions: string[] },
-		base: { revision: string },
+		base: { revision: string; remote?: string },
 		opts: SyncRunOptions & { message: string; author: { name: string; email: string } },
 	): Promise<string>;
 }
@@ -391,7 +400,8 @@ export interface SyncRunOptions {
   （`ls-tree` 给的是 blob sha1，与端口契约的 sha256 不同源；记忆文本量小，一次批量读比维护两套
   hash 语义简单）。
 - `read()` 复用同一次 `cat-file --batch` 的结果（`fetch()` 内部缓存），不额外 spawn。
-- `publish()`：`git reset --hard origin/<branch>`（暂存 = theirs）→ 写入 `changes.writes`、删除
+- `publish()`：先比较 `base.remote` 与当前 origin（不同 → NonFastForward，不写新 origin）→
+  `git reset --hard origin/<branch>`（暂存 = theirs）→ 写入 `changes.writes`、删除
   `changes.deletions` → `git add -A -- git/<project-key>`（限定路径，不吞用户随手丢进暂存目录的
   东西；`-A` 让删除也进索引）→ `git commit`（作者 = `device.json`）→ `git push origin <branch>`。
   因为我们的 commit 是 theirs 的子提交，push 是快进。**不触发任何 git merge** —— 三方差集已经在
@@ -462,7 +472,7 @@ async applyEntryFiles(
 
 ```
 ① 传输段   tryWithLock(<root>/.sync/sync.lock, "sync")     # 保护共享的 .sync/repo；忙 → 跳过本轮
-             backend.fetch() → RemoteView（含内容）
+             backend.fetch() → RemoteView（含内容） + backend.getRemote()（快照 transport 身份）
            释放根锁
 ② 应用段   store.tryWithLogicalLock(...)                   # 当前项目的进程内逻辑锁；忙 → 跳过本轮
              三方差集（纯函数）
@@ -477,8 +487,9 @@ async applyEntryFiles(
            释放根锁
 ```
 
-- 两把锁都用 **try 语义**，任一忙就跳过并记一条可读原因（与 dream / extract 同款）。因为不嵌套，
-  锁序论证比"根锁在外"更强：不可能成环。
+- 同步轮的传输/发布锁用 **try 语义**，任一忙就跳过并记一条可读原因（与 dream / extract 同款）。
+  `init()` / `setRemote()` 是管理操作，改用同一路径上的**有界 `withLock`** 跨进程排队；它们不得在
+  引擎的 fetch/publish 锁内再调用，因此仍不嵌套，也不可能成环。
 - ②与③之间根锁被放开，另一个进程可能抢先发布 → ③ 撞非快进 → 整轮重跑一次（§6.5）。
 - **push 轮会不会改本地？会。** 「先收敛再发布」意味着远端有新东西时，push 轮也要拉进来、也可能
   产生冲突副本、也要 `rebuildIndex()` → **所以要快照**。唯一的例外是远端 `revision === base.revision`
@@ -498,6 +509,8 @@ core 的引擎只提供中立入口：`syncPull()` / `syncPush()` / `syncStatus(
    幂等空转）。失败只降级成一条可读提示 —— 网络抖动、认证失败、用户填错 URL 都不得让 store、工具、
    索引或其他模块初始化失败（§4.11、§6.11）。
 2. **跑一轮 `push()`**，且必须排在索引被冻结/读取之前（§4.8）。`pullOnStart !== true` 时只做第 1 步。
+   适配层在 prepare 之前只计算一次自动启动 deadline，push 只拿剩余正预算；若 prepare 已耗尽，
+   就附一条"下一轮再推"的非致命提示并跳过，不得再发起一次 1ms 网络轮。
 
 - **为什么是一轮 `push()` 而不是 `pull()` 再补推。** `push` 轮 = 收敛 + 发布（§6.7 的①②③），一轮就把
   「拉下远端的新东西」和「上一次会话没推出去的本地变更」都做完了。`pull()` + `flush()` 做不到：`flush()`
@@ -596,8 +609,9 @@ pi 的 `memory.json` / dsh 的行 `config:` 读出后交给 `mergeConfig`）：
 | sync 配置校验不通过（§6.9） | 当成未启用 + 一条可读通知；**其余记忆功能照常** |
 | 未初始化且 `remote` 为空 | 不初始化（没有地址可初始） + 一条非致命提示"在 `memory.json` 里设 `sync.remote`"；`syncConfigErrors(..., { initialized: true })` 下这不算错 |
 | PATH 上没有 git | 同上，报"git 不可用"（`execFile` 失败口径同 `store/paths.ts`） |
-| 暂存 clone 不存在（未初始化） | 启动时按配置**自动初始化**（§6.12）；失败则本轮同步跳过 + 一条提示，本地记忆用法不受影响。自动初始化受 `autoTimeoutMs` 约束，不在根锁内跑 |
+| 暂存 clone 不存在（未初始化） | 启动时按配置**自动初始化**（§6.12）；失败则本轮同步跳过 + 一条提示，本地记忆用法不受影响。自动初始化受 `autoTimeoutMs` 约束，经同一路径的有界管理锁串行，在唯一 staging 完成后原子发布 |
 | 配置的 `remote` 与暂存 clone 的 origin 不一致 | **非致命**：一条可读错误提醒（每次启动一次即可，不刷屏）+ `status` 报一行并指向 `/memory sync remote <url>`；同步**继续按 origin 走**，其余记忆功能照常（§6.12） |
+| manifest 的 origin hash / branch 与本轮实际传输不同，或旧进程晚写旧 manifest | 该 manifest 一律当空 base；`status` 显示 reset，不删除未改本地条目，也不允许 stale publish 写入新 origin（§6.3、§6.5） |
 | 配置的 `remote` 为空但 origin 已存在 | 完全合法：照常用 origin 同步，不报配置错（§6.9） |
 | 离线 / fetch 失败 / 认证失败（含自动 init 的 clone） | 本轮跳过 + 一条提示；不重试到卡住会话（受 `autoTimeoutMs` 上限），下次启动或显式 pull/push 再试 |
 | publish 失败 | 本地状态原样保留，manifest 的 base **不前进**，脏标记留着 → 下次写触发或下次会话补推 |
@@ -644,12 +658,15 @@ pi/dsh 也没有改用户配置文件的既有能力，而初始化收到的 URL
    这一步只能排在 clone 之前：clone 一旦跑过，`.sync/repo` 就已经在磁盘上，`ready()` 随即变 true ——
    "拒绝了初始化、却已经把 clone 建好"会让拒绝分支变成假话（同一份 origin 仍然是两个写入者，
    下一次启动还会按 origin 继续同步）。所以拒绝路径上不得留下任何可被认成"已初始化"的产物。
-4. `git clone <remote>`（远端是空仓库时 `git init` + `remote add` + 建 `<branch>`）。这是最长的一步，
-   所以：不在根级 sync 锁内跑（否则期间每一次 `MemoryStore.save` 都排队），且受 `autoTimeoutMs` 约束。
+4. 经 `<root>/.sync/sync.lock` 的**有界 `withLock`** 串行管理操作；拿到锁后先尊重已 abort 的 signal。
+   在唯一 `repo.init-<pid>-<random>` staging 中 `git clone <remote>`（远端是空仓库时 `git init` +
+   `remote add` + 建 `<branch>`），完成后原子 `rename` 为 `.sync/repo`。`ready()` 仍只看最终
+   `repo/.git`；失败/abort 只清自己的 staging，崩溃残留只能由之后的串行 init 清理，绝不删除另一
+   runtime/process 已发布的 clone。整个自动初始化受 `autoTimeoutMs` 约束。
 5. clone 成功**之后**才写 `device.json`（uuid + hostname）：拒绝或 clone 失败时都不留半份设备身份。
 6. 若本地已有记忆：明确告知"与远端同名的条目会按 §6.4 产生带后缀的副本，下次 `/dream` 会合并"。
-7. 初始化交回 `SyncInitResult.revision`（远端真的有的那一个）；首份基线由适配层用
-   `emptyManifest()` + 这个 revision 写出。`files` 必须是**空集**：base 为空时，一台空设备拉下全部
+7. 初始化交回 `SyncInitResult.revision`（远端真的有的那一个）；适配层再读**实际 origin**，以
+   `emptyManifest(syncTransport(origin, branch))` + 这个 revision 写出首份基线。`files` 必须是**空集**：base 为空时，一台空设备拉下全部
    远端条目、零冲突；一台已有记忆的设备与远端同名条目走冲突分支（§6.3），而不是被当成"本地删光了"。
 
 **失败与恢复**：自动初始化失败（离线、认证、URL 写错）只产生一条非致命提示 —— store、工具、索引

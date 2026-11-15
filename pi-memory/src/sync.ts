@@ -8,6 +8,7 @@ import {
 	emptyManifest,
 	loadOrCreateDevice,
 	type MemoryStore,
+	manifestMatchesTransport,
 	manifestPath,
 	normalizeRemoteUrl,
 	type ProjectIdentity,
@@ -20,6 +21,7 @@ import {
 	type SyncStatusReport,
 	syncConfigErrors,
 	syncRootPath,
+	syncTransport,
 	writeManifest,
 } from "@yandy0725/memory-core";
 import type { MemoryConfig } from "./config";
@@ -60,7 +62,12 @@ function sameRemote(left: string, right: string): boolean {
 /** core 已脱敏；这里守住适配层自己的通知边界，不把将来新增错误里的口令带进 UI。 */
 export function errorMessage(error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
-	return message.replace(/(\/\/[^/\s:@]+:)[^@\s]+@/g, "$1***@");
+	return message
+		.replace(/\b((?:git\+)?https?:\/\/)([^/\s@]+)@/gi, (_whole, scheme: string, userinfo: string) => {
+			const colon = userinfo.indexOf(":");
+			return colon === -1 ? `${scheme}***@` : `${scheme}${userinfo.slice(0, colon)}:***@`;
+		})
+		.replace(/(\/\/[^/\s:@]+:)[^@\s]+@/g, "$1***@");
 }
 
 function uniqueFiles(files: readonly string[]): string[] {
@@ -240,12 +247,19 @@ export async function createPiSyncRuntime(options: {
 			if (disposed) return disposedResult();
 			const manifest = await readManifest(projectManifest);
 			if (disposed) return disposedResult();
-			if (ready && manifest !== null && runtime.engine !== null) {
+			let transport: ReturnType<typeof syncTransport> | null = null;
+			if (ready && manifest !== null) {
+				const origin = await backend.getRemote();
+				if (origin === null) throw new Error("the initialized sync origin is unavailable; no baseline was trusted");
+				transport = syncTransport(origin, branch);
+			}
+			const transportMatches = manifest !== null && transport !== null && manifestMatchesTransport(manifest, transport);
+			if (ready && transportMatches && runtime.engine !== null) {
 				return { ok: true, engine: runtime.engine };
 			}
 
 			let initializedResult: SyncInitResult | null = null;
-			if (!ready || manifest === null) {
+			if (!ready || !transportMatches) {
 				// 首次 init 做共存检查；缺失基线时复核当前 origin，绝不沿用旧 base。
 				const controller = new AbortController();
 				initController = controller;
@@ -269,7 +283,10 @@ export async function createPiSyncRuntime(options: {
 			}
 
 			if (initializedResult !== null) {
-				const baseline = emptyManifest();
+				// init 之后的真实 origin 才是基线身份；配置漂移或跨进程旧写入都不能换掉它。
+				const origin = await backend.getRemote();
+				if (origin === null) throw new Error("the initialized sync origin is unavailable; no baseline was written");
+				const baseline = emptyManifest(syncTransport(origin, branch));
 				baseline.base = { revision: initializedResult.revision, syncedAt: now().toISOString() };
 				await writeManifest(projectManifest, baseline);
 				if (disposed) return disposedResult();
@@ -341,7 +358,7 @@ export async function createPiSyncRuntime(options: {
 		},
 		changeRemote(remote: string, timeoutMs: number): Promise<PrepareResult> {
 			if (disposed) return Promise.resolve(disposedResult());
-			if (remoteChangeInFlight !== null) return remoteChangeInFlight;
+			if (remoteChangeInFlight !== null) return Promise.resolve(busyResult());
 			if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
 				return Promise.resolve({ ok: false, reason: "sync initialization requires a finite positive timeout budget" });
 			}

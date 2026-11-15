@@ -17,7 +17,16 @@ import { type ConflictOutcome, type ConflictSide, resolveConflict } from "./conf
 import type { DeviceIdentity } from "./device.js";
 import { type SyncConflict, diffThreeWay, type SyncDiff } from "./diff.js";
 import { sha256Hex } from "./hash.js";
-import { emptyManifest, MANIFEST_VERSION, manifestPath, readManifest, writeManifest } from "./manifest.js";
+import {
+	type SyncTransport,
+	emptyManifest,
+	MANIFEST_VERSION,
+	manifestMatchesTransport,
+	manifestPath,
+	readManifest,
+	syncTransport,
+	writeManifest,
+} from "./manifest.js";
 import { remotePrefixFromKey, syncLockPath } from "./paths.js";
 import { type LocalScan, scanLocalEntries } from "./scan.js";
 import { createSyncScheduler, type SyncScheduler } from "./scheduler.js";
@@ -389,6 +398,11 @@ function markUnagreed(plan: ApplyPlan, file: string): void {
 interface RemoteSnapshot {
 	view: RemoteView;
 	revision: string;
+	/** fetch 同一根锁内读到的真实 origin：只用于 stale-publish 校验与派生哈希，绝不写明文进清单。 */
+	remote: string;
+	transport: SyncTransport;
+	/** status 在 origin 缺失时仍可 dry-run，但此时任何已存基线都不得参与差集。 */
+	originVerified: boolean;
 	theirs: SyncFileSet;
 	outOfScope: string[];
 }
@@ -538,10 +552,19 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	 * 自足的快照，读内容不能推迟到共享的传输状态上。同一句话也写在端口注释里（backend 实现方
 	 * 看的是那一份）：两边都得说，否则独立包实现的 backend 会把 `read()` 写成对着共享状态现取。
 	 */
-	async function readRemoteSnapshot(timeoutMs: number, signal: AbortSignal): Promise<RemoteSnapshot> {
+	async function readRemoteSnapshot(
+		timeoutMs: number,
+		signal: AbortSignal,
+		allowUnverifiedForStatus = false,
+	): Promise<RemoteSnapshot> {
 		const locked = await withRootLock(async () => {
 			const view = await backend.fetch(scope, { timeoutMs, signal });
-			return { view, listed: await view.list() };
+			// fetch 与 origin 自省必须同锁：setRemote 也用这把根锁，因此这份身份就是该快照的传输身份。
+			const remote = await backend.getRemote();
+			if (remote === null && !allowUnverifiedForStatus) {
+				throw new Error("the sync origin is unavailable after fetch; no baseline was trusted");
+			}
+			return { view, listed: await view.list(), remote, originVerified: remote !== null };
 		});
 		if (!locked.acquired) throw new SyncSkip(ROOT_LOCK_BUSY);
 
@@ -564,7 +587,16 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			theirs.set(path, { hash, modified: "", bytes: 0 });
 		}
 		outOfScope.sort();
-		return { view: locked.value.view, revision: locked.value.view.revision, theirs, outOfScope };
+		return {
+			view: locked.value.view,
+			revision: locked.value.view.revision,
+			// 仅 status 允许 origin=null 的降级快照；配置值只用于展示形状，trustedManifest 会强制为空。
+			remote: locked.value.remote ?? config.remote,
+			transport: syncTransport(locked.value.remote ?? config.remote, config.branch),
+			originVerified: locked.value.originVerified,
+			theirs,
+			outOfScope,
+		};
 	}
 
 	/**
@@ -722,7 +754,11 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// 扫描抛错（非 ENOENT 的 readdir 失败）= 整轮跳过：绝不带着「读不出来」的 ours 去算差集，
 		// 那等于宣布本机删光了全部记忆，并把删除传播到远端。
 		const scan: LocalScan = await scanLocalEntries(memoryDir, platform);
-		const manifest = (await readManifest(manifestFile)) ?? emptyManifest();
+		const stored = await readManifest(manifestFile);
+		// 任何 origin/branch 变化都让旧基线失效。旧进程晚写的 manifest 仍带旧 transport，
+		// 因此即使它落在换远端之后，也不能把新远端解释成「本地全删了」。
+		const manifest =
+			stored !== null && manifestMatchesTransport(stored, snapshot.transport) ? stored : emptyManifest(snapshot.transport);
 		const previousBase = asFileSet(manifest.files);
 
 		// 解析不出/读不了的本地文件不进 `ours`，也不按基线补回：它们本轮一律不动，
@@ -817,6 +853,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		const baseFiles = agreedBaseFiles(theirs, localAfter, previousBase, untouched, plan.unagreed);
 		await writeManifest(manifestFile, {
 			version: MANIFEST_VERSION,
+			transport: snapshot.transport,
 			base: { revision: snapshot.revision, syncedAt: now().toISOString() },
 			files: asFileRecord(baseFiles),
 		});
@@ -916,7 +953,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 			return backend.publish(
 				scope,
 				delta,
-				{ revision: snapshot.revision },
+				{ revision: snapshot.revision, remote: snapshot.remote },
 				{ timeoutMs: remainingMs(deadline), signal, message: publishMessage(delta), author: commitAuthor(device) },
 			);
 		});
@@ -933,6 +970,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// 发布成功：两侧真达成一致了，基线才前进到新的 revision，并把发布出去的增量记进去。
 		await writeManifest(manifestFile, {
 			version: MANIFEST_VERSION,
+			transport: snapshot.transport,
 			base: { revision, syncedAt: now().toISOString() },
 			files: asFileRecord(applied.remoteAfterPublish),
 		});
@@ -1115,12 +1153,23 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		// dry-run：下面全程只读 —— 不快照、不落盘、不重建索引、不写基线
 		let snapshot: RemoteSnapshot;
 		try {
-			snapshot = await readRemoteSnapshot(timeoutMs, signal);
+			snapshot = await readRemoteSnapshot(timeoutMs, signal, true);
 		} catch (err) {
 			report.errors.push(describeError(err));
 			return report;
 		}
 		report.outOfScopeRemote = [...snapshot.outOfScope];
+		const trustedManifest =
+			snapshot.originVerified && manifest !== null && manifestMatchesTransport(manifest, snapshot.transport)
+				? manifest
+				: null;
+		report.base = trustedManifest?.base ?? null;
+		if (manifest !== null && trustedManifest === null) {
+			report.errors.push(
+				"the stored manifest transport does not match the fetched origin and branch; " +
+					"it was ignored and reset to an empty base for this report",
+			);
+		}
 
 		let scan: LocalScan;
 		try {
@@ -1131,7 +1180,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 		}
 		report.unparsableLocal = [...scan.unparsable];
 
-		const previousBase = asFileSet(manifest?.files ?? {});
+		const previousBase = asFileSet(trustedManifest?.files ?? {});
 		const ours: SyncFileSet = new Map(scan.files);
 		// 与真跑的同步轮同一套口径：读不出的本地文件本轮一律不动，所以既不会出现在
 		// ahead/behind，也不会出现在 conflicts 里 —— 否则报告会把一个永远不会执行的动作说给用户听。

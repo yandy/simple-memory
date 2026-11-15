@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => ({
 	syncEngines: [] as SyncEngine[],
 	/** dispose 竞争测试只延迟真实 push/init 的起点，不替换其结果或行为。 */
 	syncPushBarrier: { current: null as Promise<void> | null },
+	syncPushTimeouts: [] as number[],
 	syncInitBarrier: { current: null as Promise<void> | null },
 	syncInitSignals: [] as Array<AbortSignal | undefined>,
 	/** 只故障注入适配层直接调用的 writeManifest；core engine 内部仍走真实实现。 */
@@ -131,6 +132,7 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 				},
 				push: async (timeoutMs?: number) => {
 					mocks.syncEvents.push("push:start");
+					mocks.syncPushTimeouts.push(timeoutMs as number);
 					if (mocks.syncPushBarrier.current) await mocks.syncPushBarrier.current;
 					try {
 						return await engine.push(timeoutMs);
@@ -204,6 +206,7 @@ export const projectIdentityMock = mocks.projectIdentityMock;
 export const syncEvents = mocks.syncEvents;
 export const syncEngines = mocks.syncEngines;
 export const syncPushBarrier = mocks.syncPushBarrier;
+export const syncPushTimeouts = mocks.syncPushTimeouts;
 export const syncInitBarrier = mocks.syncInitBarrier;
 export const syncInitSignals = mocks.syncInitSignals;
 export const syncManifestWriteFailure = mocks.syncManifestWriteFailure;
@@ -254,6 +257,7 @@ export function resetWiringMocks(): void {
 	syncEvents.length = 0;
 	syncEngines.length = 0;
 	syncPushBarrier.current = null;
+	syncPushTimeouts.length = 0;
 	syncInitBarrier.current = null;
 	syncInitSignals.length = 0;
 	syncManifestWriteFailure.current = null;

@@ -205,8 +205,16 @@ export type { SyncEngine, SyncEngineOptions, SyncRoundResult, SyncStatusReport }
 
 export { sha256Hex } from "./sync/hash.js";
 
-export { MANIFEST_VERSION, emptyManifest, manifestPath, readManifest, writeManifest } from "./sync/manifest.js";
-export type { SyncManifest } from "./sync/manifest.js";
+export {
+	MANIFEST_VERSION,
+	emptyManifest,
+	manifestMatchesTransport,
+	manifestPath,
+	readManifest,
+	syncTransport,
+	writeManifest,
+} from "./sync/manifest.js";
+export type { SyncManifest, SyncTransport } from "./sync/manifest.js";
 
 // 布局的单一来源：适配层渲染「这条记忆在远端哪里」一律调这几个，不要就地拼 `git/` 字面量；
 // 本地状态（`.sync` 目录与根锁文件）同理 —— `syncLockPath` 必须与引擎用的是同一条派生，

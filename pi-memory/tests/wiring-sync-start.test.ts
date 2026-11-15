@@ -4,7 +4,7 @@
  * harness 必须排在 ../index 与 ../src/sync 之前：只 stub 项目身份，git/backend/engine/device 全走真实现。
  */
 import { execFile } from "node:child_process";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -18,6 +18,7 @@ import {
 	readManifest,
 	remoteProjectKey,
 	syncRootPath,
+	syncTransport,
 } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -34,6 +35,7 @@ import {
 	syncInitBarrier,
 	syncInitSignals,
 	syncPushBarrier,
+	syncPushTimeouts,
 	uiWith,
 	waitFor,
 } from "./helpers/wiring-harness";
@@ -176,7 +178,8 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(prepared.engine).toBe(runtime.engine);
 		expect(runtime.engine).not.toBeNull();
 		expect(await readManifest(paths.manifest)).toEqual({
-			version: 1,
+			version: 2,
+			transport: syncTransport(remote, "main"),
 			base: { revision: await remoteRevision(), syncedAt: "2026-11-15T01:02:03.000Z" },
 			files: {},
 		});
@@ -186,6 +189,63 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(again).toEqual({ ok: true, engine: runtime.engine });
 		expect(syncEvents).toEqual([]);
 		runtime.engine?.dispose();
+	});
+
+	it("re-preparation binds the empty baseline to the actual origin, not a drifted configured remote", async () => {
+		const config = memoryConfig();
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		const first = await createPiSyncRuntime({ config, store, projectDir: s.dir, identity: gitIdentity(s.cwd) });
+		if (!first.runtime) throw new Error("first runtime was not created");
+		const prepared = await first.runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`first prepare failed: ${prepared.reason}`);
+		first.runtime.dispose();
+		const paths = syncPaths();
+		await rm(paths.manifest);
+		const drifted = {
+			...config,
+			sync: { ...config.sync, remote: join(s.cwd, "configured-but-not-origin.git") },
+		};
+		const second = await createPiSyncRuntime({ config: drifted, store, projectDir: s.dir, identity: gitIdentity(s.cwd) });
+		if (!second.runtime) throw new Error("second runtime was not created");
+
+		const reprepared = await second.runtime.prepare(10_000);
+		if (!reprepared.ok) throw new Error(`second prepare failed: ${reprepared.reason}`);
+		expect((await readManifest(paths.manifest))?.transport).toEqual(syncTransport(remote, "main"));
+		second.runtime.dispose();
+	});
+
+	it("prepare resets a manifest whose transport differs from the actual origin before returning an engine", async () => {
+		const config = memoryConfig();
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		const { runtime } = await createPiSyncRuntime({ config, store, projectDir: s.dir, identity: gitIdentity(s.cwd) });
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`prepare failed: ${prepared.reason}`);
+		const paths = syncPaths();
+		const stale = {
+			version: 2,
+			transport: { remoteHash: "0".repeat(64), branch: "main" },
+			base: { revision: await remoteRevision(), syncedAt: "2026-11-15T01:02:03.000Z" },
+			files: {},
+		};
+		await writeFile(paths.manifest, JSON.stringify(stale), "utf8");
+
+		const again = await runtime.prepare(10_000);
+		if (!again.ok) throw new Error(`reprepare failed: ${again.reason}`);
+		const reset = await readManifest(paths.manifest);
+		expect(reset?.transport).toEqual(syncTransport(remote, "main"));
+		expect(reset?.files).toEqual({});
+		runtime.dispose();
 	});
 
 	it("shares one backend init between concurrent prepare calls and returns the same engine", async () => {
@@ -347,6 +407,44 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(syncEvents).not.toContain("init:start");
 		expect(syncEvents).toContain("push:start");
 		expect(syncEvents).toContain("push:end");
+	});
+
+	it("prepare and startup push share one automatic deadline", async () => {
+		await enableSync({ pullOnStart: true, autoTimeoutMs: 1_000 });
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		let release!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
+			release = resolveBarrier;
+		});
+		const starting = handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
+		await waitFor(() => syncEvents.includes("init:start"), "startup prepare to reach init");
+		await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+		release();
+		await starting;
+
+		expect(syncPushTimeouts).toHaveLength(1);
+		expect(syncPushTimeouts[0]).toBeGreaterThan(0);
+		expect(syncPushTimeouts[0]).toBeLessThan(1_000);
+	});
+
+	it("an exhausted prepare budget skips startup push with a nonfatal next-round reason", async () => {
+		await enableSync({ pullOnStart: true, autoTimeoutMs: 300 });
+		const notify = vi.fn();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		let release!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveBarrier) => {
+			release = resolveBarrier;
+		});
+		const starting = handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+		await waitFor(() => syncEvents.includes("init:start"), "startup prepare to reach init");
+		await new Promise((resolveWait) => setTimeout(resolveWait, 400));
+		release();
+		await starting;
+
+		expect(syncPushTimeouts).toEqual([]);
+		expect(notify.mock.calls[0]?.[0]).toMatch(/startup budget.*next round/i);
 	});
 
 	it("does not initialize a local project and explains that v1 supports only git projects", async () => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect, promisify } from "node:util";
@@ -18,6 +18,8 @@ const harness = vi.hoisted(() => ({
 	fail: new Set<string>(),
 	/** 每个子进程花掉的真时间：预算是「剩下的毫秒」，不花点时间就看不出它在递减。 */
 	delayMs: 5,
+	/** 并发用例在真实文件系统边界上控制一个命令；其余命令仍按默认成功/失败分派。 */
+	onCall: null as null | ((args: string[], options: Record<string, unknown>) => void | Promise<void>),
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -45,8 +47,13 @@ vi.mock("node:child_process", async (importOriginal) => {
 				options: Record<string, unknown>,
 			): Promise<{ stdout: Buffer; stderr: string; child: { stdin?: unknown } }> => {
 				harness.calls.push({ args: [...args], options: { ...options } });
+				await harness.onCall?.(args, options);
 				await sleep(harness.delayMs);
 				if (harness.fail.has(args[0])) throw fakeError(args);
+				// git 的真实副作用只模拟本测试依赖的「clone/init 建出 .git」；其余命令保持可观察委托。
+				if (args[0] === "clone" || args[0] === "init") {
+					await mkdir(join(args.at(-1) as string, ".git"), { recursive: true });
+				}
 				return { stdout: Buffer.from(""), stderr: "", child: { stdin: undefined } };
 			},
 		},
@@ -67,6 +74,7 @@ describe("git backend 的子进程启动参数", () => {
 		harness.calls.length = 0;
 		harness.fail.clear();
 		harness.delayMs = 5;
+		harness.onCall = null;
 	});
 
 	afterEach(async () => {
@@ -164,6 +172,80 @@ describe("git backend 的子进程启动参数", () => {
 		expect(err?.exitCode).toBe(128);
 		expect(err?.message).toMatch(/git remote add/);
 		expect(err?.message).toMatch(/git clone had already failed/);
+	});
+
+	it("旧 init 的失败清理不能删掉另一实例已经发布的 clone，临时目录也不被 ready 误认", async () => {
+		const syncRoot = join(dir, "shared");
+		const memoryRoot = join(dir, "shared-memory");
+		const remote = "https://git.example.invalid/o/r.git";
+		const make = () => createGitSyncBackend({ syncRoot, memoryRoot, remote, branch: "main" });
+		const older = make();
+		const newer = make();
+		const controller = new AbortController();
+		let releaseOlder!: () => void;
+		const olderGate = new Promise<void>((resolve) => {
+			releaseOlder = resolve;
+		});
+		let markOlderPush!: () => void;
+		const olderPush = new Promise<void>((resolve) => {
+			markOlderPush = resolve;
+		});
+		harness.onCall = async (args, options) => {
+			if (args[0] === "push" && options.signal === controller.signal) {
+				markOlderPush();
+				await olderGate;
+				const aborted = new Error("older init aborted after the newer instance finished");
+				aborted.name = "AbortError";
+				throw aborted;
+			}
+		};
+
+		const oldFlight = older.init({ timeoutMs: 30_000, signal: controller.signal });
+		await olderPush;
+		const newFlight = newer.init({ timeoutMs: 30_000 });
+		// 旧实现里 newer 会直接看见 older 的半成品 repo 并成功；新实现则被管理锁串行，
+		// 等 older 清理自己的 staging 后才建最终 repo。两种顺序都由后面的所有 Promise 收束。
+		await Promise.race([newFlight, new Promise((resolve) => setTimeout(resolve, 50))]);
+		releaseOlder();
+		const outcomes = await Promise.allSettled([oldFlight, newFlight]);
+
+		expect(outcomes.some((outcome) => outcome.status === "fulfilled")).toBe(true);
+		expect(await newer.ready()).toBe(true);
+		expect((await readdir(syncRoot)).filter((name) => name.startsWith("repo.init-"))).toEqual([]);
+	});
+
+	it.each(["https", "git+https"])("%s 的 token-only userinfo 也会从整条错误链脱敏", async (scheme) => {
+		const token = "s3cr3t-token-only";
+		const bad = createGitSyncBackend({
+			syncRoot: join(dir, `creds-${scheme}`),
+			memoryRoot: join(dir, "creds-memory"),
+			remote: `${scheme}://${token}@127.0.0.1:1/o/r.git`,
+			branch: "main",
+		});
+		harness.fail.add("clone");
+		harness.fail.add("remote");
+
+		const err = await bad.init({ timeoutMs: 30_000 }).then(
+			() => null,
+			(e: unknown) => e as Error,
+		);
+		const printed = inspect(err, { depth: 8 });
+		expect(printed).not.toContain(token);
+		expect(printed).toContain(`${scheme}://***@127.0.0.1:1/o/r.git`);
+	});
+
+	it("没有 userinfo 的 HTTP URL 原样保留，不被误当凭据", async () => {
+		const plain = "https://127.0.0.1:1/o/r.git";
+		const bad = createGitSyncBackend({
+			syncRoot: join(dir, "plain"),
+			memoryRoot: join(dir, "plain-memory"),
+			remote: plain,
+			branch: "main",
+		});
+		harness.fail.add("clone");
+		harness.fail.add("remote");
+		const err = await bad.init({ timeoutMs: 30_000 }).catch((error: unknown) => error as Error);
+		expect(inspect(err, { depth: 8 })).toContain(plain);
 	});
 
 	it("预算耗尽时给出去的也不是 0：`timeout: 0` 在子进程上是「不限时」", async () => {

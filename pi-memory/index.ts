@@ -368,6 +368,8 @@ export default function (pi: ExtensionAPI) {
 			syncErrors.push(...assembled.errors);
 			const activeRuntime = assembled.runtime;
 			if (activeRuntime) {
+				// 自动初始化与启动收敛共用一份预算；prepare 之外绝不再造一份完整网络预算。
+				const startupDeadline = Date.now() + cfg.sync.autoTimeoutMs;
 				const prepared = await activeRuntime.prepare(cfg.sync.autoTimeoutMs);
 				if (!isCurrent()) return;
 				if (!prepared.ok) {
@@ -376,9 +378,17 @@ export default function (pi: ExtensionAPI) {
 					if (prepared.warning) syncErrors.push(prepared.warning);
 					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
 					if (cfg.sync.pullOnStart === true) {
-						const round = await activeRuntime.runActivity(() => prepared.engine.push(cfg.sync.autoTimeoutMs));
-						if (!isCurrent()) return;
-						if (!round.ok) syncErrors.push(round.skipped?.reason ?? "memory sync startup round failed");
+						const remaining = startupDeadline - Date.now();
+						if (remaining <= 0) {
+							syncErrors.push(
+								`the automatic startup budget of ${cfg.sync.autoTimeoutMs}ms was exhausted during preparation; ` +
+									"startup push was skipped and will run on the next round",
+							);
+						} else {
+							const round = await activeRuntime.runActivity(() => prepared.engine.push(remaining));
+							if (!isCurrent()) return;
+							if (!round.ok) syncErrors.push(round.skipped?.reason ?? "memory sync startup round failed");
+						}
 					}
 				}
 			}

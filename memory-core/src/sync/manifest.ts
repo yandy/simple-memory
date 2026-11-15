@@ -1,13 +1,30 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { sha256Hex } from "./hash.js";
 import type { SyncFileInfo } from "./types.js";
 
 /**
  * manifest 的**格式**版本。形状一旦变化就加一 —— 读到不认识的版本按「无 base」处理，
  * 见 `readManifest` 的说明。
  */
-export const MANIFEST_VERSION = 1;
+export const MANIFEST_VERSION = 2;
+
+/** 基线所属的传输端点。只存 origin 的摘要，绝不把可能带凭据的 URL 写进 state。 */
+export interface SyncTransport {
+	remoteHash: string;
+	branch: string;
+}
+
+/** 用 fetch 时读到的真实 origin 与配置分支构造传输身份。 */
+export function syncTransport(remote: string, branch: string): SyncTransport {
+	return { remoteHash: sha256Hex(remote), branch };
+}
+
+/** 只有同一 origin 与同一 branch 的基线才能参与三方差集。 */
+export function manifestMatchesTransport(manifest: SyncManifest, transport: SyncTransport): boolean {
+	return manifest.transport.remoteHash === transport.remoteHash && manifest.transport.branch === transport.branch;
+}
 
 /**
  * 上次成功同步留下的基线，即三方合并里「共同祖先」的那一侧。
@@ -18,13 +35,14 @@ export const MANIFEST_VERSION = 1;
  */
 export interface SyncManifest {
 	version: number;
+	transport: SyncTransport;
 	base: { revision: string; syncedAt: string };
 	files: Record<string, SyncFileInfo>;
 }
 
-/** 没有基线的 manifest：版本已认、结构完整，但一个文件都不记得（等价首次同步）。 */
-export function emptyManifest(): SyncManifest {
-	return { version: MANIFEST_VERSION, base: { revision: "", syncedAt: "" }, files: {} };
+/** 没有基线的 manifest：版本已认、传输身份明确，但一个文件都不记得（等价首次同步）。 */
+export function emptyManifest(transport: SyncTransport): SyncManifest {
+	return { version: MANIFEST_VERSION, transport, base: { revision: "", syncedAt: "" }, files: {} };
 }
 
 /**
@@ -53,6 +71,17 @@ function asManifest(value: unknown): SyncManifest | null {
 	if (!isPlainObject(value)) return null;
 	if (value.version !== MANIFEST_VERSION) return null;
 
+	const transport = value.transport;
+	if (
+		!isPlainObject(transport) ||
+		typeof transport.remoteHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(transport.remoteHash) ||
+		typeof transport.branch !== "string" ||
+		transport.branch === ""
+	) {
+		return null;
+	}
+
 	const base = value.base;
 	if (!isPlainObject(base) || typeof base.revision !== "string" || typeof base.syncedAt !== "string") return null;
 
@@ -64,6 +93,7 @@ function asManifest(value: unknown): SyncManifest | null {
 
 	return {
 		version: MANIFEST_VERSION,
+		transport: { remoteHash: transport.remoteHash, branch: transport.branch },
 		base: { revision: base.revision, syncedAt: base.syncedAt },
 		files: files as Record<string, SyncFileInfo>,
 	};

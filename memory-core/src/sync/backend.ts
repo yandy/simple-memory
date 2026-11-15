@@ -90,7 +90,7 @@ export interface RemoteView {
  * 一次初始化的结果。
  *
  * `revision` 是远端**真的存在**的那一个（空串 = 远端还没有任何已同步内容）：适配层拿它写首份基线
- * （`emptyManifest()` + 这个 revision，`files` 为空集）。不得让适配层自己再 `fetch()` 一遍拼：
+ * （`emptyManifest(syncTransport(actualOrigin, branch))` + 这个 revision，`files` 为空集）。不得让适配层自己再 `fetch()` 一遍拼：
  * 那一来多一次远端往返，二来两次读之间远端可能已经前进，写进基线的就是一个对不上的版本。
  *
  * `warnings` 是「已经发生、但不足以拒绝初始化」的情形（例如用户自己把记忆根做成了指向别处的
@@ -135,11 +135,12 @@ export class NonFastForwardError extends Error {
  * **并发假设**：backend 可以假定调用方已经把同一份本地状态（同一个 `syncRoot`）上的调用
  * **串行化**了，但**不是**「一轮从头到尾持有一把锁」。真实形状是引擎把一轮切成三段，每段的锁不同（见设计文档）：
  *
- * 1. `ready()`：在根级 sync 锁**之外**被调用（引擎每轮进门先问一次）。`init()` 同样不在根锁内 ——
- *    它由适配层在启动时按配置调用（也可以由一次显式 pull/push 的恢复路径再调），而 clone 可能
- *    要几十秒，把它罩在根锁里就等于让期间每一次 `MemoryStore.save` 排队。**引擎自己绝不会调它**：
+ * 1. `ready()`：在根级 sync 锁**之外**被调用（引擎每轮进门先问一次）。`init()` 由适配层触发，
+ *    **引擎自己绝不会调它**；git 实现会在唯一 staging 中初始化，并经同一路径的有界 `withLock`
+ *    串行后原子发布。`setRemote()` 也使用这把管理锁，但两者都不得在引擎 fetch/publish 锁内嵌套调用。
  *    自动轮遇到未初始化只报一句可读原因，初始化是适配层的事。
- * 2. `fetch()`：**在根级 sync 锁内**跑（try 语义：拿不到就本轮直接跳过，绝不把传输放进锁外）。
+ * 2. `fetch()`：**在根级 sync 锁内**跑（try 语义：拿不到就本轮直接跳过，绝不把传输放进锁外），
+ *    并与 `getRemote()` 同锁取得快照的 transport 身份。
  *    这一段要读本地文件算基线，而「一次 save 期间没有别的 save」这条不变量正是那把根锁守的。
  * 3. 落盘合并：**根锁已经放开**，只由本 scope 的逻辑锁（`sync:<scope>`）守着。
  * 4. `publish()`：**重新抢一次根级 sync 锁**（同样抢不到就本轮报「忙」）。
@@ -201,6 +202,8 @@ export interface SyncBackend {
 	 * 端口不承诺原子，但要求 backend **要么整体成功、要么抛错且不留下半推状态**：
 	 * 抛错之后远端内容与本地状态都原样可解释，引擎才敢下一轮重来。
 	 * `base.revision` 用于乐观并发：远端已经不在 base 上时抛 {@link NonFastForwardError}。
+	 * `base.remote` 若存在，是 fetch 同一把根锁内读到的实际 origin；backend 必须在任何远端 mutation 前
+	 * 复核它，不同则抛 {@link NonFastForwardError}，防止旧进程的 delta 写进新 origin。
 	 * 空串的 base 表示「没有基线」（首次发布），**不算**非快进。
 	 *
 	 * 返回的 revision **必须是远端真的有的那一个**：引擎会原样写进基线，下一轮拿它当 base 比对。
@@ -210,7 +213,7 @@ export interface SyncBackend {
 	publish(
 		scope: SyncScope,
 		changes: SyncPublishChanges,
-		base: { revision: string },
+		base: { revision: string; remote?: string },
 		opts: SyncRunOptions & { message: string; author: { name: string; email: string } },
 	): Promise<string>;
 }

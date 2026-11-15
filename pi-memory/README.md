@@ -244,9 +244,11 @@ remote, so that cost has to be opted into, exactly like `extractMemories`.
 ```
 
 3. Start a session. The first `session_start` with this configuration **initialises automatically**: it
-   clones the remote into `<memoryDir>/.sync/repo` and writes this project's first baseline. There is
-   deliberately **no `/memory sync init`** command — its first run could be a slow clone, and a typed-but-not-
-   applied command would leave one more state to explain (wrong URL? unreachable remote?) than a config line.
+   clones into a unique staging directory, atomically publishes it as `<memoryDir>/.sync/repo`, and writes
+   this project's first baseline. Initialisation and origin changes are serialized by the bounded root lock;
+   an aborted init cleans only its own staging, never another process's published clone. There is deliberately
+   **no `/memory sync init`** command — its first run could be a slow clone, and a typed-but-not-applied command
+   would leave one more state to explain (wrong URL? unreachable remote?) than a config line.
 
 Rules that follow from "the origin is the source of truth":
 
@@ -289,26 +291,28 @@ just the project it is in; other projects sync in their own sessions.
   .sync/                         sync state — created only when sync is enabled
     device.json                  { id, hostname, createdAt }: per-device identity, never synced
     repo/                        the staging clone (worktree + .git) — the whole transport channel
-    state/<project-key>.json     this project's baseline manifest (the last state both sides agreed on)
-    sync.lock                    root-level cross-process lock (transport and publish segments)
+    state/<project-key>.json     v2 baseline: files + { sha256(actual origin), branch }, never the raw URL
+    sync.lock                    root-level cross-process lock (fetch/publish and bounded init/setRemote)
   git/<project>/                 your memory: no .git is added here, nothing else is written
   local/<project>/               never synced
 ```
 
 `.sync` sits **next to** the project tree, not inside it: the memory directory stays clean, and every scan
 skips it (dot-directories are not entries). The root `sync.lock` is a **different lock** from the project
-`.lock` described above: it is taken per segment — one `fetch` in the transport segment, one `push` in the
-publish segment — never for a whole round. An abandoned one makes every sync round fail with an actionable
-error; `/memory sync unlock` is the one sanctioned way to clear it.
+`.lock` described above: sync rounds take it per segment — one `fetch` plus origin read in the transport
+segment, one `push` in the publish segment — never for a whole round. Management operations (`init` /
+`setRemote`) wait on the same lock with a bounded timeout and are never nested inside a round's lock.
+An abandoned one makes every sync round fail with an actionable error; `/memory sync unlock` is the one
+sanctioned way to clear it.
 
 ### Lifecycle
 
 ```
 session_start
   1. config + models + memory directory
-  2. sync: prepare (inspect the staging clone; initialise on first use or when the baseline is missing)
+  2. sync: prepare (initialise on first use, a missing baseline, or an origin/branch transport mismatch)
      — this runs whether or not pullOnStart is set
-  3. pullOnStart === true → one push round (converge + catch up) BEFORE the index value is chosen
+  3. pullOnStart === true → one push round with only the remaining shared startup budget, BEFORE index selection
   4. choose the index value (disk for startup/new, the recorded transcript value for resume/fork/reload)
 
 every successful memory write
@@ -321,7 +325,9 @@ session_shutdown
 - **A push round is the whole convergence**: transport (fetch) → three-way apply against the baseline
   (snapshot, disk, index rebuild) → publish. So the startup round both pulls in what other devices wrote and
   re-publishes what a previous session failed to push. That is why it is one round instead of "pull, then
-  push": the in-process dirty flag only knows about writes made by *this* process.
+  push": the in-process dirty flag only knows about writes made by *this* process. Prepare and startup push
+  share one `sync.autoTimeoutMs` deadline; if prepare exhausts it, push is skipped with a nonfatal next-round
+  notice instead of starting a 1ms network round.
 - **`pullOnStart: false` still prepares** — it just never fetches, pulls or pushes automatically. First-time
   initialisation and recovery from a failed one still happen at session start.
 - **Writes**: every successful entry write (the `memory` tool, a whole `/dream` round, extract's saves) arms
@@ -353,7 +359,9 @@ metadata inside `.sync/repo`). It reports `Configured` / `Initialized`, `Origin`
 `Branch`, `Device`, the local directory → remote key mapping, the baseline revision, the `Ahead` / `Behind` /
 `Conflicts` file lists, `Rejected` (with reasons), `Unparsable local` (files that count as neither entry nor
 safe deletion, so they are left untouched), `Out of scope remote` (paths in the remote that are not this
-project's entries — for example someone pushed a root `MEMORY.md`), and `Errors`.
+project's entries — for example someone pushed a root `MEMORY.md`), and `Errors`. A v1, malformed, or
+transport-mismatched manifest is treated as an empty base; an origin/branch mismatch is reported in `Errors`
+without throwing, so status never presents a stale base as current.
 
 `remote <url>` is the only supported way to change the origin:
 
@@ -361,6 +369,10 @@ project's entries — for example someone pushed a root `MEMORY.md`), and `Error
   already in progress`), drains the rounds already in flight, then **invalidates this project's baseline**
   (`state/<project-key>.json` is deleted) and re-runs preparation against the new origin. A missing manifest
   is a *safe* empty baseline: it means "nothing agreed yet", never "the user deleted everything".
+- Every v2 manifest is also bound to `sha256(actual origin)` and `branch`, not to a raw credentialed URL.
+  Consequently a stale manifest written late by another process is ignored on the new transport — for every
+  project, not just the one being changed. A stale publish carries its fetch-time origin and is rejected
+  before it can write into the new one.
 - Because the baseline is empty, the first round against the new remote may see the same memory on both
   sides with different content. **Both are kept**: the newer `modified` stays at the path (ties broken by the
   content hash), the other becomes a normal entry whose `name` gains ` (冲突 <date> <sha6>)` (the suffix is Chinese in every locale — it is

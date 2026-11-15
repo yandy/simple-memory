@@ -22,6 +22,7 @@ import {
 	remoteProjectKey,
 	syncLockPath,
 	syncRootPath,
+	syncTransport,
 	writeManifest,
 } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -109,6 +110,34 @@ describe("sync command pure renderers", () => {
 		expect(text).toContain("sync.remote differs from the initialized origin; continuing to use origin");
 		expect(text).toContain("Prompt index: frozen for this session");
 		expect(text).not.toMatch(/origin-secret|configured-secret|error-secret/);
+
+		const tokenOnly = syncApi.renderSyncStatus(
+			{
+				...report,
+				remote: "https://origin-token@example.invalid/org/memory.git",
+				errors: ["failed https://error-token@example.invalid/x"],
+			},
+			"https://configured-token@example.invalid/org/other.git",
+		);
+		expect(tokenOnly).toContain("Origin: https://***@example.invalid/org/memory.git");
+		expect(tokenOnly).toContain("Configured remote: https://***@example.invalid/org/other.git");
+		expect(tokenOnly).toContain("failed https://***@example.invalid/x");
+		expect(tokenOnly).not.toMatch(/origin-token|configured-token|error-token/);
+	});
+
+	it("redacts token-only HTTP userinfo while preserving user:pass and plain URLs", () => {
+		expect(syncApi.errorMessage("failed https://token-only@example.invalid/o/r.git")).toBe(
+			"failed https://***@example.invalid/o/r.git",
+		);
+		expect(syncApi.errorMessage("failed git+https://token-only@example.invalid/o/r.git")).toBe(
+			"failed git+https://***@example.invalid/o/r.git",
+		);
+		expect(syncApi.errorMessage("failed https://user:password@example.invalid/o/r.git")).toBe(
+			"failed https://user:***@example.invalid/o/r.git",
+		);
+		expect(syncApi.errorMessage("failed https://example.invalid/o/r.git")).toBe(
+			"failed https://example.invalid/o/r.git",
+		);
 	});
 
 	it("renders failed rounds as fully as successes and omits an absent revision", () => {
@@ -506,7 +535,8 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect(init.mock.calls[0][0].timeoutMs).toBe(4_321);
 		expect(await runtime.backend.getRemote()).toBe(nextRemote);
 		expect(await readManifest(paths.manifest)).toEqual({
-			version: 1,
+			version: 2,
+			transport: syncTransport(nextRemote, "main"),
 			base: { revision: "", syncedAt: expect.any(String) },
 			files: {},
 		});
@@ -581,7 +611,8 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		if (!recovered.ok) throw new Error(`recovery failed: ${recovered.reason}`);
 		expect(init).toHaveBeenCalledTimes(2);
 		expect(await readManifest(paths.manifest)).toEqual({
-			version: 1,
+			version: 2,
+			transport: syncTransport(nextRemote, "main"),
 			base: { revision: "", syncedAt: expect.any(String) },
 			files: {},
 		});
@@ -625,7 +656,8 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect((await restartedPrepare.engine.pull(10_000)).ok).toBe(true);
 
 		expect(baselineAfterRestart).toEqual({
-			version: 1,
+			version: 2,
+			transport: syncTransport(nextRemote, "main"),
 			base: { revision: "", syncedAt: expect.any(String) },
 			files: {},
 		});
@@ -715,6 +747,49 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		runtime.dispose();
 	});
 
+	it("a second concurrent remote URL gets busy instead of sharing the first change's success", async () => {
+		const config = memoryConfig();
+		const store = newStore(config);
+		const { runtime } = await syncApi.createPiSyncRuntime({
+			config,
+			store,
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		if (!runtime) throw new Error("runtime was not created");
+		const prepared = await runtime.prepare(10_000);
+		if (!prepared.ok) throw new Error(`prepare failed: ${prepared.reason}`);
+		const firstRemote = join(s.cwd, "busy-first.git");
+		const secondRemote = join(s.cwd, "busy-second.git");
+		await git(["init", "--bare", "--quiet", firstRemote]);
+		await git(["init", "--bare", "--quiet", secondRemote]);
+		let release!: () => void;
+		syncInitBarrier.current = new Promise<void>((resolveGate) => {
+			release = resolveGate;
+		});
+
+		const first = runtime.changeRemote(firstRemote, 10_000);
+		await waitFor(() => syncEvents.includes("init:start"), "first remote change to reach init");
+		const pending = Symbol("second change was coalesced");
+		const second = await Promise.race([runtime.changeRemote(secondRemote, 10_000), Promise.resolve(pending)]);
+		release();
+		const firstResult = await first;
+		syncInitBarrier.current = null;
+		const originAfterFirst = await runtime.backend.getRemote();
+		const later = await runtime.changeRemote(secondRemote, 10_000);
+		const originAfterLater = await runtime.backend.getRemote();
+		runtime.dispose();
+
+		expect(second).not.toBe(pending);
+		if (second === pending) throw new Error("second change was coalesced");
+		expect(second.ok).toBe(false);
+		expect(second.ok ? "" : second.reason).toContain("already in progress");
+		expect(firstResult.ok).toBe(true);
+		expect(originAfterFirst).toBe(firstRemote);
+		expect(later.ok).toBe(true);
+		expect(originAfterLater).toBe(secondRemote);
+	});
+
 	it("remote change drains a manual round and the disposed engine inFlight before any old-base write can win", async () => {
 		await enableSync();
 		const { pi, tools, commands, handlers } = createFakePi();
@@ -772,7 +847,8 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect(originBeforeAutomaticRelease).toBe(remote);
 		expect(await git(["remote", "get-url", "origin"], join(paths.syncRoot, "repo"))).toBe(nextRemote);
 		expect(await readManifest(paths.manifest)).toEqual({
-			version: 1,
+			version: 2,
+			transport: syncTransport(nextRemote, "main"),
 			base: { revision: "", syncedAt: expect.any(String) },
 			files: {},
 		});
