@@ -1,5 +1,6 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { remoteEntryPath, remotePrefix, remoteProjectKey } from "../src/sync/paths.js";
+import { SYNC_DIR_NAME, remoteEntryPath, remotePrefix, remoteProjectKey, syncRootPath } from "../src/sync/paths.js";
 import { projectDirName } from "../src/store/paths.js";
 
 describe("remoteProjectKey", () => {
@@ -18,5 +19,15 @@ describe("remoteProjectKey", () => {
 	it("remotePrefix / remoteEntryPath 拼出 spec 的布局", () => {
 		expect(remotePrefix("github.com/o/r")).toBe("git/github.com__o__r");
 		expect(remoteEntryPath("git/github.com__o__r", "foo.md")).toBe("git/github.com__o__r/foo.md");
+	});
+});
+
+describe("syncRootPath", () => {
+	it("目录名恒为 `.sync`，由记忆根 join 出来（布局契约只有这一份）", () => {
+		// 名字是用户可见的契约：改了它等于搬动用户盘上的目录，必须在这里先红
+		expect(SYNC_DIR_NAME).toBe(".sync");
+		const memoryDir = join("/tmp", "memory-root");
+		// 断言 join 而不是字面量：win32 上分隔符不同，硬编码 `/` 会让这条测试只在 POSIX 上过
+		expect(syncRootPath(memoryDir)).toBe(join(memoryDir, ".sync"));
 	});
 });

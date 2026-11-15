@@ -26,7 +26,7 @@ export type { IndexCapacity, IndexLineEntry, ParsedEntryIndex } from "./store/en
 export { ENTRY_EXT, entryFileName, foldFileName, isEntryFileName, resolveUniqueFileName } from "./store/filename.js";
 
 // ── store/ 读写门面 ────────────────────────────────────────────────────────────
-export { BACKUP_DIR, LOCK_FILE, MemoryStore } from "./store/memory-store.js";
+export { BACKUP_DIR, INDEX_FILE, LOCK_FILE, MemoryStore } from "./store/memory-store.js";
 export type {
 	ApplyChange,
 	ApplyResult,
@@ -194,7 +194,7 @@ export { sha256Hex } from "./sync/hash.js";
 export { MANIFEST_VERSION, emptyManifest, manifestPath, readManifest, writeManifest } from "./sync/manifest.js";
 export type { SyncManifest } from "./sync/manifest.js";
 
-export { remoteEntryPath, remotePrefix, remoteProjectKey } from "./sync/paths.js";
+export { SYNC_DIR_NAME, remoteEntryPath, remotePrefix, remoteProjectKey, syncRootPath } from "./sync/paths.js";
 
 export { scanLocalEntries } from "./sync/scan.js";
 export type { LocalScan } from "./sync/scan.js";

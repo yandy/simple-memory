@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { projectDirName } from "../store/paths.js";
 
 /**
@@ -19,6 +20,20 @@ export function remoteProjectKey(identityKey: string): string {
 /** 单个项目在远端的前缀：`git/<远端 key>`。 */
 export function remotePrefix(identityKey: string): string {
 	return `git/${remoteProjectKey(identityKey)}`;
+}
+
+/**
+ * 同步状态目录在记忆根下的名字：`<记忆根>/.sync`。
+ *
+ * 这个字面值是**用户可见的布局契约**：它出现在文档、备份排除清单与用户自己的脚本里，而引擎、git
+ * backend、设备身份与 manifest 都把它当入参 `syncRoot` 收发。适配层若各自写一遍 `join(memoryDir, ".sync")`，
+ * 布局一改就要同步改若干处 —— 所以派生只留在这里一份，适配层一律调 `syncRootPath`。
+ */
+export const SYNC_DIR_NAME = ".sync";
+
+/** 记忆根 → 同步状态目录（`syncRoot`）。所有同步入口的 `syncRoot` 入参都由它派生，不要就地拼字符串。 */
+export function syncRootPath(memoryDir: string): string {
+	return join(memoryDir, SYNC_DIR_NAME);
 }
 
 /** 项目内某个文件在远端的路径。 */
