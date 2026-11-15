@@ -88,7 +88,11 @@ export interface SyncRoundResult {
 	rejected: Array<{ file: string; reason: string }>;
 	/** 本地解析不出/读不了的 `.md`：本轮不参与判定，但必须让用户知道它没同步。 */
 	unparsableLocal: string[];
-	/** 远端存在、但不属于本 scope 的路径（远端根相对）。 */
+	/**
+	 * 远端有、但本轮不会同步的路径（远端根相对）：传输端口报上来的**异常**路径（手工推上来的
+	 * 索引、本前缀底下的嵌套目录……），加上引擎自己判定的「这个名字在任何设备上都写不下去」。
+	 * 别的项目的记忆**不在这里** —— 那是设计规定的常态，报出来就等于每轮上千条噪声。
+	 */
 	outOfScopeRemote: string[];
 	/** 本轮结束时基线指向的远端版本（发布成功则是发布后的那一个）。 */
 	revision?: string;
@@ -112,6 +116,7 @@ export interface SyncStatusReport {
 	conflicts: string[];
 	rejected: Array<{ file: string; reason: string }>;
 	unparsableLocal: string[];
+	/** 同一轮结果里那个字段的口径（异常路径，不含别的项目的记忆）。 */
 	outOfScopeRemote: string[];
 	/** 每一步失败的可读原因（未配置、未初始化、锁忙、远端不可达、目录读不了……）。 */
 	errors: string[];

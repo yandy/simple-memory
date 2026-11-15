@@ -230,11 +230,27 @@ function pathspec(prefix: string): string {
 }
 
 /**
- * 把整棵远端树分成「本 scope 内」与「范围外」。
+ * 远端布局里「**另一个项目**的记忆文件」：`git/<项目 key>/<单层 .md>`。
  *
- * 范围外不只是别的项目的目录：本前缀底下**还有一层**的路径（`<prefix>/sub/x.md`）同样算范围外 ——
- * 记忆目录是扁平的，嵌套目录不是本功能写出来的东西。两者都必须原样报出去（仓库根相对路径），
- * 静默丢掉的话用户永远不知道远端有内容没被同步。
+ * 这是设计规定的正常布局（一个远端仓库镜像整个记忆根，每次会话只同步当前那一个项目），
+ * 因此它**不是**异常，不该进 `outOfScope`。
+ */
+const OTHER_PROJECT_ENTRY_RE = /^git\/[^/]+\/[^/]+\.md$/;
+
+/**
+ * 把整棵远端树分成「本 scope 内」与「**真正异常**的范围外路径」。
+ *
+ * 范围外报告的存在理由是「远端有东西没被同步，而用户不知道」—— 例如有人手工推上来的仓库根
+ * `MEMORY.md`、`local/...`、`.lock`，或本前缀底下**还有一层**的路径（`<prefix>/sub/x.md`：
+ * 记忆目录是扁平的，嵌套目录不是本功能写出来的东西）。
+ *
+ * **别的项目的记忆不在这个清单里**，哪怕它们确实「没被这一轮同步」：设计规定的部署形态就是
+ * 一个远端仓库镜像整个记忆根、而一次会话只同步当前项目，于是「兄弟项目」是每一轮的常态。
+ * 把它们算成异常，报告条数就随项目数 × 记忆数线性增长（20 个项目 × 100 条 = 每轮约 2000 条），
+ * 而异常报告一旦和正常数据同量级，就等于没有报告 —— 真正那一条信号（有人手工推了索引）
+ * 会被永久埋掉。所以判据不是「在不在本前缀下」，而是「像不像远端布局里的一条记忆」。
+ *
+ * 报出去的路径一律是仓库根相对的原样路径：静默丢掉的话用户永远不知道远端有内容没进同步。
  */
 function classify(tree: string[], prefix: string): { inScope: string[]; outOfScope: string[] } {
 	const head = `${prefix}/`;
@@ -243,7 +259,7 @@ function classify(tree: string[], prefix: string): { inScope: string[]; outOfSco
 	for (const path of tree) {
 		const rest = path.startsWith(head) ? path.slice(head.length) : "";
 		if (rest !== "" && !rest.includes("/")) inScope.push(rest);
-		else outOfScope.push(path);
+		else if (!OTHER_PROJECT_ENTRY_RE.test(path)) outOfScope.push(path);
 	}
 	return { inScope, outOfScope };
 }

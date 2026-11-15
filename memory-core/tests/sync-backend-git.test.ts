@@ -214,21 +214,53 @@ describe.skipIf(!GIT)(
 			expect(await readFile(join(repoDir("b"), scope.prefix, "foo.md"), "utf8")).toBe("正文");
 		});
 
-		it("list/read 只看到 prefix 内的路径；范围外的路径进 outOfScope（不是静默丢掉）", async () => {
+		it("list/read 只看到 prefix 内的路径；真正异常的路径进 outOfScope（不是静默丢掉）", async () => {
 			const a = await onlineDevice("a");
 			await handPush({
-				"git/other__p/x.md": "别的项目的记忆",
+				"git/other__p/x.md": "别的项目的记忆（设计规定的常态，**不算**异常）",
 				"MEMORY.md": "有人手工推上来的索引",
+				"local/note.md": "永不参与同步的本地状态",
+				".lock": "有人把锁文件推上来了",
 				[`${scope.prefix}/sub/nested.md`]: "前缀底下的嵌套目录",
 			});
 
 			const view = await a.fetch(scope, runOpts);
 			expect(await view.list()).toEqual([]);
+			// 载重：`git/other__p/x.md` **不在**清单里。别的项目的记忆是正常布局的一部分，
+			// 报出来就等于每一轮都随项目数 × 记忆数线性增长地刷噪声，把真信号埋掉。
 			expect([...view.outOfScope].sort()).toEqual(
-				["MEMORY.md", "git/other__p/x.md", `${scope.prefix}/sub/nested.md`].sort(),
+				[".lock", "MEMORY.md", "local/note.md", `${scope.prefix}/sub/nested.md`].sort(),
 			);
 			// 范围外的东西既不列也读不到（read 只服务 list() 报出的路径）
 			await expect(view.read("MEMORY.md")).rejects.toThrow();
+		});
+
+		it("远端有 3 个项目：每个项目各自只报异常路径，兄弟项目的记忆一条都不报", async () => {
+			// 这就是设计规定的部署形态：一个远端仓库镜像整个记忆根，一次会话只同步当前项目。
+			// 若把「整棵树减去本前缀」当成范围外，20 个项目 × 100 条记忆 = 每轮约 2000 条噪声。
+			const prefixes = ["git/proj__a", "git/proj__b", "git/proj__c"];
+			const pushed: Record<string, string> = {};
+			for (const prefix of prefixes) {
+				for (const name of ["记忆 一.md", "记忆 二.md"]) pushed[`${prefix}/${name}`] = `正文：${prefix}/${name}`;
+			}
+			// 每个项目各自的一条真异常：仓库根的手推索引、以及某一个前缀底下的嵌套目录
+			pushed["MEMORY.md"] = "有人手工推上来的索引";
+			pushed[`${prefixes[1]}/sub/nested.md`] = "前缀底下的嵌套目录";
+			// 先让一台设备 init：远端分支被引导出来之后，handPush 才有 origin/main 可 checkout
+			await onlineDevice("seed");
+			await handPush(pushed);
+
+			for (const prefix of prefixes) {
+				const backend = await onlineDevice(`dev-${prefix}`);
+				const view = await backend.fetch({ prefix }, runOpts);
+				// 自己的两条记忆照常列出来（兄弟项目的存在不影响同步本身）
+				expect((await view.list()).map((item) => item.path).sort()).toEqual(["记忆 一.md", "记忆 二.md"]);
+				// 载重：兄弟项目那 4 条记忆一条都不报。报的只有两条真异常 —— 仓库根手推的索引，
+				// 以及一个嵌套目录（扁平布局里不该有它；它出现在别的前缀底下，所以每个项目都看得见）。
+				expect([...view.outOfScope].sort(), `prefix=${prefix}`).toEqual(
+					["MEMORY.md", `${prefixes[1]}/sub/nested.md`].sort(),
+				);
+			}
 		});
 
 		it("非 ASCII 的文件名原样往返（ls-tree 默认的 C-quoting 会把它整条判成范围外）", async () => {

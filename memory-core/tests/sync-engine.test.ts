@@ -104,6 +104,9 @@ interface FakeRemote extends SyncBackend {
 	names(prefix: string): Promise<string[]>;
 }
 
+/** 远端布局里「另一个项目的记忆文件」：`git/<项目 key>/<单层 .md>`（与 git backend 的判据同一份形状）。 */
+const OTHER_PROJECT_ENTRY_RE = /^git\/[^/]+\/[^/]+\.md$/;
+
 /**
  * 内存里的远端。口径照 git backend：`revision` 是不透明字符串（空串 = 还没有任何已发布内容）、
  * `list()` 的 hash 是 sha256(字节) 十六进制小写、`outOfScope` 是**远端根相对**路径、
@@ -150,7 +153,11 @@ function createFakeRemote(): FakeRemote {
 			}
 			for (const [other, files] of scopes) {
 				if (other === scope.prefix) continue;
-				for (const path of files.keys()) outOfScope.push(`${other}/${path}`);
+				for (const path of files.keys()) {
+					// 别的项目的**扁平 entry** 是设计规定的正常布局，不算异常（口径同 git backend 的
+					// classify）：报出来就等于每一轮都随项目数 × 记忆数线性增长地刷噪声。
+					if (!OTHER_PROJECT_ENTRY_RE.test(`${other}/${path}`)) outOfScope.push(`${other}/${path}`);
+				}
 			}
 			for (const path of loose.keys()) outOfScope.push(path);
 			const revision = remote.revision;
@@ -619,6 +626,35 @@ describe("sync engine（假 backend）", () => {
 		expect(res.outOfScopeRemote.sort()).toEqual([`${prefix}/.hidden.md`, `${prefix}/MEMORY.md`]);
 		expect(await readdir(projectDir)).not.toContain("MEMORY.md");
 		expect(await store.readIndex()).not.toContain("手推的索引");
+	});
+
+	it("★远端有 3 个项目：每个项目的 outOfScopeRemote 只含异常路径，兄弟项目的记忆一条都不报", async () => {
+		// 设计规定的部署形态：一个远端仓库镜像整个记忆根，一次会话只同步当前项目。
+		// 若把「整棵树减去本前缀」当成范围外，这里的报告会是 3 × 2 条噪声，而真信号只有 2 条 ——
+		// 换成用户真实的规模（20 个项目 × 100 条记忆）就是每轮约 2000 条。
+		const keys = ["example.com/org/a", "example.com/org/b", "example.com/org/c"];
+		const devices: Device[] = [];
+		for (const [index, key] of keys.entries()) devices.push(await makeDevice(`proj-${index}`, key));
+
+		for (const dev of devices) {
+			await dev.store.addEntry({ name: "记忆", body: dev.projectKey });
+			expect((await dev.engine.push()).ok).toBe(true);
+		}
+		// 两条真异常：仓库根手推上来的索引、以及某个前缀底下的嵌套目录
+		await remote.writeRaw("MEMORY.md", "# 手推的索引");
+		await remote.write(devices[1].prefix, "sub/nested.md", raw("N"));
+		const anomalies = ["MEMORY.md", `${devices[1].prefix}/sub/nested.md`].sort();
+
+		for (const dev of devices) {
+			const res = await dev.engine.pull();
+			expect(res.ok).toBe(true);
+			// 兄弟项目那 6 条记忆一条都不报，两条真异常一个都不漏
+			expect(res.outOfScopeRemote.sort(), dev.projectKey).toEqual(anomalies);
+			// status 是同一份口径（用户平时看的是它）
+			expect((await dev.engine.status()).outOfScopeRemote.sort(), dev.projectKey).toEqual(anomalies);
+			// 自己的那条记忆照常同步，没有被兄弟项目的存在挤掉
+			expect(await readdir(dev.projectDir)).toContain("记忆.md");
+		}
 	});
 
 	it("pull 在 backend.fetch 抛错时返回 skipped 而不抛", async () => {
