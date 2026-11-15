@@ -22,6 +22,8 @@ import {
 	runTask,
 	type SyncRoundResult,
 	scanEntries,
+	syncLockPath,
+	syncRootPath,
 	TASKS,
 	withFsRetry,
 } from "@yandy0725/memory-core";
@@ -35,7 +37,13 @@ import { createMemoryTool, type MemoryToolDeps, type MemoryToolOptions } from ".
 import { resolveModel } from "./src/model-resolver";
 import { readDreamMeta, shouldNudge, writeDreamMeta } from "./src/nudge";
 import { searchSessions } from "./src/session-search";
-import { createPiSyncRuntime, type PiSyncRuntime } from "./src/sync";
+import {
+	createPiSyncRuntime,
+	type PiSyncRuntime,
+	renderSyncRound,
+	renderSyncStatus,
+	errorMessage as syncErrorMessage,
+} from "./src/sync";
 
 function extractAgentsMdBlocks(systemPrompt: string): string[] {
 	const blocks: string[] = [];
@@ -123,13 +131,12 @@ async function lockStatusLine(memoryDir: string): Promise<string> {
 	return `held by ${describeHolder(status.holder)}`;
 }
 
-/**
- * `/memory unlock`：崩溃遗留的 `.lock` 的**唯一**人工清除入口（spec §19 风险表）。
- * 必须显式 confirm，而且只删 `.lock` 本身 —— 删错了就是两个写入者同时持有锁。
- * confirm 正文在 `held` 时点名持有者：只有人能把「本机已死的进程」与「别的机器正在跑」区分开。
- */
-async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<void> {
-	const lockPath = join(memoryDir, LOCK_FILE);
+/** 两类人工锁恢复共用：显式确认、withFsRetry、ENOENT 幂等，并且只 unlink 目标文件。 */
+async function unlockFile(
+	lockPath: string,
+	ui: ExtensionUIContext,
+	copy: { title: string; noun: string; operation: string; removed: string; failure: string },
+): Promise<void> {
 	const status = await readLockStatus(lockPath);
 	if (status.kind === "absent") {
 		ui.notify("No lock present.", "info");
@@ -137,24 +144,48 @@ async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<
 	}
 	const question =
 		status.kind === "held"
-			? `Remove the memory lock file? It is held by ${describeHolder(status.holder)}. Only do this if no memory operation is running.`
-			: "Remove the memory lock file? Only do this if no memory operation is running.";
-	const ok = await ui.confirm("Memory lock", question);
+			? `Remove the ${copy.noun} file? It is held by ${describeHolder(status.holder)}. Only do this if no ${copy.operation} is running.`
+			: `Remove the ${copy.noun} file? Only do this if no ${copy.operation} is running.`;
+	const ok = await ui.confirm(copy.title, question);
 	if (!ok) return;
 	try {
-		// 恢复路径也要重试：用户正是因为一把可能被瞬时错误困住的锁才走到这里，而删除本身
-		// 同样会被杀软/索引器/同步客户端打断 —— 这里再报一次 EPERM 就是把用户困在原地。
-		// 幂等（删一个已不存在的文件走下面的 ENOENT 分支），重试无副作用。
+		// 恢复路径也要重试：删除本身同样会被杀软/索引器/同步客户端瞬时打断。
 		await withFsRetry(() => unlink(lockPath));
-		ui.notify("Memory lock removed.", "info");
+		ui.notify(copy.removed, "info");
 	} catch (e) {
-		// confirm 到 unlink 之间锁自己消失了：那正是想要的结果
+		// confirm 到 unlink 之间锁自己消失了：那正是想要的结果。
 		if ((e as NodeJS.ErrnoException).code === "ENOENT") {
 			ui.notify("No lock present.", "info");
 			return;
 		}
-		ui.notify(`Failed to remove memory lock: ${(e as Error).message}`, "error");
+		ui.notify(`${copy.failure}: ${(e as Error).message}`, "error");
 	}
+}
+
+/**
+ * `/memory unlock`：崩溃遗留的 `.lock` 的**唯一**人工清除入口（spec §19 风险表）。
+ * 文案与确认语义保持原样；共享 helper 只是让根锁恢复复用同一条安全边界。
+ */
+async function unlockMemory(memoryDir: string, ui: ExtensionUIContext): Promise<void> {
+	await unlockFile(join(memoryDir, LOCK_FILE), ui, {
+		title: "Memory lock",
+		noun: "memory lock",
+		operation: "memory operation",
+		removed: "Memory lock removed.",
+		failure: "Failed to remove memory lock",
+	});
+}
+
+/** `/memory sync unlock` 只依赖配置根，不需要 store、device 或 engine。 */
+async function unlockMemorySync(config: MemoryConfig, ui: ExtensionUIContext): Promise<void> {
+	const lockPath = syncLockPath(syncRootPath(resolve(config.memoryDir)));
+	await unlockFile(lockPath, ui, {
+		title: "Memory sync lock",
+		noun: "memory sync lock",
+		operation: "memory sync operation",
+		removed: "Memory sync lock removed.",
+		failure: "Failed to remove memory sync lock",
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -688,46 +719,170 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	/** Task 3 只需要的手动恢复入口：同一 runtime 上重试 prepare，然后严格只 pull、不发布。 */
-	async function pullMemorySync(ctx: ExtensionContext): Promise<void> {
+	const SYNC_USAGE =
+		'Usage: /memory sync [status] | pull | push | remote <url> | unlock. Initialization is automatic; set "sync.enabled" and "sync.remote" in memory.json.';
+
+	function showSyncConfigError(ui: ExtensionUIContext): boolean {
+		if (!configError) return false;
+		notifySync(ui, `Memory sync unavailable:\n${configError}`, "info");
+		return true;
+	}
+
+	function showSyncUnavailable(ui: ExtensionUIContext): void {
+		if (showSyncConfigError(ui)) return;
+		notifySync(
+			ui,
+			syncError
+				? `Memory sync unavailable:\n${syncError}`
+				: 'Memory sync unavailable: sync is not enabled; set "sync.enabled" and "sync.remote" in memory.json.',
+			"info",
+		);
+	}
+
+	/** 严格 dry-run：engine 尚未准备时只读 ready/origin，绝不 prepare/init 或创建 device/manifest。 */
+	async function showMemorySyncStatus(ctx: ExtensionContext): Promise<void> {
 		const ui = ctx.ui;
 		const cfg = config;
 		const activeRuntime = syncRuntime;
 		if (!cfg || !activeRuntime) {
-			notifySync(ui, `Memory sync unavailable${syncError ? `:\n${syncError}` : ": sync is not enabled."}`, "info");
+			showSyncUnavailable(ui);
+			return;
+		}
+		const engine = activeRuntime.engine;
+		if (!engine) {
+			try {
+				const initialized = await activeRuntime.backend.ready();
+				if (!initialized) {
+					notifySync(
+						ui,
+						'Memory sync is not initialized: set "sync.remote" in memory.json; initialization runs at session start, or use /memory sync pull to retry.',
+						"info",
+					);
+					return;
+				}
+				const origin = await activeRuntime.backend.getRemote();
+				notifySync(
+					ui,
+					syncErrorMessage(
+						[
+							"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
+							`Origin: ${origin ?? "(not set)"}`,
+							`Configured remote: ${typeof cfg.sync.remote === "string" && cfg.sync.remote.trim() !== "" ? cfg.sync.remote : "(not set)"}`,
+						].join("\n"),
+					),
+					"info",
+				);
+			} catch (error) {
+				notifySync(ui, `Memory sync status failed: ${syncErrorMessage(error)}`);
+			}
+			return;
+		}
+		try {
+			const report = await engine.status(cfg.sync.timeoutMs);
+			notifySync(ui, renderSyncStatus(report, typeof cfg.sync.remote === "string" ? cfg.sync.remote : ""), "info");
+		} catch (error) {
+			notifySync(ui, `Memory sync status failed: ${syncErrorMessage(error)}`);
+		}
+	}
+
+	async function runMemorySyncRound(kind: "pull" | "push", ctx: ExtensionContext): Promise<void> {
+		const ui = ctx.ui;
+		const cfg = config;
+		const activeRuntime = syncRuntime;
+		if (!cfg || !activeRuntime) {
+			showSyncUnavailable(ui);
 			return;
 		}
 		try {
 			const prepared = await activeRuntime.prepare(cfg.sync.timeoutMs);
 			if (!prepared.ok) {
 				setSyncError([...syncPersistentErrors, prepared.reason]);
-				notifySync(ui, `Memory sync pull failed: ${prepared.reason}`);
+				notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(prepared.reason)}`);
 				return;
 			}
-			const round = await prepared.engine.pull(cfg.sync.timeoutMs);
+			const round = await prepared.engine[kind](cfg.sync.timeoutMs);
 			const errors = [...syncPersistentErrors];
 			if (prepared.warning) errors.push(prepared.warning);
-			if (!round.ok) errors.push(round.skipped?.reason ?? "unknown sync pull failure");
+			if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
 			setSyncError(errors);
+			const rendered = renderSyncRound(round);
 			if (!round.ok) {
-				notifySync(ui, `Memory sync pull failed: ${round.skipped?.reason ?? "unknown sync pull failure"}`);
+				notifySync(
+					ui,
+					`Memory sync ${kind} failed: ${syncErrorMessage(round.skipped?.reason ?? "unknown sync failure")}\n${rendered}`,
+				);
+				return;
+			}
+			notifySync(ui, `Memory sync ${kind}:\n${rendered}`, "info");
+		} catch (error) {
+			const reason = syncErrorMessage(error);
+			setSyncError([...syncPersistentErrors, reason]);
+			notifySync(ui, `Memory sync ${kind} failed: ${reason}`);
+		}
+	}
+
+	async function changeMemorySyncRemote(remote: string, ctx: ExtensionContext): Promise<void> {
+		const ui = ctx.ui;
+		const cfg = config;
+		const activeRuntime = syncRuntime;
+		if (!cfg || !activeRuntime) {
+			showSyncUnavailable(ui);
+			return;
+		}
+		try {
+			const prepared = await activeRuntime.changeRemote(remote, cfg.sync.timeoutMs);
+			const errors = [...syncPersistentErrors];
+			if (prepared.ok && prepared.warning) errors.push(prepared.warning);
+			if (!prepared.ok) errors.push(prepared.reason);
+			setSyncError(errors);
+			if (!prepared.ok) {
+				notifySync(ui, `Memory sync remote failed: ${syncErrorMessage(prepared.reason)}`);
 				return;
 			}
 			notifySync(
 				ui,
-				`Memory sync pull: ${round.pulled.length} pulled, ${round.conflicts.length} conflicts, ${round.rejected.length} rejected.`,
+				`Memory sync remote: ${syncErrorMessage(remote)}\nOrigin changed and this project's baseline was reset; memory.json was not modified.`,
 				"info",
 			);
 		} catch (error) {
-			const reason = error instanceof Error ? error.message : String(error);
+			const reason = syncErrorMessage(error);
 			setSyncError([...syncPersistentErrors, reason]);
-			notifySync(ui, `Memory sync pull failed: ${reason}`);
+			notifySync(ui, `Memory sync remote failed: ${reason}`);
 		}
 	}
 
 	pi.registerCommand("memory", {
 		description: "Show memory status or remove a stale lock",
 		handler: async (args, ctx) => {
+			const parts = args.trim() === "" ? [] : args.trim().split(/\s+/);
+			if (parts[0] === "sync") {
+				const subcommand = parts[1] ?? "status";
+				// 根锁恢复只依赖配置根；模型错误绝不能把唯一人工恢复入口一并禁掉。
+				if (subcommand === "unlock" && parts.length === 2 && config) {
+					await unlockMemorySync(config, ctx.ui);
+					return;
+				}
+				// 其他 sync 命令必须先暴露真实配置错误，不能落成笼统的 not enabled。
+				if (showSyncConfigError(ctx.ui)) return;
+				if (!config) {
+					notifySync(ctx.ui, "Memory not initialized; start a session before using /memory sync.", "info");
+					return;
+				}
+				if (subcommand === "status" && parts.length <= 2) {
+					await showMemorySyncStatus(ctx);
+					return;
+				}
+				if ((subcommand === "pull" || subcommand === "push") && parts.length === 2) {
+					await runMemorySyncRound(subcommand, ctx);
+					return;
+				}
+				if (subcommand === "remote" && parts.length === 3) {
+					await changeMemorySyncRemote(parts[2], ctx);
+					return;
+				}
+				notifySync(ctx.ui, SYNC_USAGE, "info");
+				return;
+			}
 			// 配置都读不出来（`loadConfig` 抛错）时也要报真实原因，而不是笼统的「未初始化」——
 			// `/memory` 是重读错误态的唯一入口。首次会话就失败时 `config` 仍是 null，所以这里先看错误态。
 			if (!config) {
@@ -739,10 +894,6 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify("Memory not initialized.", "info");
-				return;
-			}
-			if (args.trim() === "sync pull") {
-				await pullMemorySync(ctx);
 				return;
 			}
 			if (args === "unlock") {
