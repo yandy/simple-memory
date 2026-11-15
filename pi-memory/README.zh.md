@@ -53,6 +53,7 @@ pi install npm:@yandy0725/pi-memory
 - 远端由你自己准备（空仓库可以），`git` 必须能非交互地 clone / push —— pi-memory 不保存任何凭据。
 - 只同步 entry `*.md`：`MEMORY.md`、`.lock`、`.backups/`、`sessions/` 都留在本机。
 - 两侧并发改写同一条记忆时**两份都保留**，另一份变成确定性的冲突副本，之后由 `/dream` 合并。
+- 已有本地 entry 的项目**第一次**同步会出现一条 info 级预告（`pi-memory sync notice: …`），提醒同名条目可能落成冲突副本；它不是失败，且同一份基线不会重复提醒。
 - 手动收敛：`/memory sync pull` / `push` / `status`（严格 dry-run）/ `remote <url>`。
 
 完整语义见[跨设备同步](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.zh.md#跨设备同步可选默认关闭)。

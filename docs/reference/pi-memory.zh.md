@@ -171,9 +171,9 @@ session_shutdown
   → 不看去抖，立刻 flush 一次，上限 sync.autoTimeoutMs
 ```
 
-- **一轮 push 就是完整的一次收敛**：传输段（fetch）→ 对基线做三方差集并应用（快照、落盘、重建索引）→ 发布段。所以启动那一轮既把别的设备写的东西拉下来，也把上个会话没推出去的补推上去。这也正是「一轮 push」而不是「先 pull 再 push」的原因：进程内的脏标记只认得**本进程**写过的内容。prepare 与启动 push 共用一份 `sync.autoTimeoutMs` deadline；prepare 耗尽时就跳过 push 并给出非致命的「下一轮再推」提示，绝不再发起一次 1ms 网络轮。
+- **一轮 push 就是完整的一次收敛**：传输段（fetch）→ 对基线做三方差集并应用（快照、落盘、重建索引）→ 发布段。所以启动那一轮既把别的设备写的东西拉下来，也把上个会话没推出去的补推上去。这也正是「一轮 push」而不是「先 pull 再 push」的原因：进程内的脏标记只认得**本进程**写过的内容。prepare 与启动 push 共用一份 `sync.autoTimeoutMs` deadline；prepare 耗尽时就跳过 push 并给出非致命的「下一轮再推」预告（`pi-memory sync notice: …`，info 级），绝不再发起一次 1ms 网络轮。
 - **`pullOnStart: false` 仍会 prepare** —— 只是永不自动 fetch/pull/push。首次初始化与「上次初始化失败」的恢复仍然发生在会话启动时。键名保持既有契约：启动那一轮 push 本身就包含拉取与发布。
-- **已有本地 entry**：初始化新基线时，prepare 会在任何启动 push **之前**提示可能产生确定性的冲突副本；同一份基线只提示一次，不会每次启动都重复。
+- **已有本地 entry**：初始化新基线时，prepare 会在任何启动 push **之前**提示可能产生确定性的冲突副本；同一份基线只提示一次，不会每次启动都重复。这条是**预告，不是错误**：以 info 级 `pi-memory sync notice: …` 通知，`/memory` 里单列一行 `Sync notice:`；只有真正的失败才用 `pi-memory sync error: …` 与持久错误态。
 - **写入触发**：每一次成功的 entry 写入（`memory` 工具、一整轮 `/dream`、extract 的落盘）都会给去抖上弦。`pushOnWrite: false` 装的是空转触发器 —— 不自动发布任何东西，手动命令照常可用。
 - **退出兜底**：即使去抖还没到点也 flush 一次，这一轮的上限是 `sync.autoTimeoutMs`；在途等待的上限仍是既有写入用的 `lock.timeoutMs`。flush 失败只产生一条 `Memory sync flush failed: … local changes will be retried at the next session start.` —— 内容仍在本地，下一轮就会补推：下次会话启动（`pullOnStart` 默认开启）或下一次写入的去抖推送。若 `pushOnWrite` 与 `pullOnStart` 都关了，用 `/memory sync push`。
 - **录制索引（已知语义，不是 bug）**：`resume` / `fork` / `reload` 冻结 transcript 里录制的索引值。启动收敛照样跑、磁盘照样更新，但同步来的记忆**不会**出现在本会话的 `memory_index` 里，直到下一次 compaction（或下一个会话）。`/memory sync status` 的最后一行会说明这一点。

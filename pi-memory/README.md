@@ -62,6 +62,9 @@ repository shares them:
 - Only entry `*.md` files sync: `MEMORY.md`, `.lock`, `.backups/` and `sessions/` stay local.
 - If both sides rewrite the same memory, **both are kept**: the other becomes a deterministic conflict
   copy that `/dream` merges later.
+- On the **first** sync of a project that already has local entries, expect one info notice
+  (`pi-memory sync notice: …`) that same-named entries may land as conflict copies. It is not a failure and
+  it does not repeat for that baseline.
 - Manual convergence: `/memory sync pull` / `push` / `status` (strict dry-run) / `remote <url>`.
 
 Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.md#cross-device-sync).

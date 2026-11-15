@@ -205,12 +205,15 @@ session_shutdown
   re-publishes what a previous session failed to push. That is why it is one round instead of "pull, then
   push": the in-process dirty flag only knows about writes made by *this* process. Prepare and startup push
   share one `sync.autoTimeoutMs` deadline; if prepare exhausts it, push is skipped with a nonfatal next-round
-  notice instead of starting a 1ms network round.
+  notice (`pi-memory sync notice: …`, info level) instead of starting a 1ms network round.
 - **`pullOnStart: false` still prepares** — it just never fetches, pulls or pushes automatically. First-time
   initialisation and recovery from a failed one still happen at session start. The key keeps its established
   name: the startup push round includes pulling as well as publishing.
 - **Existing local entries**: when a new baseline is initialised, prepare warns about possible deterministic
-  conflict copies **before any startup push**. The notice is emitted once for that baseline, not on every start.
+  conflict copies **before any startup push**. The notice is emitted once for that baseline, not on every start,
+  and it is a **notice, not an error**: it is reported as `pi-memory sync notice: …` at info level and `/memory`
+  lists it under a separate `Sync notice:` line. Only real failures use `pi-memory sync error: …` and the
+  persistent sync error state.
 - **Writes**: every successful entry write (the `memory` tool, a whole `/dream` round, extract's saves) arms
   the debounce. `pushOnWrite: false` installs a no-op trigger — nothing is published automatically, manual
   commands still work.

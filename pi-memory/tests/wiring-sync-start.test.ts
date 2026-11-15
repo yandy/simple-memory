@@ -462,6 +462,10 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 
 		expect(syncPushTimeouts).toEqual([]);
 		expect(notify.mock.calls[0]?.[0]).toMatch(/startup budget.*next round/i);
+		// 预算用尽只是「下一轮再推」，不是失败：必须走 info 预告通道，不得渲染成红色 Error。
+		expect(notify.mock.calls[0]?.[1]).toBe("info");
+		expect(notify.mock.calls[0][0]).toContain("pi-memory sync notice:");
+		expect(notify.mock.calls[0][0]).not.toContain("pi-memory sync error:");
 	});
 
 	it("does not initialize a local project and explains that v1 supports only git projects", async () => {
@@ -559,6 +563,10 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 
 		expect(notify).toHaveBeenCalledTimes(1);
 		expect(notify.mock.calls[0][0]).toContain("deterministic conflict copies");
+		// 预告不是故障：info 级 + 独立前缀，不能借用 error 通道（否则宿主渲染成 `Error:`）。
+		expect(notify.mock.calls[0][1]).toBe("info");
+		expect(notify.mock.calls[0][0]).toContain("pi-memory sync notice:");
+		expect(notify.mock.calls[0][0]).not.toContain("pi-memory sync error:");
 		expect(syncEvents.indexOf("conflict-preview")).toBeGreaterThanOrEqual(0);
 		expect(syncEvents.indexOf("conflict-preview")).toBeLessThan(syncEvents.indexOf("push:start"));
 
@@ -593,7 +601,10 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 
 		expect(notify).toHaveBeenCalledTimes(2);
 		expect(notify.mock.calls[0][0]).toContain("deterministic conflict copies");
+		expect(notify.mock.calls[0][1]).toBe("info");
+		expect(notify.mock.calls[0][0]).toContain("pi-memory sync notice:");
 		expect(notify.mock.calls[1][0]).toContain("startup push failed");
+		expect(notify.mock.calls[1][1]).toBe("error");
 		expect(notify.mock.calls[1][0]).not.toContain("deterministic conflict copies");
 	});
 
