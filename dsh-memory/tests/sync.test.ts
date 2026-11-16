@@ -238,6 +238,29 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		expect(await store.listEntries()).toEqual([]);
 	});
 
+	it("reports the local-entry conflict warning before the startup push begins", async () => {
+		const cfg = config({ pullOnStart: true });
+		const store = storeFor(cfg);
+		await store.addEntry({ name: "Local", description: "local", body: "local" });
+		const { runtime } = await makeRuntime(cfg, store);
+		if (!runtime) throw new Error("runtime was not created");
+		const events: string[] = [];
+
+		const started = await runtime.startup((warning) => {
+			events.push(warning.includes("conflict copies") ? "warning" : "other warning");
+			const engine = runtime.engine;
+			if (!engine) throw new Error("warning arrived before the engine was prepared");
+			const push = engine.push.bind(engine);
+			vi.spyOn(engine, "push").mockImplementation(async (timeoutMs) => {
+				events.push("push");
+				return push(timeoutMs);
+			});
+		});
+
+		expect(started.ok).toBe(true);
+		expect(events).toEqual(["warning", "push"]);
+	});
+
 	it("continues to use the initialized origin when the configured remote drifts", async () => {
 		const firstConfig = config();
 		const firstStore = storeFor(firstConfig);

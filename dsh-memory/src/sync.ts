@@ -41,7 +41,7 @@ export interface DshSyncRuntime {
 	readonly backend: SyncBackend;
 	readonly syncRoot: string;
 	/** 自动初始化；pullOnStart 开启时再共用同一份预算执行一轮启动 push。 */
-	startup(): Promise<DshSyncOutcome<SyncRoundResult | null>>;
+	startup(onWarning?: (warning: string) => void): Promise<DshSyncOutcome<SyncRoundResult | null>>;
 	run(kind: "pull" | "push", timeoutMs: number): Promise<DshSyncOutcome<SyncRoundResult>>;
 	/** 严格 dry-run：engine 尚未准备时只读 ready/origin，绝不 prepare。 */
 	status(timeoutMs: number): Promise<DshSyncOutcome<DshSyncStatus>>;
@@ -249,7 +249,7 @@ export async function createDshSyncRuntime(options: {
 		}
 	}
 
-	function startup(): Promise<DshSyncOutcome<SyncRoundResult | null>> {
+	function startup(onWarning?: (warning: string) => void): Promise<DshSyncOutcome<SyncRoundResult | null>> {
 		if (disposed) return Promise.resolve(disposedResult());
 		if (remoteChangeActive) return Promise.resolve(busyResult());
 		return enqueue(async () => {
@@ -257,6 +257,8 @@ export async function createDshSyncRuntime(options: {
 			const deadline = Date.now() + sync.autoTimeoutMs;
 			const prepared = await prepare(sync.autoTimeoutMs);
 			if (!prepared.ok) return prepared;
+			// 首次冲突副本预告必须先于任何可能产生/发布副本的启动轮次。
+			if (prepared.warning) onWarning?.(prepared.warning);
 			if (sync.pullOnStart !== true) {
 				return prepared.warning === undefined
 					? { ok: true as const, value: null }
