@@ -9,6 +9,7 @@ import {
 	readLockStatus,
 	syncLockPath,
 	syncRootPath,
+	withFsRetry,
 } from "@yandy0725/memory-core";
 import type { MemoryConfig, SyncRoundResult, SyncStatusReport } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +32,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	for (const runtime of runtimes.reverse()) await runtime.dispose();
 	vi.restoreAllMocks();
-	await rm(dir, { recursive: true, force: true });
+	await withFsRetry(() => rm(dir, { recursive: true, force: true }));
 });
 
 function config(over: Record<string, unknown> = {}): MemoryConfig {

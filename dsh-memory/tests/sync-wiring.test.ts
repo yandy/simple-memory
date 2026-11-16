@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { DEFAULT_CONFIG, MemoryStore } from "@yandy0725/memory-core";
+import { DEFAULT_CONFIG, MemoryStore, withFsRetry } from "@yandy0725/memory-core";
 import type { MemoryConfig, SyncConfig } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { apply } from "../src/index.js";
@@ -43,7 +43,9 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		for (const cleanup of cleanups.reverse()) await cleanup();
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
-		await rm(dir, { recursive: true, force: true });
+		// Windows 上，一个刚被 abort 但尚未完全退出的 git 子进程可能仍持有 `.sync/repo` 里文件的句柄，
+		// 直接 rm 会撞 EBUSY。withFsRetry 就是为这类瞬时占用设计的（同 commands.ts 的 unlock 路径）。
+		await withFsRetry(() => rm(dir, { recursive: true, force: true }));
 	});
 
 	async function git(args: string[], cwd = dir): Promise<string> {

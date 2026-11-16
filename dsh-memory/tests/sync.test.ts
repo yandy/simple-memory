@@ -13,6 +13,7 @@ import {
 	readManifest,
 	remoteProjectKey,
 	syncRootPath,
+	withFsRetry,
 } from "@yandy0725/memory-core";
 import type { MemoryConfig, ProjectIdentity, SyncConfig } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -58,7 +59,9 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		for (const runtime of runtimes.reverse()) await runtime.dispose();
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
-		await rm(dir, { recursive: true, force: true });
+		// 即使 dispose() 已经 await 过 tail/inFlight，Windows 上被 abort 的 git 子进程也可能还没完全
+		// 释放文件句柄，直接 rm 会撞 EBUSY（CI 实测）。withFsRetry 就是为这类瞬时占用设计的。
+		await withFsRetry(() => rm(dir, { recursive: true, force: true }));
 	});
 
 	function config(over: Partial<SyncConfig> = {}, memoryDir = join(dir, "memory-root")): MemoryConfig {
