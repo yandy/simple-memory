@@ -217,6 +217,8 @@ session_shutdown
 
 改好 `memory.json` 后重启会话 —— 配置在启动时只读一次。headless / print 会话里配置错误是静默的（不会弹任何通知），所以要在交互式会话里用 `/memory` 确认。
 
+解析用的是会话的模型注册表，但 headless 子会话跑在 pi-memory 自建的 runtime 里：`models.json` 里的 provider、以及另一个扩展用 `pi.registerProvider()` **运行时注册**的 provider 都能用。搬不过去的是运行时注册的**虚拟模型** —— 那种模型启动时能解析、执行时给一条显式错误（`… resolves in the host registry but not in a headless runtime`）。用到虚拟模型的话，请在 `models.json` 里配置物理 provider。
+
 ## 工作原理
 
 ### 会话生命周期
@@ -224,7 +226,7 @@ session_shutdown
 | 事件 | pi-memory 做什么 |
 |---|---|
 | `session_start` | 加载配置 → 校验必需模型（失败即什么都不初始化）→ 解析记忆目录 → **准备跨设备同步**（首次使用时自动初始化，即使 `pullOnStart: false` 也照做）→ `pullOnStart` 开启时跑一轮收敛（一轮 push）→ **确定索引值并冻结**（`startup`/`new` 读磁盘；`resume`/`fork`/`reload` 重放 transcript 取录制值）→ 注册 `memory` 工具（仅首次，5 个 action）→ 重建清单缓存 → dream 提醒检查 |
-| `before_agent_start` | 把冻结值写进 `sections["memory_index"]`（**每一轮、无条件**），然后做 auto-surfacing（主会话且非子 agent） |
+| `before_agent_start` | 把冻结值写进 `sections["memory_index"]`（**每一轮、无条件**），然后做 auto-surfacing（主会话、非子 agent、且只针对用户消息触发的 run —— custom 消息触发的 run 没有用户输入可检索） |
 | `agent_end` | `extractMemories.enabled` 开启时触发异步 extract；写入成功通知 `Extracted N memories.`，失败通知 `Extract failed: …`（每会话一次） |
 | `session_compact` | 清空已注入集合，**并从磁盘重读索引** —— 会话内唯一的刷新点 |
 | `session_shutdown` | 把待发布的同步推送 flush 一次（上限 `sync.autoTimeoutMs`），并等在途写入收尾（上限 `lock.timeoutMs`），因此退出既不会留下 stale 的 `.lock`，也不会留下一批只到过本地磁盘的记忆 |
@@ -237,7 +239,8 @@ pi 用有序的 sections 构建 system prompt，只对**值发生变化**的 sec
 
 有意接受的代价：**本会话内写入的记忆不会出现在本会话的索引里**。工具返回值已经确认写入，下一个会话立刻可见。
 
-如果宿主的 pi 还没有 sections API，pi-memory 回退为把索引拼到 system prompt 字符串末尾 —— 功能不变，只是缓存变差。
+`systemPromptOptions.sections` 是宿主事件的**必填字段**（pi 0.99.2 起），而 `>=1.5.0` 的 peer 下限更严格：
+代码里没有「把索引拼到 system prompt 末尾」的回退。宿主不提供 `sections` 就是违反契约。
 
 ### 自动浮现
 

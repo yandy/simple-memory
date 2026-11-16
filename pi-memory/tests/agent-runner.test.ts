@@ -46,7 +46,8 @@ mocks.createAgentSessionMock.mockResolvedValue({
 	extensionsResult: {},
 });
 
-import { createPiHeadlessAgent, runHeadlessAgent } from "../src/agent-runner";
+import type { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createPiHeadlessAgent, replayRegisteredProviders, runHeadlessAgent } from "../src/agent-runner";
 
 const { promptMock, abortMock, steerMock, disposeMock, subscribeMock, createAgentSessionMock, inMemoryMock, createSessionMock } = mocks;
 
@@ -54,6 +55,9 @@ const fakeRegistry = {
 	find: vi.fn((_p: string, id: string) => (id === "deepseek-v4-flash" ? { id } : undefined)),
 	getAvailable: () => [{ provider: "deepseek", id: "deepseek-v4-flash", name: "Flash" }],
 	getAll: () => [{ provider: "deepseek", id: "deepseek-v4-flash", name: "Flash" }],
+	getRegisteredProviderIds: () => [] as string[],
+	getRegisteredProviderConfig: () => undefined,
+	getRegisteredNativeProvider: () => undefined,
 } as any;
 
 beforeEach(() => {
@@ -400,5 +404,56 @@ describe("createPiHeadlessAgent", () => {
 		const port = createPiHeadlessAgent(deps);
 
 		await expect(port.run({ ...request, timeoutMs: 50 })).rejects.toThrow(/timed out after 50ms/);
+	});
+});
+
+describe("replayRegisteredProviders", () => {
+	const fakeRuntime = () => ({ registerProvider: vi.fn(), registerNativeProvider: vi.fn() });
+	const asRegistry = (over: Record<string, unknown>) => over as unknown as ModelRegistry;
+	const asRuntime = (over: ReturnType<typeof fakeRuntime>) => over as unknown as ModelRuntime;
+
+	// 宿主的默认 runtime 只有 builtin + models.json；另一扩展用 pi.registerProvider 注册的
+	// provider 若不搬过去，模型会在 headless 执行时变成 `Unknown provider`（自动浮现还会吞掉错误）。
+	it("replays both config-style and native runtime providers", () => {
+		const native = { id: "native-only" };
+		const config = { baseUrl: "https://example.test" };
+		const runtime = fakeRuntime();
+		const registry = asRegistry({
+			getRegisteredProviderIds: () => ["native-only", "config-only"],
+			getRegisteredNativeProvider: (id: string) => (id === "native-only" ? native : undefined),
+			getRegisteredProviderConfig: (id: string) => (id === "config-only" ? config : undefined),
+		});
+
+		replayRegisteredProviders(registry, asRuntime(runtime));
+
+		// native 走 registerNativeProvider，config 走 registerProvider：搬错类型在真实宿主上
+		// 同样表现成 Unknown provider，所以两条路径分开钉。
+		expect(runtime.registerNativeProvider).toHaveBeenCalledWith(native);
+		expect(runtime.registerProvider).toHaveBeenCalledWith("config-only", config);
+		expect(runtime.registerProvider).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips ids that expose neither a native provider nor a config", () => {
+		const runtime = fakeRuntime();
+		const registry = asRegistry({
+			getRegisteredProviderIds: () => ["gone"],
+			getRegisteredNativeProvider: () => undefined,
+			getRegisteredProviderConfig: () => undefined,
+		});
+
+		replayRegisteredProviders(registry, asRuntime(runtime));
+
+		expect(runtime.registerNativeProvider).not.toHaveBeenCalled();
+		expect(runtime.registerProvider).not.toHaveBeenCalled();
+	});
+
+	it("does nothing when the host registered no providers at runtime", () => {
+		const runtime = fakeRuntime();
+		const registry = asRegistry({ getRegisteredProviderIds: () => [] });
+
+		replayRegisteredProviders(registry, asRuntime(runtime));
+
+		expect(runtime.registerNativeProvider).not.toHaveBeenCalled();
+		expect(runtime.registerProvider).not.toHaveBeenCalled();
 	});
 });

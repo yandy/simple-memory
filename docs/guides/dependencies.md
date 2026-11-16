@@ -27,10 +27,12 @@ peer 下限：CI 跑在冒烟也会跑的那一档上，不给「声明支持、
   按 `event.messageType === "user"` 取用户输入，装在 <1.2.0 的宿主上该字段不存在，浮现会静默不触发。
 - `CreateAgentSessionOptions` 只收 `modelRuntime`：`modelRegistry` 在 0.80.2 之后、0.99.2 之前就被移除
   （不是 1.5.0 才改的）。扩展拿不到 runtime（`ExtensionContext.modelRegistry` 是同步门面，没有取回
-  runtime 的公开途径），所以 headless 子会话由宿主自建 runtime，`modelRegistry` 只用于把配置里的模型名
-  解析成 `Model`。
-- `sections`（`systemPromptOptions.sections`）自 0.99.2 起就有，代码里的 `applyIndexSection` 失败分支只是
-  给更老的宿主留的退路，与 peer 下限无关。
+  runtime 的公开途径），所以默认由宿主自建 runtime；**有运行时注册的 provider 时**
+  `src/agent-runner.ts` 自己造一个并把它们搬过去（`replayRegisteredProviders`），否则那些模型会
+  「启动校验解析成功、headless 执行时 Unknown provider」。搬不动的只有运行时虚拟模型（registry 没有读取
+  virtual definition 的途径），那种情况在 `runHeadlessAgent` 里变成一条显式错误。
+- `sections`（`systemPromptOptions.sections`）自 0.99.2 起是**必填字段**，不是可选能力：代码直接按必填
+  契约写入，没有降级分支（缺了就是宿主违约，不该在每轮注入里静默咽成整段替换 system prompt）。
 - 1.2.0 → 1.5.0 之间的差异是纯增量（`KeybindingHints`、`projectContextEntry`、
   `MarkdownTransformerOptions` 等），没有再破坏源码 —— 所以这次抬到 1.5.0 只改声明，1.2.0 那一版留下的
   适配代码原样成立。

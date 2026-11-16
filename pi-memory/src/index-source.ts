@@ -28,7 +28,7 @@ export interface ReplayableSessionManager {
 	buildSessionProjection?(): { messages?: unknown[] } | undefined;
 }
 
-/** 可注入的转换函数（测试用；生产路径从 SDK 包根动态取）。 */
+/** 可注入的转换函数（测试用；生产路径用 SDK 包根的具名导出）。 */
 export interface ReplayOpts {
 	sessionEntryToContextMessages?: (entry: unknown) => unknown[];
 }

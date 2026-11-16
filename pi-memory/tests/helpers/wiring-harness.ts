@@ -438,6 +438,10 @@ export function fakeRegistry(ids: string[], availableIds: string[] = ids) {
 		getAll: () => models,
 		getAvailable: () => available,
 		find: (provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id),
+		// headless 子会话会把「运行时注册的 provider」搬进自建 runtime；默认没有注册
+		getRegisteredProviderIds: () => [] as string[],
+		getRegisteredProviderConfig: () => undefined,
+		getRegisteredNativeProvider: () => undefined,
 	} as any;
 }
 

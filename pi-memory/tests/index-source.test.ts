@@ -4,9 +4,8 @@ const { converterRef } = vi.hoisted(() => ({
 	converterRef: { current: undefined as undefined | ((entry: unknown) => unknown[]) },
 }));
 
-// 现状宿主的包根确实导出 `sessionEntryToContextMessages`，但 `resolveConverter`
-// 是运行时特性探测：用 getter 桥接一个可变引用，于是「导出存在」与「导出缺失」两个分支
-// 都能确定性地测到，不受宿主 SDK 版本影响。
+// 生产代码具名 import 宿主的 `sessionEntryToContextMessages`；这里用 getter 桥接一个可变引用，
+// 好让用例能指定「SDK 导出」返回什么（默认 undefined = 未提供导出）。
 vi.mock("@earendil-works/pi-coding-agent", () => ({
 	get sessionEntryToContextMessages() {
 		return converterRef.current;
@@ -170,6 +169,18 @@ describe("readRecordedMemoryIndex", () => {
 		try {
 			const sm = sessionManager([entry(systemMessage({ memory_index: "from-sdk" }))]);
 			expect(readRecordedMemoryIndex(sm)).toBe("from-sdk");
+		} finally {
+			converterRef.current = undefined;
+		}
+	});
+
+	// 优先级：注入的 converter 必须压过 SDK 导出。只有「两个来源返回不同值」才能区分顺序 ——
+	// 只提供一个来源的用例在顺序写反时照样通过。
+	it("prefers the injected converter over the SDK export", () => {
+		converterRef.current = () => [systemMessage({ memory_index: "from-sdk" })];
+		try {
+			const sm = sessionManager([entry(systemMessage({ memory_index: "from-opts" }))]);
+			expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe("from-opts");
 		} finally {
 			converterRef.current = undefined;
 		}
