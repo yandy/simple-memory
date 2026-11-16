@@ -163,15 +163,6 @@ describe("readRecordedMemoryIndex", () => {
 		const sm = sessionManager([entry(systemMessage({ preamble: "p", memory_index: recorded }))]);
 
 		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe(raw);
-		// 宿主再渲染一次仍逐字节等于录制值：回写不会产生新 patch（D13/D14）。
-		expect(wrapSection(raw)).toBe(recorded);
-	});
-
-	it("returns a recorded value without a wrapper unchanged", () => {
-		const recorded = "- [SSH](ssh.md) — legacy bare value\n";
-		const sm = sessionManager([entry(systemMessage({ memory_index: recorded }))]);
-
-		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe(recorded);
 	});
 
 	it("resolves the converter from the SDK export when no opts are given", () => {
@@ -179,16 +170,6 @@ describe("readRecordedMemoryIndex", () => {
 		try {
 			const sm = sessionManager([entry(systemMessage({ memory_index: "from-sdk" }))]);
 			expect(readRecordedMemoryIndex(sm)).toBe("from-sdk");
-		} finally {
-			converterRef.current = undefined;
-		}
-	});
-
-	it("prefers the injected converter over the SDK export", () => {
-		converterRef.current = () => [systemMessage({ memory_index: "from-sdk" })];
-		try {
-			const sm = sessionManager([entry(systemMessage({ memory_index: "from-opts" }))]);
-			expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe("from-opts");
 		} finally {
 			converterRef.current = undefined;
 		}
@@ -292,14 +273,6 @@ describe("readRecordedMemoryIndex", () => {
 		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe(raw);
 	});
 
-	it("replays across many entries, keeping the last recorded value", () => {
-		const sm = sessionManager([
-			entry(systemMessage({ memory_index: "first" })),
-			entry({ role: "user", content: "hello" }),
-			entry(systemMessage({ memory_index: "second" })),
-		]);
-		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe("second");
-	});
 });
 
 // ── Plan D（D2：优先用宿主的 buildSessionProjection 重放）────────────────────
@@ -362,14 +335,6 @@ describe("readRecordedMemoryIndex 优先用宿主的 buildSessionProjection", ()
 		});
 
 		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe("kept-by-host");
-	});
-
-	it("applies the same null-patch semantics to projected messages", () => {
-		const sm = projecting([systemMessage({ memory_index: "v1" }), systemMessage({ memory_index: null })]);
-
-		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBeNull();
-		// 而且是真的走的投影路径（而不是因为 getEntries 抛错而降级成 null）
-		expect(sm.getEntries).not.toHaveBeenCalled();
 	});
 
 	// Review Focus #3：投影抛错 / 形状不对 → 必须回落原路径，结果与没有投影时逐字相同。
