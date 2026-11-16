@@ -396,6 +396,11 @@ export default function (pi: ExtensionAPI) {
 			syncRuntime = assembled.runtime;
 			syncPersistentErrors = [...assembled.errors];
 			syncErrors.push(...assembled.errors);
+			// create 阶段的预告（如「非 git 项目本会话不同步」）不是失败：只登记为预告并走 info 级通知。
+			if (assembled.notices.length > 0) {
+				syncNotices.push(...assembled.notices);
+				notifyPendingSyncNotices();
+			}
 			const activeRuntime = assembled.runtime;
 			if (activeRuntime) {
 				// 自动初始化与启动收敛共用一份预算；prepare 之外绝不再造一份完整网络预算。
@@ -769,10 +774,12 @@ export default function (pi: ExtensionAPI) {
 
 	function showSyncUnavailable(ui: ExtensionUIContext): void {
 		if (showSyncConfigError(ui)) return;
+		// 没有 runtime 也可能是环境降级（非 git 项目）而非配置错误：原文照显预告，别退化成「未启用」。
+		const reason = syncError ?? syncNotice;
 		notifySync(
 			ui,
-			syncError
-				? `Memory sync unavailable:\n${syncError}`
+			reason
+				? `Memory sync unavailable:\n${reason}`
 				: 'Memory sync unavailable: sync is not enabled; set "sync.enabled" and "sync.remote" in memory.json.',
 			"info",
 		);

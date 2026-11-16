@@ -214,6 +214,10 @@ session_shutdown
   and it is a **notice, not an error**: it is reported as `pi-memory sync notice: …` at info level and `/memory`
   lists it under a separate `Sync notice:` line. Only real failures use `pi-memory sync error: …` and the
   persistent sync error state.
+- **Non-git projects**: when `sync.enabled` is true but the project is not a git repository, v1 does not
+  initialise sync at all. This is likewise a **notice, not an error**: it is reported once as
+  `pi-memory sync notice: …` at info level, `/memory` lists it under `Sync notice:`, and `/memory sync`
+  repeats that reason instead of claiming sync is not enabled.
 - **Writes**: every successful entry write (the `memory` tool, a whole `/dream` round, extract's saves) arms
   the debounce. `pushOnWrite: false` installs a no-op trigger — nothing is published automatically, manual
   commands still work.
@@ -476,6 +480,7 @@ pi-memory runs natively on Windows — no WSL required.
 | The extractor wrote memories | `Extracted <N> memory.` / `Extracted <N> memories.` |
 | The extractor failed | `Extract failed: <message>` — at most once per session |
 | `/dream` finished / failed | the headless agent's summary / `Dream failed: <message>` |
+| Sync degraded by the environment (`sync.enabled` is true but the project is not a git repository) | `pi-memory sync notice:` with `Memory sync v1 only supports git projects; sync is disabled for this session.` (info level, not an error) |
 | Sync fails at startup or on a manual command | `pi-memory sync error:` with one `- <error>` line each / `Memory sync pull failed: <reason>` / `Memory sync push failed: …` / `Memory sync remote failed: …` / `Memory sync status failed: …` |
 | A manual sync command succeeded | `Memory sync pull:` / `Memory sync push:` / `Memory sync remote: <url>`, followed by that round's pulled / pushed / conflict / rejected file lists |
 | Shutdown flush failed | `Memory sync flush failed: <reason>; local changes will be retried at the next session start.` |

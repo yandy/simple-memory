@@ -142,18 +142,20 @@ export async function createPiSyncRuntime(options: {
 	projectDir: string;
 	identity: ProjectIdentity;
 	now?: () => Date;
-}): Promise<{ runtime: PiSyncRuntime | null; errors: string[] }> {
+}): Promise<{ runtime: PiSyncRuntime | null; errors: string[]; notices: string[] }> {
 	const { config, store, projectDir, identity } = options;
 	const now = options.now ?? (() => new Date());
 	const sync = config.sync;
 	const enabled = sync?.enabled === true;
+	const notices: string[] = [];
 
 	if (identity.kind !== "git") {
 		const errors = syncConfigErrors(config);
-		if (enabled) errors.push("Memory sync v1 only supports git projects; sync is disabled for this session.");
-		return { runtime: null, errors };
+		// 环境不支持（非 git 项目）是**降级**，不是故障：走预告通道，别让宿主把它渲染成红色 Error。
+		if (enabled) notices.push("Memory sync v1 only supports git projects; sync is disabled for this session.");
+		return { runtime: null, errors, notices };
 	}
-	if (!enabled) return { runtime: null, errors: syncConfigErrors(config) };
+	if (!enabled) return { runtime: null, errors: syncConfigErrors(config), notices };
 
 	const memoryRoot = resolve(config.memoryDir);
 	const syncRoot = syncRootPath(memoryRoot);
@@ -169,7 +171,7 @@ export async function createPiSyncRuntime(options: {
 	}
 
 	const configErrors = syncConfigErrors(config, { initialized });
-	if (configErrors.length > 0) return { runtime: null, errors: [...errors, ...configErrors] };
+	if (configErrors.length > 0) return { runtime: null, errors: [...errors, ...configErrors], notices };
 
 	if (initialized && remote.trim() !== "") {
 		try {
@@ -431,5 +433,5 @@ export async function createPiSyncRuntime(options: {
 		},
 	};
 
-	return { runtime, errors };
+	return { runtime, errors, notices };
 }
