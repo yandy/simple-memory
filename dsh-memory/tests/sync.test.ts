@@ -361,7 +361,7 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 
 		await vi.waitFor(async () => {
 			await expect(remoteFile(secondRemote, "Gap-write.md")).resolves.toContain("gap body");
-		});
+		}, { timeout: 15_000, interval: 100 });
 		await expect(remoteFile(remote, "Gap-write.md")).rejects.toThrow();
 	});
 

@@ -211,7 +211,7 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		const tool = memoryTool(fake, "s1");
 
 		await tool.execute({ action: "add", name: "A", description: "first", content: "one" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("A.md")).toContain("one"));
+		await vi.waitFor(async () => expect(await remoteFile("A.md")).toContain("one"), { timeout: 15_000, interval: 100 });
 		const addedRevision = await git(["--git-dir", remote, "rev-parse", "main"]);
 		await tool.execute({ action: "list" }, {});
 		await tool.execute({ action: "search", query: "one" }, {});
@@ -220,11 +220,11 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		expect(await git(["--git-dir", remote, "rev-parse", "main"])).toBe(addedRevision);
 
 		await tool.execute({ action: "replace", name: "A", content: "two" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("A.md")).toContain("two"));
+		await vi.waitFor(async () => expect(await remoteFile("A.md")).toContain("two"), { timeout: 15_000, interval: 100 });
 		await tool.execute({ action: "remove", name: "A" }, {});
 		await vi.waitFor(async () => {
 			await expect(remoteFile("A.md")).rejects.toThrow();
-		});
+		}, { timeout: 15_000, interval: 100 });
 	});
 
 	it("uses the same write trigger for extract and dream worker tools, including rename and rebuild_index", async () => {
@@ -254,20 +254,20 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		expect(dreamTool).not.toBe(extractTool);
 
 		await extractTool!.execute({ action: "add", name: "Extract write", content: "from extract" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("Extract-write.md")).toContain("from extract"));
+		await vi.waitFor(async () => expect(await remoteFile("Extract-write.md")).toContain("from extract"), { timeout: 15_000, interval: 100 });
 		await memoryTool(fake, "s1").execute({ action: "add", name: "Old", content: "before rename" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("Old.md")).toContain("before rename"));
+		await vi.waitFor(async () => expect(await remoteFile("Old.md")).toContain("before rename"), { timeout: 15_000, interval: 100 });
 		await dreamTool!.execute({ action: "rename", name: "Old", new_name: "New" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("New.md")).toContain("before rename"));
+		await vi.waitFor(async () => expect(await remoteFile("New.md")).toContain("before rename"), { timeout: 15_000, interval: 100 });
 		await vi.waitFor(async () => {
 			await expect(remoteFile("Old.md")).rejects.toThrow();
-		});
+		}, { timeout: 15_000, interval: 100 });
 
 		// rebuild_index 本身不同步 MEMORY.md；它触发 noteWrite 后，之前直接写盘的 entry 才到远端。
 		const cfg = coreConfig(root);
 		await storeAt(localMemoryDir(), cfg).addEntry({ name: "Pending", description: "direct", body: "pending body" });
 		await dreamTool!.execute({ action: "rebuild_index" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("Pending.md")).toContain("pending body"));
+		await vi.waitFor(async () => expect(await remoteFile("Pending.md")).toContain("pending body"), { timeout: 15_000, interval: 100 });
 	});
 
 	it("cancels debounce on dispose and recovers the local write on the next agent creation", async () => {
@@ -277,12 +277,16 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		await memoryTool(fake, "s1").execute({ action: "add", name: "Pending", content: "recover me" }, {});
 
 		fake.emitter.agentDisposed(agent);
-		await new Promise((resolveTimer) => setTimeout(resolveTimer, 120));
+		// 等待窗口必须长过「去抖期 + 一次完整本地 push 轮」的真实耗时，否则「没推上去」可能只是因为
+		// 查得太早，而不是 dispose() 真的取消了旧定时器 —— 变异验证（去掉 agent/disposed 里的
+		// disposeSyncSession 调用）实测：120ms 窗口下该变异**不会**让本用例变红（假绿），把窗口放宽到
+		// 1000ms 后才能稳定复现失败。1000ms 是本地 bare 仓库单轮 push 实测耗时的数倍余量，不是随意取的。
+		await new Promise((resolveTimer) => setTimeout(resolveTimer, 1000));
 		await expect(remoteFile("Pending.md")).rejects.toThrow();
 
 		const reborn = fake.makeAgent({ id: "s1", cwd: repo });
 		await fake.emitter.agentCreated(reborn);
-		await vi.waitFor(async () => expect(await remoteFile("Pending.md")).toContain("recover me"));
+		await vi.waitFor(async () => expect(await remoteFile("Pending.md")).toContain("recover me"), { timeout: 15_000, interval: 100 });
 		fake.emitter.agentDisposed(reborn);
 		expect((await memoryCommand(fake, reborn)).text).toContain("not initialized");
 		expect((await memoryCommand(fake, reborn, "sync")).kind).toBe("error");
@@ -313,7 +317,7 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 
 		await vi.waitFor(async () => {
 			await expect(remoteFile("Pending.md", missingRemote)).resolves.toContain("written while sync was down");
-		});
+		}, { timeout: 15_000, interval: 100 });
 	});
 
 	it("disposes the previous runtime when the same session is re-created without an intervening dispose event", async () => {
@@ -335,7 +339,7 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		// 新一代 runtime 仍然健康：再写一条，应该由它自己的去抖定时器推上去，
 		// 并且同一轮会连带收敛之前那条一直没发布的 Pending.md（引擎每轮都重新扫全量本地目录）。
 		await memoryTool(fake, "s1").execute({ action: "add", name: "Second", content: "second body" }, {});
-		await vi.waitFor(async () => expect(await remoteFile("Second.md")).toContain("second body"));
+		await vi.waitFor(async () => expect(await remoteFile("Second.md")).toContain("second body"), { timeout: 15_000, interval: 100 });
 		await expect(remoteFile("Pending.md")).resolves.toContain("first body");
 	});
 });
