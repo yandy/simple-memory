@@ -300,6 +300,8 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			warnings: resolved.warnings,
 			setKeys,
 			sync: { get: (sessionId) => syncSessions.get(sessionId) },
+			warn: (message, ...params) => ctx.logger.warn(message, ...params),
+			info: (message, ...params) => ctx.logger.info(message, ...params),
 		}),
 	);
 	// `/dream`：整目录整理。命令立刻返回「已开始」，摘要在宿主日志里（dream 的 timeout 是 600s，

@@ -1,7 +1,7 @@
 import type { SyncRoundResult, SyncStatusReport } from "@yandy0725/memory-core";
 import { sameSyncRemote } from "@yandy0725/memory-core";
 import type { DshSyncSession } from "./sync.js";
-import { syncErrorMessage } from "./sync.js";
+import { SYNC_REMOTE_DRIFT_ERROR, syncErrorMessage } from "./sync.js";
 
 function uniqueFiles(files: readonly string[]): string[] {
 	return [...new Set(files)].sort();
@@ -76,9 +76,7 @@ export function renderSyncStatus(report: SyncStatusReport, configuredRemote: str
 		report.remote.trim() !== "" &&
 		!sameSyncRemote(configuredRemote, report.remote)
 	) {
-		lines.push(
-			'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)',
-		);
+		lines.push(SYNC_REMOTE_DRIFT_ERROR);
 	}
 	return syncErrorMessage(lines.join("\n"));
 }

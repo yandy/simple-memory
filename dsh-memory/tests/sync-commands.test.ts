@@ -16,6 +16,7 @@ import { createMemoryCommand, renderStatus } from "../src/commands.js";
 import type { CommandDeps } from "../src/commands.js";
 import { createDshSyncRuntime } from "../src/sync.js";
 import type { DshSyncRuntime, DshSyncSession } from "../src/sync.js";
+import { SYNC_REMOTE_DRIFT_ERROR } from "../src/sync.js";
 import { renderSyncRound, renderSyncStatus, renderSyncSummary } from "../src/sync-view.js";
 import type { SessionMemoryRuntime } from "../src/store-registry.js";
 
@@ -94,15 +95,19 @@ function session(runtime: DshSyncRuntime | null, over: Partial<DshSyncSession> =
 function commandFor(
 	rt: SessionMemoryRuntime | undefined,
 	syncState: DshSyncSession | undefined,
-): { command: ReturnType<typeof createMemoryCommand>; refresh: ReturnType<typeof vi.fn> } {
+): { command: ReturnType<typeof createMemoryCommand>; refresh: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn> } {
 	const refresh = vi.fn(async () => {});
+	const info = vi.fn();
+	const warn = vi.fn();
 	const deps: CommandDeps = {
 		registry: { get: () => rt },
 		indexCache: { refresh },
 		warnings: [],
 		sync: { get: () => syncState },
+		info,
+		warn,
 	};
-	return { command: createMemoryCommand(deps), refresh };
+	return { command: createMemoryCommand(deps), refresh, info, warn };
 }
 
 function invoke(command: ReturnType<typeof createMemoryCommand>, rawInput: string) {
@@ -261,7 +266,7 @@ describe("/memory sync commands", () => {
 		const { command, refresh } = commandFor(rt, state);
 
 		const result = await invoke(command, `sync ${kind}`);
-		expect(runtime.run).toHaveBeenCalledWith(kind, 4_321);
+		expect(runtime.run).toHaveBeenCalledWith(kind, 4_321, expect.any(Function));
 		expect(refresh).toHaveBeenCalledWith(rt);
 		expect(result.kind).toBe("error");
 		expect(result.text).toContain("root lock is held");
@@ -277,7 +282,7 @@ describe("/memory sync commands", () => {
 		const url = "https://user:super-secret@example.invalid/private.git";
 
 		const result = await invoke(command, `sync remote ${url}`);
-		expect(runtime.changeRemote).toHaveBeenCalledWith(url, 4_321);
+		expect(runtime.changeRemote).toHaveBeenCalledWith(url, 4_321, expect.any(Function));
 		expect(result.kind).toBe("success");
 		expect(result.text).toContain("https://user:***@example.invalid/private.git");
 		expect(result.text).not.toContain("super-secret");
@@ -333,5 +338,80 @@ describe("/memory sync commands", () => {
 		expect(await readFile(sibling, "utf8")).toBe("keep me");
 		expect(await readFile(projectLock, "utf8")).toBe("also keep me");
 		expect((await invoke(command, "sync unlock --force")).text).toContain("No sync lock present");
+	});
+
+	it.each(["pull", "push"] as const)("surfaces the conflict-copy warning in the %s result and logs it before the round finishes", async (kind) => {
+		const cfg = config();
+		const events: string[] = [];
+		const runtime = fakeRuntime(cfg, {
+			run: vi.fn(async (_kind, _timeout, onWarning) => {
+				// 这个 fake 忠实地复现真实 run() 的契约：prepare 产生预告时先回调 onWarning，再跑真正的一轮。
+				onWarning?.("same-named entries may be kept as deterministic conflict copies");
+				events.push("round");
+				return { ok: true as const, value: round({ ok: true }), warning: "same-named entries may be kept as deterministic conflict copies" };
+			}),
+		});
+		const state = session(runtime);
+		const { command, info } = commandFor(memoryRuntime(cfg), state);
+
+		info.mockImplementation(() => events.push("info"));
+		const result = await invoke(command, `sync ${kind}`);
+
+		expect(events).toEqual(["info", "round"]);
+		expect(info).toHaveBeenCalledWith(
+			"simple-memory: memory sync notice: %s",
+			"same-named entries may be kept as deterministic conflict copies",
+		);
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("same-named entries may be kept as deterministic conflict copies");
+		expect(state.notices).toEqual(["same-named entries may be kept as deterministic conflict copies"]);
+	});
+
+	it("surfaces the conflict-copy warning in the remote result and logs it before the change finishes", async () => {
+		const cfg = config();
+		const events: string[] = [];
+		const runtime = fakeRuntime(cfg, {
+			changeRemote: vi.fn(async (_remote, _timeout, onWarning) => {
+				onWarning?.("same-named entries may be kept as deterministic conflict copies");
+				events.push("noteWrite");
+				return { ok: true as const, value: null, warning: "same-named entries may be kept as deterministic conflict copies" };
+			}),
+		});
+		const state = session(runtime);
+		const { command, info } = commandFor(memoryRuntime(cfg), state);
+
+		info.mockImplementation(() => events.push("info"));
+		const result = await invoke(command, "sync remote https://example.invalid/new.git");
+
+		expect(events).toEqual(["info", "noteWrite"]);
+		expect(result.kind).toBe("success");
+		expect(result.text).toContain("same-named entries may be kept as deterministic conflict copies");
+	});
+
+	it("clears a resolved origin-drift error after remote change, but keeps unrelated persistent errors", async () => {
+		const cfg = config({ remote: join(dir, "second-remote.git") });
+		const driftError = SYNC_REMOTE_DRIFT_ERROR;
+		const unrelatedError = "Failed to inspect memory sync state: disk on fire";
+		const runtime = fakeRuntime(cfg);
+		const state = session(runtime, { persistentErrors: [driftError, unrelatedError], errors: [driftError, unrelatedError] });
+		const { command } = commandFor(memoryRuntime(cfg), state);
+
+		const result = await invoke(command, `sync remote ${join(dir, "second-remote.git")}`);
+		expect(result.kind).toBe("success");
+		expect(state.persistentErrors).toEqual([unrelatedError]);
+		expect(state.errors).toEqual([unrelatedError]);
+	});
+
+	it("keeps the origin-drift error when the new remote still does not match the configured remote", async () => {
+		const cfg = config({ remote: join(dir, "configured.git") });
+		const driftError = SYNC_REMOTE_DRIFT_ERROR;
+		const runtime = fakeRuntime(cfg);
+		const state = session(runtime, { persistentErrors: [driftError], errors: [driftError] });
+		const { command } = commandFor(memoryRuntime(cfg), state);
+
+		const result = await invoke(command, `sync remote ${join(dir, "somewhere-else.git")}`);
+		expect(result.kind).toBe("success");
+		expect(state.persistentErrors).toEqual([driftError]);
+		expect(state.errors).toEqual([driftError]);
 	});
 });

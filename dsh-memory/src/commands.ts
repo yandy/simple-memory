@@ -10,6 +10,7 @@ import {
 	readLockStatus,
 	resolveMemoryDir,
 	runTask,
+	sameSyncRemote,
 	syncLockPath,
 	syncRootPath,
 	TASKS,
@@ -20,12 +21,13 @@ import { errorMessage } from "./errors.js";
 import { parseModelRef } from "./model.js";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 import type { DshSyncSession } from "./sync.js";
-import { syncErrorMessage } from "./sync.js";
+import { SYNC_REMOTE_DRIFT_ERROR, syncErrorMessage } from "./sync.js";
 import { renderSyncRound, renderSyncStatus, renderSyncSummary } from "./sync-view.js";
 
 /**
  * `/memory` 命令需要的依赖。命令定义只是数据（注册与生命周期在装配层），
- * 所以这里只拿「查运行时 + 刷索引 + 行 config 的警告 + 用户在行 config 里写过的白名单顶层键」四样。
+ * 所以这里只拿「查运行时 + 刷索引 + 行 config 的警告 + 用户在行 config 里写过的白名单顶层键 +
+ * 同步账本 + 两条日志通道」六样。
  */
 export interface CommandDeps {
 	registry: { get(sessionId: string): SessionMemoryRuntime | undefined };
@@ -41,6 +43,14 @@ export interface CommandDeps {
 	setKeys?: readonly string[];
 	/** 可选以保持纯状态命令的既有单测独立；装配层为每个根会话提供同步账本。 */
 	sync?: { get(sessionId: string): DshSyncSession | undefined };
+	/**
+	 * 宿主日志通道，形状与 `DreamCommandDeps` 的同名依赖一致。`/memory sync pull|push|remote`
+	 * 用它把「可能产生冲突副本」这类预告在**执行会产生副本的那一步之前**就先写进宿主日志 ——
+	 * 命令的返回文本要等整轮跑完才能给出，而预告的价值在于事前，不是事后。可选：装配层没有
+	 * logger 时（例如既有单测直接构造 `CommandDeps`）退化为只把预告并进命令返回文本。
+	 */
+	warn?(message: string, ...params: unknown[]): void;
+	info?(message: string, ...params: unknown[]): void;
 }
 
 /**
@@ -288,14 +298,19 @@ async function runMemorySyncRound(
 	rt: SessionMemoryRuntime,
 	state: DshSyncSession,
 	indexCache: CommandDeps["indexCache"],
+	info: CommandDeps["info"],
 ): Promise<CommandResult> {
 	const runtime = state.runtime;
 	if (!runtime) return syncUnavailable(rt, state);
 	try {
-		const outcome = await runtime.run(kind, rt.config.sync.timeoutMs);
+		const outcome = await runtime.run(kind, rt.config.sync.timeoutMs, (warning) => {
+			info?.("simple-memory: memory sync notice: %s", warning);
+		});
 		// 失败轮也可能已经拉下部分 entry；无论成败都让下一份 prompt 快照看到真实磁盘。
 		await indexCache.refresh(rt);
 		state.notices = outcome.ok && outcome.warning ? [outcome.warning] : [];
+		// info 只是旁路（宿主日志），命令结果自己也要完整 —— 不盯着日志的用户不该错过这条预告。
+		const warningBlock = outcome.ok && outcome.warning ? `\nNotice: ${outcome.warning}` : "";
 		if (!outcome.ok) {
 			state.errors = [...persistentErrors(state), outcome.reason];
 			return { kind: "error", text: syncErrorMessage(`Memory sync ${kind} failed: ${outcome.reason}`) };
@@ -306,11 +321,11 @@ async function runMemorySyncRound(
 			state.errors = [...persistentErrors(state), reason];
 			return {
 				kind: "error",
-				text: syncErrorMessage(`Memory sync ${kind} failed: ${reason}\n${renderSyncRound(round)}`),
+				text: syncErrorMessage(`Memory sync ${kind} failed: ${reason}${warningBlock}\n${renderSyncRound(round)}`),
 			};
 		}
 		state.errors = persistentErrors(state);
-		return { kind: "success", text: `Memory sync ${kind}:\n${renderSyncRound(round)}` };
+		return { kind: "success", text: syncErrorMessage(`Memory sync ${kind}:${warningBlock}\n${renderSyncRound(round)}`) };
 	} catch (error) {
 		const reason = syncErrorMessage(error);
 		state.errors = [...persistentErrors(state), reason];
@@ -322,21 +337,32 @@ async function changeMemorySyncRemote(
 	remote: string,
 	rt: SessionMemoryRuntime,
 	state: DshSyncSession,
+	info: CommandDeps["info"],
 ): Promise<CommandResult> {
 	const runtime = state.runtime;
 	if (!runtime) return syncUnavailable(rt, state);
 	try {
-		const outcome = await runtime.changeRemote(remote, rt.config.sync.timeoutMs);
+		const outcome = await runtime.changeRemote(remote, rt.config.sync.timeoutMs, (warning) => {
+			info?.("simple-memory: memory sync notice: %s", warning);
+		});
 		state.notices = outcome.ok && outcome.warning ? [outcome.warning] : [];
+		const warningBlock = outcome.ok && outcome.warning ? `\nNotice: ${outcome.warning}` : "";
 		if (!outcome.ok) {
 			state.errors = [...persistentErrors(state), outcome.reason];
 			return { kind: "error", text: syncErrorMessage(`Memory sync remote failed: ${outcome.reason}`) };
+		}
+		// 换远端成功后，新 origin 就是 `remote`（`setRemote` 已经生效）。若它现在与行 config 里的
+		// `sync.remote` 一致，工厂阶段记下的那条漂移诊断已经不再成立，精确移除它 —— 而不是盲目
+		// 清空全部持久错误（其它错误，比如 backend.ready() 探测失败，与本次换远端无关，不能一起清掉）。
+		// 若用户换的是一个仍然与 config 不一致的新地址，漂移依然存在，这条错误应当保留。
+		if (state.persistentErrors && sameSyncRemote(remote, configuredRemote(rt))) {
+			state.persistentErrors = state.persistentErrors.filter((error) => error !== SYNC_REMOTE_DRIFT_ERROR);
 		}
 		state.errors = persistentErrors(state);
 		return {
 			kind: "success",
 			text: syncErrorMessage(
-				`Memory sync remote: ${remote}\nOrigin changed and this project's baseline was reset; the plugin row config was not modified.`,
+				`Memory sync remote: ${remote}\nOrigin changed and this project's baseline was reset; the plugin row config was not modified.${warningBlock}`,
 			),
 		};
 	} catch (error) {
@@ -383,10 +409,10 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 					return showMemorySyncStatus(rt, state);
 				}
 				if ((subcommand === "pull" || subcommand === "push") && tokens.length === 2 && state) {
-					return runMemorySyncRound(subcommand, rt, state, deps.indexCache);
+					return runMemorySyncRound(subcommand, rt, state, deps.indexCache, deps.info);
 				}
 				if (subcommand === "remote" && tokens.length === 3 && state) {
-					return changeMemorySyncRemote(tokens[2], rt, state);
+					return changeMemorySyncRemote(tokens[2], rt, state, deps.info);
 				}
 				if (subcommand === "status" || subcommand === "pull" || subcommand === "push" || subcommand === "remote") {
 					if (!state) return syncUnavailable(rt, undefined);

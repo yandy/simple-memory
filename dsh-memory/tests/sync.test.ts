@@ -364,4 +364,68 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		});
 		await expect(remoteFile(remote, "Gap-write.md")).rejects.toThrow();
 	});
+
+	it("reports the local-entry conflict warning before a manual round runs", async () => {
+		const cfg = config();
+		const store = storeFor(cfg);
+		await store.addEntry({ name: "Local", description: "local", body: "local" });
+		const { runtime } = await makeRuntime(cfg, store);
+		if (!runtime) throw new Error("runtime was not created");
+		const events: string[] = [];
+
+		const outcome = await runtime.run("pull", 10_000, (warning) => {
+			events.push(warning.includes("conflict copies") ? "warning" : "other warning");
+			const engine = runtime.engine;
+			if (!engine) throw new Error("warning arrived before the engine was prepared");
+			const pull = engine.pull.bind(engine);
+			vi.spyOn(engine, "pull").mockImplementation(async (timeoutMs) => {
+				events.push("pull");
+				return pull(timeoutMs);
+			});
+		});
+
+		expect(outcome.ok).toBe(true);
+		expect(events).toEqual(["warning", "pull"]);
+	});
+
+	it("reports the local-entry conflict warning before changeRemote schedules the replacement write trigger", async () => {
+		const cfg = config();
+		const store = storeFor(cfg);
+		await store.addEntry({ name: "Local", description: "local", body: "local" });
+		const { runtime } = await makeRuntime(cfg, store);
+		if (!runtime) throw new Error("runtime was not created");
+		expect((await runtime.startup()).ok).toBe(true);
+		const events: string[] = [];
+
+		const changed = await runtime.changeRemote(secondRemote, 10_000, (warning) => {
+			events.push(warning.includes("conflict copies") ? "warning" : "other warning");
+			const engine = runtime.engine;
+			if (!engine) throw new Error("warning arrived before the replacement engine was prepared");
+			const noteWrite = engine.noteWrite.bind(engine);
+			vi.spyOn(engine, "noteWrite").mockImplementation(() => {
+				events.push("noteWrite");
+				noteWrite();
+			});
+		});
+
+		expect(changed.ok).toBe(true);
+		expect(events).toEqual(["warning", "noteWrite"]);
+	});
+
+	it("clarifies that the origin already changed when preparation fails afterwards", async () => {
+		const cfg = config();
+		const { runtime } = await makeRuntime(cfg, storeFor(cfg));
+		if (!runtime) throw new Error("runtime was not created");
+		expect((await runtime.startup()).ok).toBe(true);
+		vi.spyOn(runtime.backend, "init").mockRejectedValueOnce(new Error("network unreachable"));
+
+		const changed = await runtime.changeRemote(secondRemote, 10_000);
+		expect(changed.ok).toBe(false);
+		if (!changed.ok) {
+			expect(changed.reason).toContain("the origin was already changed to");
+			expect(changed.reason).toContain(secondRemote);
+			expect(changed.reason).toContain("network unreachable");
+		}
+		expect(await runtime.backend.getRemote()).toBe(secondRemote);
+	});
 });

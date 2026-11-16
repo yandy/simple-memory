@@ -24,8 +24,16 @@ import {
 	syncConfigErrors,
 	syncRootPath,
 	syncTransport,
+	withFsRetry,
 	writeManifest,
 } from "@yandy0725/memory-core";
+
+/**
+ * origin 漂移的可读诊断。导出为常量而不是就地字面量：`/memory sync remote <url>` 成功后要
+ * 精确地移除这一条（而不是盲目清空全部持久错误），靠文案字符串比对而不是索引位置。
+ */
+export const SYNC_REMOTE_DRIFT_ERROR =
+	'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)';
 
 export type DshSyncOutcome<T> = { ok: true; value: T; warning?: string } | { ok: false; reason: string };
 export type DshSyncStatus = SyncStatusReport | { initialized: boolean; origin: string | null };
@@ -42,10 +50,14 @@ export interface DshSyncRuntime {
 	readonly syncRoot: string;
 	/** 自动初始化；pullOnStart 开启时再共用同一份预算执行一轮启动 push。 */
 	startup(onWarning?: (warning: string) => void): Promise<DshSyncOutcome<SyncRoundResult | null>>;
-	run(kind: "pull" | "push", timeoutMs: number): Promise<DshSyncOutcome<SyncRoundResult>>;
+	run(
+		kind: "pull" | "push",
+		timeoutMs: number,
+		onWarning?: (warning: string) => void,
+	): Promise<DshSyncOutcome<SyncRoundResult>>;
 	/** 严格 dry-run：engine 尚未准备时只读 ready/origin，绝不 prepare。 */
 	status(timeoutMs: number): Promise<DshSyncOutcome<DshSyncStatus>>;
-	changeRemote(remote: string, timeoutMs: number): Promise<DshSyncOutcome<null>>;
+	changeRemote(remote: string, timeoutMs: number, onWarning?: (warning: string) => void): Promise<DshSyncOutcome<null>>;
 	noteWrite(): void;
 	/** abort + drain，不执行 flush；dsh 没有可靠的退出兜底事件。 */
 	dispose(): Promise<void>;
@@ -125,9 +137,7 @@ export async function createDshSyncRuntime(options: {
 		try {
 			const origin = await backend.getRemote();
 			if (origin !== null && !sameSyncRemote(origin, remote)) {
-				errors.push(
-					'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)',
-				);
+				errors.push(SYNC_REMOTE_DRIFT_ERROR);
 			}
 		} catch (error) {
 			errors.push(`Failed to read the initialized sync origin: ${syncErrorMessage(error)}`);
@@ -283,13 +293,19 @@ export async function createDshSyncRuntime(options: {
 		});
 	}
 
-	function run(kind: "pull" | "push", timeoutMs: number): Promise<DshSyncOutcome<SyncRoundResult>> {
+	function run(
+		kind: "pull" | "push",
+		timeoutMs: number,
+		onWarning?: (warning: string) => void,
+	): Promise<DshSyncOutcome<SyncRoundResult>> {
 		if (disposed) return Promise.resolve(disposedResult());
 		if (remoteChangeActive) return Promise.resolve(busyResult());
 		return enqueue(async () => {
 			if (disposed) return disposedResult();
 			const prepared = await prepare(timeoutMs);
 			if (!prepared.ok) return prepared;
+			// 手动恢复初始化时，冲突副本预告也要先于会产生/发布副本的那一轮，口径同 startup()。
+			if (prepared.warning) onWarning?.(prepared.warning);
 			const round = await prepared.engine[kind](timeoutMs);
 			return prepared.warning === undefined
 				? { ok: true as const, value: round }
@@ -314,7 +330,11 @@ export async function createDshSyncRuntime(options: {
 		});
 	}
 
-	function changeRemote(newRemote: string, timeoutMs: number): Promise<DshSyncOutcome<null>> {
+	function changeRemote(
+		newRemote: string,
+		timeoutMs: number,
+		onWarning?: (warning: string) => void,
+	): Promise<DshSyncOutcome<null>> {
 		if (disposed) return Promise.resolve(disposedResult());
 		if (remoteChangeActive) return Promise.resolve(busyResult());
 		if (!positiveBudget(timeoutMs)) {
@@ -323,6 +343,7 @@ export async function createDshSyncRuntime(options: {
 		remoteChangeActive = true;
 		const flight = enqueue(async (): Promise<DshSyncOutcome<null>> => {
 			let result: DshSyncOutcome<null>;
+			let originChanged = false;
 			try {
 				if (disposed) return disposedResult();
 				if (!(await backend.ready())) {
@@ -337,7 +358,7 @@ export async function createDshSyncRuntime(options: {
 				if (disposed) return disposedResult();
 
 				try {
-					await unlink(projectManifest);
+					await withFsRetry(() => unlink(projectManifest));
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
@@ -346,18 +367,33 @@ export async function createDshSyncRuntime(options: {
 				initController = controller;
 				try {
 					await backend.setRemote(newRemote, { timeoutMs, signal: controller.signal });
+					originChanged = true;
 				} finally {
 					if (initController === controller) initController = null;
 				}
 				if (disposed) return disposedResult();
 				const prepared = await prepare(timeoutMs);
+				// origin 已经切换、旧基线已删除：预告必须先于下面可能立刻发布副本的 replacement noteWrite()。
+				if (prepared.ok && prepared.warning) onWarning?.(prepared.warning);
 				result = prepared.ok
 					? { ok: true, value: null, ...(prepared.warning === undefined ? {} : { warning: prepared.warning }) }
-					: { ok: false, reason: prepared.reason };
+					: {
+							ok: false,
+							reason: originChanged
+								? `the origin was already changed to ${syncErrorMessage(newRemote)}, but preparing the new baseline failed: ${prepared.reason}`
+								: prepared.reason,
+						};
 			} catch (error) {
 				pendingEngine?.dispose();
 				pendingEngine = null;
-				result = disposed ? disposedResult() : { ok: false, reason: syncErrorMessage(error) };
+				result = disposed
+					? disposedResult()
+					: {
+							ok: false,
+							reason: originChanged
+								? `the origin was already changed to ${syncErrorMessage(newRemote)}, but the remote change failed afterwards: ${syncErrorMessage(error)}`
+								: syncErrorMessage(error),
+						};
 			}
 
 			if (!disposed) {

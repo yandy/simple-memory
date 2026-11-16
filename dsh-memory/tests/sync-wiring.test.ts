@@ -287,4 +287,55 @@ describe("dsh sync wiring", { timeout: 60_000 }, () => {
 		expect((await memoryCommand(fake, reborn)).text).toContain("not initialized");
 		expect((await memoryCommand(fake, reborn, "sync")).kind).toBe("error");
 	});
+
+	it("recovers on the next session start after a startup failure and pushes writes made while sync was down", async () => {
+		const missingRemote = join(dir, "missing", "remote.git");
+		const firstFake = await setup(rowConfig({ remote: missingRemote, pullOnStart: true }));
+		const firstAgent = firstFake.makeAgent({ id: "s1", cwd: repo });
+		await firstFake.emitter.agentCreated(firstAgent);
+
+		// 同步初始化失败（远端不存在），但本地记忆照常可写 —— 这条写入此时无处可推。
+		const added = await memoryTool(firstFake, "s1").execute(
+			{ action: "add", name: "Pending", content: "written while sync was down" },
+			{},
+		);
+		expect(added.content).toContain("Saved");
+		await expect(remoteFile("Pending.md", missingRemote)).rejects.toThrow();
+
+		// 「修好网络/配置」：真的建出这个 bare 远端，然后用同一份记忆根重新装配一次，
+		// 等价于用户改好配置后的下一次会话/进程启动（spec §6.12 的失败恢复路径）。
+		await mkdir(join(dir, "missing"), { recursive: true });
+		await git(["init", "--bare", "--quiet", "--initial-branch=main", missingRemote]);
+
+		const secondFake = await setup(rowConfig({ remote: missingRemote, pullOnStart: true }));
+		const secondAgent = secondFake.makeAgent({ id: "s2", cwd: repo });
+		await secondFake.emitter.agentCreated(secondAgent);
+
+		await vi.waitFor(async () => {
+			await expect(remoteFile("Pending.md", missingRemote)).resolves.toContain("written while sync was down");
+		});
+	});
+
+	it("disposes the previous runtime when the same session is re-created without an intervening dispose event", async () => {
+		const fake = await setup(rowConfig({ pullOnStart: false, pushOnWrite: true, pushDebounceMs: 60 }));
+		const agent = fake.makeAgent({ id: "s1", cwd: repo });
+		await fake.emitter.agentCreated(agent);
+		await memoryTool(fake, "s1").execute({ action: "add", name: "Pending", content: "first body" }, {});
+
+		// noteWrite 已经排了一个 60ms 的去抖定时器；在它触发之前，宿主对同一个 sessionId 又发了一次
+		// created（clear/compact 重建，中间没有 disposed 事件）—— 第二次 created 必须先 dispose 上一代 runtime。
+		const agent2 = fake.makeAgent({ id: "s1", cwd: repo });
+		await fake.emitter.agentCreated(agent2);
+		// 等待窗口要明显长过去抖期 + 一次本地 bare 仓库 push 的真实耗时，否则「没推上去」可能只是
+		// 因为等得不够久，而不是旧定时器真的被取消了（诊断实测：60ms 去抖 + 完整 push 一轮约需 <200ms）。
+		await new Promise((resolveTimer) => setTimeout(resolveTimer, 300));
+		// pullOnStart=false，新 runtime 不会自己补推；若旧定时器没被取消，这里早该推上去了。
+		await expect(remoteFile("Pending.md")).rejects.toThrow();
+
+		// 新一代 runtime 仍然健康：再写一条，应该由它自己的去抖定时器推上去，
+		// 并且同一轮会连带收敛之前那条一直没发布的 Pending.md（引擎每轮都重新扫全量本地目录）。
+		await memoryTool(fake, "s1").execute({ action: "add", name: "Second", content: "second body" }, {});
+		await vi.waitFor(async () => expect(await remoteFile("Second.md")).toContain("second body"));
+		await expect(remoteFile("Pending.md")).resolves.toContain("first body");
+	});
 });
