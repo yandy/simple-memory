@@ -9,20 +9,21 @@ export const MEMORY_INDEX_SECTION = "memory_index";
 /**
  * 重放录制值所需的最小 `SessionManager` 面（结构类型）。
  *
- * 本地类型是 pi-coding-agent **0.80.2**，它的 `ReadonlySessionManager` 没有
- * `buildContextEntries`（0.99.2 才加），所以这里不 import SDK 的类型，而是按结构声明：
- * 0.80.2 能过 `tsc`，0.99.2 的实例天然满足，测试也能直接塞假对象。
+ * 不 import SDK 的类型，而是按结构声明：真实的 `ReadonlySessionManager`（peer 下限 1.5.0）天然满足，
+ * 测试可以直接塞假对象，低于下限的老宿主也不会因为缺方法让 `session_start` 抛错。
+ * `buildContextEntries` 在宿主实现里是**无参**的（靠内部状态算当前分支），这里按可选带参声明，
+ * 对真实实例多传实参无副作用。
  */
 export interface ReplayableSessionManager {
 	getEntries(): unknown[];
 	getLeafId(): string | null;
 	buildContextEntries?(entries: unknown[], leafId?: string | null): unknown[];
 	/**
-	 * 0.99.2 的实例方法（**无参**），返回 `{ entries, messages, thinkingLevel, model }`。
+	 * 宿主实例的**无参**方法（0.99.2 起），返回 `{ entries, messages, thinkingLevel, model }`。
 	 * 宿主自己算 system 消息用的就是它（`session-manager.js:882`：
 	 * `getCurrentSystemMessage(this.buildSessionProjection().messages)`），所以它才是「模型当前
-	 * 看到哪些 system 消息」的权威来源。本地类型是 0.80.2（没有这个方法）—— 因此声明为可选 +
-	 * 运行时特性探测，不得 import SDK 的类型。
+	 * 看到哪些 system 消息」的权威来源。声明为可选 + 运行时特性探测：0.99.2 之前的老宿主
+	 * 没有它，也不 import SDK 的类型。
 	 */
 	buildSessionProjection?(): { messages?: unknown[] } | undefined;
 }
@@ -81,9 +82,8 @@ export function replaySystemSections(messages: unknown[]): Map<string, string> {
 /**
  * 动态取 SDK 包根的 `sessionEntryToContextMessages`。
  *
- * 不能写成 `import { sessionEntryToContextMessages } from "…"`：本地类型是 0.80.2，
- * 具名导入会让 `tsc` 直接报 `has no exported member`，而这个包**不得**动 peerDependencies /
- * lockfile。取不到就返回 null，调用方回退磁盘读（spec §19 的退路）。
+ * 不用具名 import：宿主早已导出它，但动态取让「宿主没有这个导出」变成可返回 `null` 的可回退情形，
+ * 而不是编译不过。取不到就返回 null，调用方回退磁盘读（spec §19 的退路）。
  */
 function resolveConverter(): ((entry: unknown) => unknown[]) | null {
 	const candidate = (sdk as unknown as Record<string, unknown>).sessionEntryToContextMessages;
@@ -163,7 +163,7 @@ function replayEntryMessages(sm: Partial<ReplayableSessionManager>, opts?: Repla
  * 否则被恢复会话的 system prompt 头部会被改写，折叠路径下其后的整段对话全部失去缓存）。
  *
  * **优先用宿主的 `buildSessionProjection()`** —— 与宿主算 `getCurrentSystemMessage` 同源；
- * 拿不到（0.80.2 / 更老的 session / 投影抛错）才回落到自实现的 entry 重放（Plan C 终审 #4）。
+ * 拿不到（低于 peer 下限的老宿主 / 更老的 session / 投影抛错）才回落到自实现的 entry 重放（Plan C 终审 #4）。
  *
  * 两条路径都不可得时返回 `null`，由调用方回退磁盘读：SDK 太旧（既无投影也无转换函数）、
  * sessionManager 形状不认识（含 `buildSessionProjection()` 的返回值里没有 `messages` 数组，

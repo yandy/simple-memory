@@ -17,7 +17,7 @@ export function buildInjection(systemPrompt: string, snapshot: string): string {
 /**
  * 把冻结的索引值写进 `event.systemPromptOptions.sections`（就地修改这个可变对象）。
  *
- * 返回 `false` 表示宿主 SDK 太旧、没有 `sections`（本地类型是 0.80.2），调用方必须回退
+ * 返回 `false` 表示宿主没有 `sections`（0.99.2 之前的老宿主），调用方必须回退
  * `{ systemPrompt: buildInjection(…) }`（功能不受损，只是缓存变差）。
  *
  * **无条件设置**，哪怕值是 `""`：省略这个键等于告诉 pi「该 section 不应存在」，

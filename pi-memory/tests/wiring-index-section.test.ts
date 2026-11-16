@@ -142,8 +142,8 @@ describe("index wiring — memory_index section", () => {
 			getLeafId: () => "leaf-1",
 		};
 
-		// 本文件把 index-source 整个 mock 了；这里用真实实现（注入 converter 替代 0.80.2 缺失的
-		// SDK 导出），走完「重放 → 脱壳 → 冻结 → 回写」全程。
+		// 本文件把 index-source 整个 mock 了；这里用真实实现（显式注入 converter，不依赖宿主导出），
+		// 走完「重放 → 脱壳 → 冻结 → 回写」全程。
 		const actual = await vi.importActual<typeof import("../src/index-source")>("../src/index-source");
 		readRecordedMemoryIndexMock.mockImplementation((sm: unknown) =>
 			actual.readRecordedMemoryIndex(sm, {

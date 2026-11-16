@@ -12,6 +12,8 @@ in the conversation.
 pi install npm:@yandy0725/pi-memory
 ```
 
+Requires pi **1.5.0 or newer** (`@earendil-works/pi-coding-agent` peer range is `>=1.5.0`).
+
 Or add it to `~/.pi/agent/settings.json`:
 
 ```json

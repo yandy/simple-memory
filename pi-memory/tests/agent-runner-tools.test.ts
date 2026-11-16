@@ -68,8 +68,8 @@ async function createSession(opts: { tools?: string[]; noTools?: "all" | "builti
 		...opts,
 		customTools: [memoryTool],
 		model: undefined,
-		// modelRegistry 无可用 provider 也能起 session（model 为 undefined，不触发任何网络）。
-		modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] } as any,
+		// model 为 undefined，不触发任何网络：宿主自建 runtime（createAgentSession 不收
+		// modelRegistry，扩展也拿不到 runtime）。
 		sessionManager: SessionManager.inMemory(cwd),
 		settingsManager,
 		resourceLoader: loader,

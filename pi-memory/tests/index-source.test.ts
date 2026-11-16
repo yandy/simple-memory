@@ -4,8 +4,8 @@ const { converterRef } = vi.hoisted(() => ({
 	converterRef: { current: undefined as undefined | ((entry: unknown) => unknown[]) },
 }));
 
-// 本地 node_modules 是 pi-coding-agent **0.80.2**，包根没有 `sessionEntryToContextMessages`
-// 导出（0.99.2 才有）。用 getter 桥接一个可变引用，于是「导出存在」与「导出缺失」两个分支
+// 现状宿主的包根确实导出 `sessionEntryToContextMessages`，但 `resolveConverter`
+// 是运行时特性探测：用 getter 桥接一个可变引用，于是「导出存在」与「导出缺失」两个分支
 // 都能确定性地测到，不受宿主 SDK 版本影响。
 vi.mock("@earendil-works/pi-coding-agent", () => ({
 	get sessionEntryToContextMessages() {
@@ -184,7 +184,7 @@ describe("readRecordedMemoryIndex", () => {
 		}
 	});
 
-	// 0.80.2（本地类型/CI 依赖）没有这个导出：必须回退磁盘读，而不是抛错。
+	// 低于 peer 下限的老宿主没有这个导出：必须回退磁盘读，而不是抛错。
 	it("returns null when the SDK does not export sessionEntryToContextMessages", () => {
 		converterRef.current = undefined;
 		const sm = sessionManager([entry(systemMessage({ memory_index: "unreachable" }))]);

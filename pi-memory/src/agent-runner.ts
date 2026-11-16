@@ -17,6 +17,14 @@ import { resolveModel } from "./model-resolver";
 export interface HeadlessAgentOpts {
 	task: string;
 	cwd: string;
+	/**
+	 * 宿主会话的模型注册表，**只用于把配置里的模型名解析成 `Model`**（`resolveModel`）。
+	 *
+	 * 旧基线 0.80.2 的 `createAgentSession` 收 `modelRegistry`，宿主后来改成只收 `modelRuntime`
+	 * （0.99.2 起已是如此），而宿主不把 runtime 暴露给扩展（`ExtensionContext.modelRegistry` 是同步
+	 * 门面，没有取回 runtime 的公开途径）。所以子会话由宿主自建 runtime（默认读
+	 * agentDir/auth.json + models.json），这里只负责给出显式的 `Model`。
+	 */
 	modelRegistry: import("@earendil-works/pi-coding-agent").ModelRegistry;
 	/** 必填：模型必须来自显式配置（启动校验已经保证可解析），没有父模型回退。 */
 	model: string;
@@ -90,7 +98,9 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 		customTools: opts.customTools ?? [],
 		model: resolvedModel as any,
 		thinkingLevel: opts.thinkLevel as any,
-		modelRegistry: opts.modelRegistry,
+		// 不传 `modelRuntime`：扩展拿不到宿主的 runtime（见 HeadlessAgentOpts.modelRegistry）。
+		// 代价：宿主进程里**运行时注册**的 provider（另一个扩展调 `pi.registerProvider`）不在
+		// 自建 runtime 里；写在 models.json 的 provider 照常可用。
 		sessionManager,
 		settingsManager,
 		resourceLoader: loader,

@@ -12,7 +12,7 @@ updates:
           - "minor"
           - "patch"
     ignore:
-      # 宿主提供包，见 docs/guides/dependencies.md「pi 宿主包的版本」：三个 devDependency 精确钉死 0.80.2，
+      # 宿主提供包，见 docs/guides/dependencies.md「pi 宿主包的版本」：三个 devDependency 精确钉死 1.5.0，
       # 升级必然连带改源码，不能由自动 PR 代替决策。
       - dependency-name: "@earendil-works/pi-ai"
       - dependency-name: "@earendil-works/pi-coding-agent"

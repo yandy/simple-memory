@@ -186,9 +186,8 @@ vi.mock("../../src/session-search", () => ({
 	searchSessions: mocks.searchSessionsMock,
 }));
 
-// 录制值重放的真实现由 tests/index-source.test.ts 覆盖（本地 SDK 是 0.80.2，没有
-// sessionEntryToContextMessages 导出，真实路径在这里永远拿不到录制值）—— 接线层只钉
-// 「哪个 reason 走录制值、拿到/拿不到分别怎么办」。
+// 录制值重放的真实现由 tests/index-source.test.ts 覆盖（这里整个 mock 掉，接线层只钉
+// 「哪个 reason 走录制值、拿到/拿不到分别怎么办」）。
 vi.mock("../../src/index-source", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../src/index-source")>();
 	return {
@@ -460,18 +459,32 @@ export function uiCtx(over: Record<string, unknown> = {}) {
 	} as any;
 }
 
-/** 0.99.2 宿主的 fake 事件：`systemPromptOptions.sections` 是可变对象，注入就地写进去。 */
+/** 现状宿主的 fake 事件：`systemPromptOptions.sections` 是可变对象，注入就地写进去。 */
 export function sectionsEvent(prompt = "q") {
 	return {
+		messageType: "user" as const,
 		prompt,
 		systemPrompt: "BASE_PROMPT",
 		systemPromptOptions: { sections: {} as Record<string, string | null> },
 	};
 }
 
-/** 旧 SDK（本地类型 0.80.2）的 fake 事件：根本没有 `sections`。 */
+/** 低于 peer 下限的旧宿主 fake 事件：根本没有 `sections`（**不得**当成现状）。 */
 export function legacyEvent(prompt = "q") {
-	return { prompt, systemPrompt: "BASE_PROMPT", systemPromptOptions: {} };
+	return { messageType: "user" as const, prompt, systemPrompt: "BASE_PROMPT", systemPromptOptions: {} };
+}
+
+/**
+ * `messageType: "custom"` 的 run（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）：
+ * 宿主 1.2.0 起这类事件带 `message` 而不是 `prompt`。
+ */
+export function customTriggerEvent() {
+	return {
+		messageType: "custom" as const,
+		message: { customType: "other-extension", content: "hi", display: false },
+		systemPrompt: "BASE_PROMPT",
+		systemPromptOptions: { sections: {} as Record<string, string | null> },
+	};
 }
 
 /**

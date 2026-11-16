@@ -35,7 +35,7 @@ describe("applyIndexSection", () => {
 		expect(options.sections[MEMORY_INDEX_SECTION]).toBe("new");
 	});
 
-	it("returns false when the host SDK exposes no sections (0.80.2)", () => {
+	it("returns false when the host exposes no sections (pre-sections host)", () => {
 		expect(applyIndexSection({}, "v")).toBe(false);
 		expect(applyIndexSection(undefined, "v")).toBe(false);
 		expect(applyIndexSection(null, "v")).toBe(false);

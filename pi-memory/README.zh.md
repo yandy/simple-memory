@@ -11,6 +11,8 @@ harness 可用。记忆落在磁盘上，不在会话里。
 pi install npm:@yandy0725/pi-memory
 ```
 
+需要 pi **1.5.0 或更新**（`@earendil-works/pi-coding-agent` 的 peer 范围是 `>=1.5.0`）。
+
 或写进 `~/.pi/agent/settings.json`：
 
 ```json

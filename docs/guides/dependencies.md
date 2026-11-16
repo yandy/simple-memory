@@ -10,16 +10,34 @@
 
 - 源码里 import 了宿主提供包，就必须在 `peerDependencies` 里声明；
 - `typebox` 系（`typebox` / `@sinclair/typebox`）按宿主约定用 `*` 范围；
-- `@earendil-works/*` 的范围由本仓自定，当前是 `>=<最低宿主版本>`，脚本只要求声明存在。
+- `@earendil-works/*` 的范围由本仓自定，当前是 `>=1.5.0`（下限就是 devDependency 的精确版本），脚本只要求声明存在。
 
 ## pi 宿主包的版本
 
 `pi-memory` 的 `devDependencies` 把 `@earendil-works/pi-ai` / `pi-coding-agent` / `pi-tui`
-**钉死在 `0.80.2`**（精确版本，不带范围）。
+**钉死在 `1.5.0`**（精确版本，不带范围），`peerDependencies` 声明 `>=1.5.0`。devDependency 取的就是
+peer 下限：CI 跑在冒烟也会跑的那一档上，不给「声明支持、实际没测」留缝。
 
-这不是疏忽：宿主在 1.5.0 改了 API（`BeforeAgentStartEvent` 变成 union、
-`CreateAgentSessionOptions.modelRegistry` → `modelRuntime`/`model`），而当前代码是按 0.80.2
-写的。升级这三个 devDependency 必然连带改代码，必须当成一次独立变更来做。
+钉精确版本不是疏忽：宿主 API 会破坏性变更，而代码是照着某一个版本写的。下限 `1.5.0` 是刻意选的策略值
+（只支持这一档起的宿主），而代码真正**依赖**的 API 边界比它更早，认清楚这两件事才能判断下次能不能随手
+抬：
+
+- `before_agent_start` 变成 `BeforeAgentStartUserEvent | BeforeAgentStartCustomEvent` 是 **1.2.0**
+  （1.1.0 / 1.0.0 / 0.99.2 都还是单一事件，只有 `prompt`，没有 `messageType`）。`pi-memory` 的自动浮现
+  按 `event.messageType === "user"` 取用户输入，装在 <1.2.0 的宿主上该字段不存在，浮现会静默不触发。
+- `CreateAgentSessionOptions` 只收 `modelRuntime`：`modelRegistry` 在 0.80.2 之后、0.99.2 之前就被移除
+  （不是 1.5.0 才改的）。扩展拿不到 runtime（`ExtensionContext.modelRegistry` 是同步门面，没有取回
+  runtime 的公开途径），所以 headless 子会话由宿主自建 runtime，`modelRegistry` 只用于把配置里的模型名
+  解析成 `Model`。
+- `sections`（`systemPromptOptions.sections`）自 0.99.2 起就有，代码里的 `applyIndexSection` 失败分支只是
+  给更老的宿主留的退路，与 peer 下限无关。
+- 1.2.0 → 1.5.0 之间的差异是纯增量（`KeybindingHints`、`projectContextEntry`、
+  `MarkdownTransformerOptions` 等），没有再破坏源码 —— 所以这次抬到 1.5.0 只改声明，1.2.0 那一版留下的
+  适配代码原样成立。
+
+推论：升级这三个 devDependency 必然连带改代码（0.80.2 → 1.5.0 这次就改了 `index.ts` 里 `event.prompt` 的
+收窄、`src/agent-runner.ts` 里 `createAgentSession` 的选项，以及按 0.80.2 事件形状写的 fake 事件与测试），
+必须当成一次独立变更来做，不能让 dependabot 的自动 PR 越过它。
 
 ## dsh 宿主包
 
@@ -91,7 +109,7 @@ CI 的 `test-dist` job 覆盖仓内 dist：`MEMORY_CORE_FROM_DIST=1` 关掉 alia
 `.github/dependabot.yml` 的骨架与 `yandy/pi-packages` 保持一致（周更、限 5 个 PR、dev 依赖
 minor/patch 成组）。唯一刻意的差异是 `ignore`：
 
-- `@earendil-works/*` 三个宿主包精度钉死 0.80.2（见上节）；
+- `@earendil-works/*` 三个宿主包精度钉死 1.5.0（见上节）；
 - `@deepseek-ai/*` 九个 dsh 宿主包同样钉死精确版本（见上节「dsh 宿主包」）；
 - `@yandy0725/memory-core` 是 workspace 内依赖 —— 自动更新只会产出必然红 CI 的 PR 或绕开发布
   顺序。

@@ -585,16 +585,20 @@ export default function (pi: ExtensionAPI) {
 		// Main sessions (including forks) never have this tag. Our own headless
 		// sessions use noExtensions (never bind), so they never reach here.
 		const isSubagent = event.systemPrompt?.includes('<active_agent name="');
+		// 1.2.0 起 `before_agent_start` 是两种 run 的联合：`messageType: "user"` 带 `prompt`，
+		// `messageType: "custom"`（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）带 `message`。
+		// 自动浮现按用户输入检索，custom run 没有用户输入可检索，跳过（不是降级）。
+		const promptText = event.messageType === "user" ? event.prompt : undefined;
 		// biome-ignore lint/suspicious/noExplicitAny: message injection result
 		let injectedMessage: any;
-		if (autoSurfacing?.enabled && event.prompt && !isSubagent) {
+		if (autoSurfacing?.enabled && promptText && !isSubagent) {
 			try {
 				if (ctx.hasUI) ctx.ui.setStatus("surfacing", "Searching relevant memories…");
 				const manifest = await scanEntries(activeStore);
 				if (manifest.length > 0) {
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
-						{ userPrompt: event.prompt.slice(0, 4000), injectedFiles, manifest },
+						{ userPrompt: promptText.slice(0, 4000), injectedFiles, manifest },
 						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless } },
 					);
 					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
@@ -615,7 +619,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return {
-			// 旧 SDK（没有 sections，本地类型就是 0.80.2）的退路：功能不受损，只是缓存变差。
+			// 没有 `sections` 的老宿主（0.99.2 之前）走这条退路：整段替换 system prompt，
+			// 功能不受损，只是缓存变差。
 			...(applied ? {} : { systemPrompt: buildInjection(event.systemPrompt, indexSnapshot) }),
 			...(injectedMessage ? { message: injectedMessage } : {}),
 		};
