@@ -1,6 +1,7 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
+	BeforeAgentStartEventResult,
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionUIContext,
@@ -31,7 +32,7 @@ import { createPiHeadlessAgent } from "./src/agent-runner";
 import { type LoadedConfig, legacyMemoryRoot, loadConfig, type MemoryConfig, modelConfigErrors } from "./src/config";
 import { createPiTranscript } from "./src/host-transcript";
 import { readRecordedMemoryIndex } from "./src/index-source";
-import { applyIndexSection, buildInjection } from "./src/inject-pi";
+import { applyIndexSection } from "./src/inject-pi";
 import { detectLegacyMemoryDir } from "./src/legacy-hint";
 import { createMemoryTool, type MemoryToolDeps, type MemoryToolOptions } from "./src/memory-tool";
 import { resolveModel } from "./src/model-resolver";
@@ -577,20 +578,18 @@ export default function (pi: ExtensionAPI) {
 		// 必须在 auto-surfacing **之前**：surfacing 的 `finally` 在 await 之后读 `ctx.hasUI`，
 		// session 在途中 dispose 会让 handler 从那里抛出（R49）——那时 section 已经被跳过，
 		// 这一轮就从「喂回冻结值」变成了「删段」。
-		const applied = applyIndexSection(event.systemPromptOptions, indexSnapshot);
-
+		applyIndexSection(event.systemPromptOptions, indexSnapshot);
 		const autoSurfacing = config.autoSurfacing;
 		// Skip auto-surfacing in subagent sessions: pi-subagents injects an
 		// <active_agent name="..."/> tag into every subagent's system prompt.
 		// Main sessions (including forks) never have this tag. Our own headless
 		// sessions use noExtensions (never bind), so they never reach here.
-		const isSubagent = event.systemPrompt?.includes('<active_agent name="');
+		const isSubagent = event.systemPrompt.includes('<active_agent name="');
 		// 1.2.0 起 `before_agent_start` 是两种 run 的联合：`messageType: "user"` 带 `prompt`，
 		// `messageType: "custom"`（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）带 `message`。
 		// 自动浮现按用户输入检索，custom run 没有用户输入可检索，跳过（不是降级）。
 		const promptText = event.messageType === "user" ? event.prompt : undefined;
-		// biome-ignore lint/suspicious/noExplicitAny: message injection result
-		let injectedMessage: any;
+		let injectedMessage: BeforeAgentStartEventResult["message"];
 		if (autoSurfacing?.enabled && promptText && !isSubagent) {
 			try {
 				if (ctx.hasUI) ctx.ui.setStatus("surfacing", "Searching relevant memories…");
@@ -618,12 +617,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		return {
-			// 没有 `sections` 的老宿主（0.99.2 之前）走这条退路：整段替换 system prompt，
-			// 功能不受损，只是缓存变差。
-			...(applied ? {} : { systemPrompt: buildInjection(event.systemPrompt, indexSnapshot) }),
-			...(injectedMessage ? { message: injectedMessage } : {}),
-		};
+		return injectedMessage ? { message: injectedMessage } : {};
 	});
 
 	// D14：compaction 是**唯一**的会话内刷新点。compaction 已经重写了对话中段，头部再变一次

@@ -71,7 +71,7 @@ vi.mock("../../src/config", async (importOriginal) => {
 });
 
 // auto-surfacing 的 scanEntries 与三个任务共用的 runTask 都来自 core，在这里一并替换；
-// applyIndexSection / buildInjection 走 pi 的真实实现，这样「sections 注入 + 冻结」这件事本身也被钉住。
+// applyIndexSection 走 pi 的真实实现，这样「sections 注入 + 冻结」这件事本身也被钉住。
 // `resolveMemoryDir` / `scanEntries` / `runTask` 同样来自 core，但同一个包还提供 `MemoryStore` /
 // `indexCapacity` / `parseEntryIndex` / `readLockStatus` / `withFsRetry` / `LOCK_FILE` /
 // `buildIndexSection` / `indexInjectionCapacity` —— 那些是端到端写入用例的被测对象，
@@ -467,11 +467,6 @@ export function sectionsEvent(prompt = "q") {
 		systemPrompt: "BASE_PROMPT",
 		systemPromptOptions: { sections: {} as Record<string, string | null> },
 	};
-}
-
-/** 低于 peer 下限的旧宿主 fake 事件：根本没有 `sections`（**不得**当成现状）。 */
-export function legacyEvent(prompt = "q") {
-	return { messageType: "user" as const, prompt, systemPrompt: "BASE_PROMPT", systemPromptOptions: {} };
 }
 
 /**

@@ -96,7 +96,7 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 		tools: opts.tools ?? (opts.noTools ? undefined : [...FILE_IO_TOOLS]),
 		noTools: opts.noTools,
 		customTools: opts.customTools ?? [],
-		model: resolvedModel as any,
+		model: resolvedModel,
 		thinkingLevel: opts.thinkLevel as any,
 		// 不传 `modelRuntime`：扩展拿不到宿主的 runtime（见 HeadlessAgentOpts.modelRegistry）。
 		// 代价：宿主进程里**运行时注册**的 provider（另一个扩展调 `pi.registerProvider`）不在
@@ -156,7 +156,7 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 	} finally {
 		opts.signal?.removeEventListener("abort", onAbort);
 		unsubscribe();
-		session.dispose?.();
+		session.dispose();
 	}
 }
 

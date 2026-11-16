@@ -107,10 +107,8 @@ describe("index wiring — auto-surfacing", () => {
 		]);
 		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: "<relevant_memories>\n## SSH\nssh config\n</relevant_memories>" });
 
-		const result = await handlers["before_agent_start"][0](
-			{ messageType: "user", prompt: "how do I debug SSH?", systemPrompt: "Normal system prompt" },
-			s.uiCtx(),
-		);
+		const event = { ...sectionsEvent("how do I debug SSH?"), systemPrompt: "Normal system prompt" };
+		const result = await handlers["before_agent_start"][0](event, s.uiCtx());
 
 		expect(scanEntriesMock).toHaveBeenCalledTimes(1);
 		// 清单来自 store（不是逐文件 readFile）
@@ -131,7 +129,7 @@ describe("index wiring — auto-surfacing", () => {
 			content: "<relevant_memories>\n## SSH\nssh config\n</relevant_memories>",
 			display: false,
 		});
-		expect(result?.systemPrompt).toContain("- [SSH](ssh.md) — staging ssh config");
+		expect(event.systemPromptOptions.sections["memory_index"]).toContain("- [SSH](ssh.md) — staging ssh config");
 	});
 
 	it("does not surface the same entry file twice in one session", async () => {
@@ -150,7 +148,7 @@ describe("index wiring — auto-surfacing", () => {
 			return { files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" };
 		});
 
-		const event = { messageType: "user" as const, prompt: "ssh?", systemPrompt: "sp" };
+		const event = sectionsEvent("ssh?");
 		await handlers["before_agent_start"][0](event, s.uiCtx());
 		// 第二轮：runTask 收到的 injectedFiles 里已经有 ssh.md
 		await handlers["before_agent_start"][0](event, s.uiCtx());
@@ -168,18 +166,15 @@ describe("index wiring — auto-surfacing", () => {
 			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
 		]);
 
-		const result = await handlers["before_agent_start"][0](
-			{
-				messageType: "user",
-				prompt: "how do I debug SSH?",
-				systemPrompt: 'sp\n\n<active_agent name="general-purpose"/>\n',
-			},
-			s.uiCtx(),
-		);
+		const event = {
+			...sectionsEvent("how do I debug SSH?"),
+			systemPrompt: 'sp\n\n<active_agent name="general-purpose"/>\n',
+		};
+		await handlers["before_agent_start"][0](event, s.uiCtx());
 
 		expect(scanEntriesMock).not.toHaveBeenCalled();
 		expect(runTaskMock).not.toHaveBeenCalled();
-		expect(result?.systemPrompt).toContain("- [SSH](ssh.md) — staging ssh config");
+		expect(event.systemPromptOptions.sections["memory_index"]).toContain("- [SSH](ssh.md) — staging ssh config");
 	});
 
 	it("skips auto-surfacing for custom-message runs but still writes the index section", async () => {
@@ -212,7 +207,7 @@ describe("index wiring — auto-surfacing", () => {
 		]);
 		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" });
 
-		await handlers["before_agent_start"][0]({ messageType: "user", prompt: "q", systemPrompt: "sp" }, s.uiCtx());
+		await handlers["before_agent_start"][0](sectionsEvent("q"), s.uiCtx());
 
 		const taskCtx = runTaskMock.mock.calls[0][2];
 		expect(Object.keys(taskCtx).sort()).toEqual(["cfg", "cwd", "ports", "store"]);

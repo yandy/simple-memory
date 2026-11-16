@@ -6,7 +6,7 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakePi, DISK_INDEX, legacyEvent, readRecordedMemoryIndexMock, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, setupSession, uiCtx } from "./helpers/wiring-harness";
+import { createFakePi, DISK_INDEX, readRecordedMemoryIndexMock, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, setupSession, uiCtx } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { INDEX_TRUNCATION_MARKER } from "@yandy0725/memory-core";
 
@@ -181,18 +181,6 @@ describe("index wiring — memory_index section", () => {
 
 		expect(readRecordedMemoryIndexMock).toHaveBeenCalledTimes(1);
 		expect(event.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
-	});
-
-	it("falls back to { systemPrompt } when the host SDK exposes no sections", async () => {
-		const { pi, handlers } = createFakePi();
-		memoryFactory(pi as any);
-		await handlers["session_start"][0]({}, s.uiCtx());
-
-		const event = legacyEvent();
-		const result = await handlers["before_agent_start"][0](event, s.uiCtx());
-
-		expect(result?.systemPrompt).toBe(`BASE_PROMPT\n\n${DISK_INDEX}`);
-		expect((event.systemPromptOptions as any).sections).toBeUndefined();
 	});
 
 	it("injects an empty section value instead of dropping the key", async () => {
