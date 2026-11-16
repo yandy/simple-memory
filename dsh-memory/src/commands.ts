@@ -1,26 +1,33 @@
 import { unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import type { HeadlessAgentPort, MemoryConfig } from "@yandy0725/memory-core";
 import {
 	indexCapacity,
 	indexInjectionCapacity,
 	LOCK_FILE,
-	parseEntryIndex,
 	moduleStatusRows,
+	parseEntryIndex,
 	readLockStatus,
 	resolveMemoryDir,
 	runTask,
+	sameSyncRemote,
+	syncLockPath,
+	syncRootPath,
 	TASKS,
 	taskModel,
 	withFsRetry,
 } from "@yandy0725/memory-core";
-import type { HeadlessAgentPort } from "@yandy0725/memory-core";
 import { errorMessage } from "./errors.js";
 import { parseModelRef } from "./model.js";
 import type { SessionMemoryRuntime } from "./store-registry.js";
+import type { DshSyncSession } from "./sync.js";
+import { SYNC_REMOTE_DRIFT_ERROR, syncErrorMessage } from "./sync.js";
+import { renderSyncRound, renderSyncStatus, renderSyncSummary } from "./sync-view.js";
 
 /**
  * `/memory` 命令需要的依赖。命令定义只是数据（注册与生命周期在装配层），
- * 所以这里只拿「查运行时 + 刷索引 + 行 config 的警告 + 用户在行 config 里写过的白名单顶层键」四样。
+ * 所以这里只拿「查运行时 + 刷索引 + 行 config 的警告 + 用户在行 config 里写过的白名单顶层键 +
+ * 同步账本 + 两条日志通道」六样。
  */
 export interface CommandDeps {
 	registry: { get(sessionId: string): SessionMemoryRuntime | undefined };
@@ -34,6 +41,16 @@ export interface CommandDeps {
 	 * 用户增加噪声。（本轮三个任务全部实现了，所以这条就是给未来新增任务留的接口。）
 	 */
 	setKeys?: readonly string[];
+	/** 可选以保持纯状态命令的既有单测独立；装配层为每个根会话提供同步账本。 */
+	sync?: { get(sessionId: string): DshSyncSession | undefined };
+	/**
+	 * 宿主日志通道，形状与 `DreamCommandDeps` 的同名依赖一致。`/memory sync pull|push|remote`
+	 * 用它把「可能产生冲突副本」这类预告在**执行会产生副本的那一步之前**就先写进宿主日志 ——
+	 * 命令的返回文本要等整轮跑完才能给出，而预告的价值在于事前，不是事后。可选：装配层没有
+	 * logger 时（例如既有单测直接构造 `CommandDeps`）退化为只把预告并进命令返回文本。
+	 */
+	warn?(message: string, ...params: unknown[]): void;
+	info?(message: string, ...params: unknown[]): void;
 }
 
 /**
@@ -79,27 +96,54 @@ async function lockStatusLine(memoryDir: string): Promise<string> {
  * turn 里、approval 服务会直接拒，所以「人的显式确认」用 `--force` 表达，而不是 pi 的
  * `ui.confirm`（同一属性、不同机制）。只删 `.lock` 本身 —— 删错了就是两个写入者同时持有锁。
  */
-async function unlockMemory(memoryDir: string, force: boolean): Promise<{ kind: "success" | "error"; text: string }> {
-	const lockPath = join(memoryDir, LOCK_FILE);
+async function unlockLock(
+	lockPath: string,
+	force: boolean,
+	copy: { noun: string; command: string; removed: string; failure: string },
+): Promise<{ kind: "success" | "error"; text: string }> {
 	const status = await readLockStatus(lockPath);
 
 	if (!force) {
-		if (status.kind === "absent") return { kind: "success", text: "No lock present." };
+		if (status.kind === "absent") return { kind: "success", text: `No ${copy.noun} present.` };
 		const described = status.kind === "held" ? `held by ${describeHolder(status.holder)}` : "unreadable";
-		return { kind: "success", text: `Lock is ${described} — re-run /memory unlock --force to remove it.` };
+		return {
+			kind: "success",
+			text: `${copy.noun[0].toUpperCase()}${copy.noun.slice(1)} is ${described} — re-run ${copy.command} --force to remove it.`,
+		};
 	}
 
-	if (status.kind === "absent") return { kind: "success", text: "No lock present." };
+	if (status.kind === "absent") return { kind: "success", text: `No ${copy.noun} present.` };
 	try {
-		// 恢复路径也要重试：删除本身同样会被杀软/索引器/同步客户端打断，再报一次瞬时错误就是
-		// 把用户困在原地。幂等（删一个已不存在的文件走 ENOENT 分支），重试无副作用。
 		await withFsRetry(() => unlink(lockPath));
-		return { kind: "success", text: "Memory lock removed." };
+		return { kind: "success", text: copy.removed };
 	} catch (e) {
-		// check 到 unlink 之间锁自己消失了：那正是想要的结果
-		if ((e as NodeJS.ErrnoException).code === "ENOENT") return { kind: "success", text: "No lock present." };
-		return { kind: "error", text: `Failed to remove memory lock: ${errorMessage(e)}` };
+		if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+			return { kind: "success", text: `No ${copy.noun} present.` };
+		}
+		return { kind: "error", text: `${copy.failure}: ${errorMessage(e)}` };
 	}
+}
+
+async function unlockMemory(memoryDir: string, force: boolean): Promise<{ kind: "success" | "error"; text: string }> {
+	return unlockLock(join(memoryDir, LOCK_FILE), force, {
+		noun: "lock",
+		command: "/memory unlock",
+		removed: "Memory lock removed.",
+		failure: "Failed to remove memory lock",
+	});
+}
+
+/** 根 sync.lock 只依赖配置根；store/config 错误不能关掉唯一人工恢复入口。 */
+async function unlockMemorySync(
+	config: MemoryConfig,
+	force: boolean,
+): Promise<{ kind: "success" | "error"; text: string }> {
+	return unlockLock(syncLockPath(syncRootPath(resolve(config.memoryDir))), force, {
+		noun: "sync lock",
+		command: "/memory sync unlock",
+		removed: "Memory sync lock removed.",
+		failure: "Failed to remove memory sync lock",
+	});
 }
 
 /** `Modules:` 行里未实现任务的后缀：写得很白，不给用户留「它也许在跑」的想像空间。 */
@@ -134,6 +178,7 @@ export async function renderStatus(
 	rt: SessionMemoryRuntime | undefined,
 	warnings: string[],
 	setKeys: readonly string[] = [],
+	syncSession?: DshSyncSession,
 ): Promise<string> {
 	if (rt === undefined) {
 		return "Memory: not initialized — no memory runtime for this session";
@@ -188,6 +233,7 @@ export async function renderStatus(
 		`Modules: ${modules}`,
 		`Lock: ${await lockStatusLine(dir)}`,
 	];
+	if (syncSession !== undefined) lines.push(...renderSyncSummary(syncSession));
 	if (warnings.length > 0) {
 		lines.push(`Config: ${warnings.length} warning(s)`);
 		lines.push(...warnings);
@@ -195,11 +241,142 @@ export async function renderStatus(
 	return lines.join("\n");
 }
 
+type CommandResult = { kind: "success" | "error"; text: string };
+
+const SYNC_USAGE =
+	'Usage: /memory sync [status] | pull | push | remote <url> | unlock [--force]. Initialization is automatic; set "sync.enabled" and "sync.remote" in the plugin row config.';
+
+function configuredRemote(rt: SessionMemoryRuntime): string {
+	return typeof rt.config.sync.remote === "string" ? rt.config.sync.remote : "";
+}
+
+function syncUnavailable(rt: SessionMemoryRuntime, state: DshSyncSession | undefined): CommandResult {
+	const details =
+		rt.error ??
+		[...(state?.errors ?? []), ...(state?.notices ?? [])]
+			.map((line) => line.trim())
+			.filter(Boolean)
+			.join("\n");
+	const fallback = 'sync is not enabled; set "sync.enabled" and "sync.remote" in the plugin row config.';
+	return { kind: "error", text: syncErrorMessage(`Memory sync unavailable:\n${details || fallback}`) };
+}
+
+function persistentErrors(state: DshSyncSession): string[] {
+	return [...(state.persistentErrors ?? [])];
+}
+
+async function showMemorySyncStatus(rt: SessionMemoryRuntime, state: DshSyncSession): Promise<CommandResult> {
+	const runtime = state.runtime;
+	if (!runtime) return syncUnavailable(rt, state);
+	try {
+		const outcome = await runtime.status(rt.config.sync.timeoutMs);
+		if (!outcome.ok) return { kind: "error", text: `Memory sync status failed: ${syncErrorMessage(outcome.reason)}` };
+		if ("configured" in outcome.value) {
+			return { kind: "success", text: renderSyncStatus(outcome.value, configuredRemote(rt)) };
+		}
+		const origin = outcome.value.origin ?? "(not set)";
+		const configured = configuredRemote(rt).trim() || "(not set)";
+		const text = outcome.value.initialized
+			? [
+					"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
+					`Origin: ${origin}`,
+					`Configured remote: ${configured}`,
+				].join("\n")
+			: [
+					'Memory sync is not initialized: set "sync.remote" in the plugin row config; initialization runs at session start, or use /memory sync pull to retry.',
+					`Origin: ${origin}`,
+					`Configured remote: ${configured}`,
+				].join("\n");
+		return { kind: "success", text: syncErrorMessage(text) };
+	} catch (error) {
+		return { kind: "error", text: `Memory sync status failed: ${syncErrorMessage(error)}` };
+	}
+}
+
+async function runMemorySyncRound(
+	kind: "pull" | "push",
+	rt: SessionMemoryRuntime,
+	state: DshSyncSession,
+	indexCache: CommandDeps["indexCache"],
+	info: CommandDeps["info"],
+): Promise<CommandResult> {
+	const runtime = state.runtime;
+	if (!runtime) return syncUnavailable(rt, state);
+	try {
+		const outcome = await runtime.run(kind, rt.config.sync.timeoutMs, (warning) => {
+			info?.("simple-memory: memory sync notice: %s", warning);
+		});
+		// 失败轮也可能已经拉下部分 entry；无论成败都让下一份 prompt 快照看到真实磁盘。
+		await indexCache.refresh(rt);
+		state.notices = outcome.ok && outcome.warning ? [outcome.warning] : [];
+		// info 只是旁路（宿主日志），命令结果自己也要完整 —— 不盯着日志的用户不该错过这条预告。
+		const warningBlock = outcome.ok && outcome.warning ? `\nNotice: ${outcome.warning}` : "";
+		if (!outcome.ok) {
+			state.errors = [...persistentErrors(state), outcome.reason];
+			return { kind: "error", text: syncErrorMessage(`Memory sync ${kind} failed: ${outcome.reason}`) };
+		}
+		const round = outcome.value;
+		if (!round.ok) {
+			const reason = round.skipped?.reason ?? `unknown sync ${kind} failure`;
+			state.errors = [...persistentErrors(state), reason];
+			return {
+				kind: "error",
+				text: syncErrorMessage(`Memory sync ${kind} failed: ${reason}${warningBlock}\n${renderSyncRound(round)}`),
+			};
+		}
+		state.errors = persistentErrors(state);
+		return { kind: "success", text: syncErrorMessage(`Memory sync ${kind}:${warningBlock}\n${renderSyncRound(round)}`) };
+	} catch (error) {
+		const reason = syncErrorMessage(error);
+		state.errors = [...persistentErrors(state), reason];
+		return { kind: "error", text: `Memory sync ${kind} failed: ${reason}` };
+	}
+}
+
+async function changeMemorySyncRemote(
+	remote: string,
+	rt: SessionMemoryRuntime,
+	state: DshSyncSession,
+	info: CommandDeps["info"],
+): Promise<CommandResult> {
+	const runtime = state.runtime;
+	if (!runtime) return syncUnavailable(rt, state);
+	try {
+		const outcome = await runtime.changeRemote(remote, rt.config.sync.timeoutMs, (warning) => {
+			info?.("simple-memory: memory sync notice: %s", warning);
+		});
+		state.notices = outcome.ok && outcome.warning ? [outcome.warning] : [];
+		const warningBlock = outcome.ok && outcome.warning ? `\nNotice: ${outcome.warning}` : "";
+		if (!outcome.ok) {
+			state.errors = [...persistentErrors(state), outcome.reason];
+			return { kind: "error", text: syncErrorMessage(`Memory sync remote failed: ${outcome.reason}`) };
+		}
+		// 换远端成功后，新 origin 就是 `remote`（`setRemote` 已经生效）。若它现在与行 config 里的
+		// `sync.remote` 一致，工厂阶段记下的那条漂移诊断已经不再成立，精确移除它 —— 而不是盲目
+		// 清空全部持久错误（其它错误，比如 backend.ready() 探测失败，与本次换远端无关，不能一起清掉）。
+		// 若用户换的是一个仍然与 config 不一致的新地址，漂移依然存在，这条错误应当保留。
+		if (state.persistentErrors && sameSyncRemote(remote, configuredRemote(rt))) {
+			state.persistentErrors = state.persistentErrors.filter((error) => error !== SYNC_REMOTE_DRIFT_ERROR);
+		}
+		state.errors = persistentErrors(state);
+		return {
+			kind: "success",
+			text: syncErrorMessage(
+				`Memory sync remote: ${remote}\nOrigin changed and this project's baseline was reset; the plugin row config was not modified.${warningBlock}`,
+			),
+		};
+	} catch (error) {
+		const reason = syncErrorMessage(error);
+		state.errors = [...persistentErrors(state), reason];
+		return { kind: "error", text: `Memory sync remote failed: ${reason}` };
+	}
+}
+
 export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 	return {
 		name: "memory",
-		description: "Show memory status, or remove a stale lock with `unlock --force`",
-		input: { hint: "[unlock --force]" },
+		description: "Show memory status, sync memory, or remove a stale lock",
+		input: { hint: "[sync [status|pull|push|remote <url>|unlock [--force]] | unlock --force]" },
 		handler: async (inv) => {
 			const rt = deps.registry.get(inv.agent.session.id);
 			// rawInput 是命令名之后的原文（含分隔空白），先 trim 再按空白拆分。
@@ -207,6 +384,41 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 				.trim()
 				.split(/\s+/)
 				.filter((t) => t.length > 0);
+
+			if (tokens[0] === "sync") {
+				const subcommand = tokens[1] ?? "status";
+				if (subcommand === "unlock" && (tokens.length === 2 || (tokens.length === 3 && tokens[2] === "--force"))) {
+					if (rt === undefined) {
+						return {
+							kind: "error",
+							text:
+								"Cannot unlock memory sync: no memory runtime for this session; fix the plugin row config and start the session first.",
+						};
+					}
+					return unlockMemorySync(rt.config, tokens[2] === "--force");
+				}
+				if (rt === undefined) {
+					return {
+						kind: "error",
+						text:
+							"Memory sync unavailable: no memory runtime for this session; fix the plugin row config and start the session first.",
+					};
+				}
+				const state = deps.sync?.get(inv.agent.session.id);
+				if (subcommand === "status" && tokens.length <= 2 && state) {
+					return showMemorySyncStatus(rt, state);
+				}
+				if ((subcommand === "pull" || subcommand === "push") && tokens.length === 2 && state) {
+					return runMemorySyncRound(subcommand, rt, state, deps.indexCache, deps.info);
+				}
+				if (subcommand === "remote" && tokens.length === 3 && state) {
+					return changeMemorySyncRemote(tokens[2], rt, state, deps.info);
+				}
+				if (subcommand === "status" || subcommand === "pull" || subcommand === "push" || subcommand === "remote") {
+					if (!state) return syncUnavailable(rt, undefined);
+				}
+				return { kind: "error", text: SYNC_USAGE };
+			}
 
 			if (tokens[0] === "unlock") {
 				const force = tokens.includes("--force");
@@ -231,11 +443,11 @@ export function createMemoryCommand(deps: CommandDeps): CommandDefinitionLike {
 				return await unlockMemory(memoryDir, force);
 			}
 
-			// `/memory` 兼作手动同步入口：报状态前先刷一次索引快照（refresh 永不抛错）。
+			// `/memory` 报状态前先刷一次索引快照（refresh 永不抛错）。
 			if (rt !== undefined) await deps.indexCache.refresh(rt);
 			return {
 				kind: "success",
-				text: await renderStatus(rt, deps.warnings, deps.setKeys ?? []),
+				text: await renderStatus(rt, deps.warnings, deps.setKeys ?? [], deps.sync?.get(inv.agent.session.id)),
 			};
 		},
 	};

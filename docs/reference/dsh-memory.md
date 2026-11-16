@@ -28,9 +28,10 @@ loop), which creates a few structural differences. They are listed here rather t
    `dsh-agent-instructions` into **opaque prompt text** with no stable marker, so the
    `## AGENTS.md Rules` section is empty on this side — the instructions are still visible to the main
    agent, they just are not handed to extract separately.
-6. **No cross-device sync.** The sync engine (`.sync/` staging clone, manifest baselines, debounced
-   pushes, the `/memory sync` subcommands) is wired up in `pi-memory` only; the dsh adapter reads and
-   writes the local memory directory. Enable sync on the pi side if you need to share across machines.
+6. **No exit-flush for sync.** `agent/disposed` is not a reliable teardown point in a long-lived host
+   (see [Cross-device sync](#cross-device-sync) below), so unlike pi's `session_shutdown` flush, dsh does
+   not attempt a push when a session goes away. Unpublished writes are picked up by the next
+   `agent/created` startup round instead.
 
 The `dream` / `extractMemories` config subtrees are named exactly as in pi's `memory.json`, so they can
 be copied over; their `model` / `thinkLevel` / budget values are consumed by core, not by this adapter
@@ -40,6 +41,10 @@ The index is not frozen for the session because dsh re-assembles the system prom
 freezes the index for the whole session and replays the recorded value to protect the prompt cache), so
 the index is a snapshot: it is refreshed asynchronously on `agent/created`, after every successful
 memory write, after `/memory`, and before **every** `pre-step`; reads are a synchronous map lookup.
+Cross-device sync, when enabled, runs to completion **before** the first refresh of a session (see
+[Cross-device sync](#cross-device-sync)), so entries pulled in by the startup round are already visible
+in the very first `memory_index` render — there is no "frozen recorded index" caveat here, unlike pi's
+`resume` / `fork` / `reload` paths.
 
 ## Install
 
@@ -127,6 +132,107 @@ directories and the sharing fails silently.
 The first line of `/memory` prints the resolved `Dir:` — that is the intended way to spot this: if the
 two `Dir:` lines disagree, the configuration is not aligned.
 
+## Cross-device sync
+
+dsh-memory can replicate a project's memory entries to **one git remote**, so the same repository opened
+on another machine lands on the same memories. It is **off by default** — syncing writes your memories to
+a remote, so that cost has to be opted into, exactly like `extractMemories`. The engine (three-way diff,
+conflict resolution, manifest baselines, the git transport) is the same `@yandy0725/memory-core` code pi
+uses; this section only describes what is **different on the dsh side** — configuration source, lifecycle
+hooks, and the absence of an exit flush. For the shared core semantics (scope, layout, conflict suffix
+rules, `status` fields) see the
+[pi-memory reference](./pi-memory.md#cross-device-sync); they are identical here.
+
+### Setup — there is no `/memory sync init`
+
+1. Prepare the remote repository yourself (**empty is fine**) and make sure plain `git` in the environment
+   where dsh runs can `clone` / `push` it non-interactively — SSH key, credential helper, token in the
+   URL, whatever your setup already uses. dsh-memory stores no credential of its own and never prompts; it
+   shells out to `git` from `PATH`. A **private** remote is the intended default.
+2. Point the row config at it:
+
+```yaml
+- id: memory
+  name: '@yandy0725/dsh-memory'
+  config:
+    sync: { enabled: true, remote: "git@github.com:you/simple-memory.git" }
+```
+
+3. Start a session. The first `agent/created` for a root agent with this configuration **initialises
+   automatically**: it clones into a unique staging directory, atomically publishes it as
+   `<memoryDir>/.sync/repo`, and writes this project's first baseline. Initialisation and origin changes
+   are serialized by the bounded root lock; an aborted init cleans only its own staging, never another
+   process's published clone. There is deliberately **no `/memory sync init`** command, same reasoning as
+   pi.
+
+Rules that follow from "the origin is the source of truth" are identical to pi's (see the shared reference
+above): once initialised the staged clone's `origin` wins over `sync.remote`; a drifted `sync.remote` is a
+non-fatal notice, not an error; `enabled` / `pullOnStart` / `pushOnWrite` are validated by type, not
+truthiness; initialisation failures degrade to local-only memory with one readable notice.
+
+### Lifecycle (dsh-specific)
+
+```
+agent/created (root agents only; sub-agents are gated out, same as the memory tool)
+  1. registry.prepare — resolve the memory directory / store (unchanged)
+  2. sync: createDshSyncRuntime + prepare (initialise on first use, a missing baseline, or an
+     origin/branch transport mismatch) — this runs whether or not pullOnStart is set
+  3. pullOnStart === true → one push round with only the remaining shared startup budget
+  4. indexCache.refresh — the FIRST snapshot of this session, taken AFTER steps 2–3 complete
+
+every successful memory write (main tool, extract worker, dream worker)
+  → core debounce: mark dirty, schedule one push after pushDebounceMs (quiet period from the first write)
+
+agent/disposed
+  → dispose() the runtime: abort any in-flight init, dispose the engine (which aborts the current
+    round's signal), and drain already-registered manual/automatic rounds. NO push is attempted.
+```
+
+- **Why no exit flush**: `agent/disposed` fires too late (or effectively never) inside a long-lived host
+  process for a session that simply goes idle — this was measured for the extract trigger and is the same
+  reason `extract.ts` uses `agent/turn-stopping` instead (see [Why the sub-session is a long-lived
+  worker](#why-the-sub-session-is-a-long-lived-worker)). Trying to push there would either never run or
+  race the process teardown, so dsh does not try. **A push round is still the whole convergence**
+  (fetch → three-way apply → publish), so the *next* `agent/created` startup round picks up anything a
+  previous session failed to publish — that is the recovery path, in place of pi's `session_shutdown`
+  flush. With `pushOnWrite` and `pullOnStart` both off, use `/memory sync push` explicitly.
+- **`pullOnStart: false` still prepares** — it just never fetches, pulls or pushes automatically. Same
+  semantics as pi.
+- **Existing local entries**: when a new baseline is initialised, prepare warns about possible
+  deterministic conflict copies **before any startup push**, once per baseline, as a notice
+  (`simple-memory: memory sync notice: …`, info level) — not an error.
+- **Non-git projects**: when `sync.enabled` is true but the project is not a git repository, v1 does not
+  initialise sync at all; reported once as a notice, and `/memory sync` repeats that reason instead of
+  claiming sync is not enabled.
+- **Per-session, not per-process**: unlike pi's single `syncRuntime` variable, dsh keeps a
+  `sessionId → runtime` map, because one long-lived host process serves many sessions (same reason the
+  store registry and index cache are keyed by session). Re-creating an agent with the same `sessionId`
+  (host `clear` / `compact`) disposes the previous runtime first, so a stale automatic round can never
+  write to the remote across generations. `apply`'s own disposer drains every remaining session's
+  runtime the same way.
+
+### Commands
+
+```
+/memory sync                    — status (same as `/memory sync status`); strict dry-run
+/memory sync pull               — converge remote changes into disk + refresh the index snapshot; publishes nothing
+/memory sync push               — converge, then publish
+/memory sync remote <url>       — point the staging clone's origin at <url> and reset this project's baseline
+/memory sync unlock [--force]   — remove a left-behind .sync/sync.lock
+```
+
+`status`, `pull`, `push` and `remote <url>` behave identically to pi's (see the shared reference). Two
+differences are dsh-specific:
+
+- **`pull` / `push` refresh the index snapshot** as part of the command (via `indexCache.refresh`), since
+  dsh has no frozen per-session index to protect — the next `pre-step` would refresh it anyway, but doing
+  it inline means `/memory` immediately after a manual round shows the converged state without waiting
+  for the next step.
+- **`unlock` uses `--force`, not an interactive confirmation.** dsh command handlers have no interactive
+  channel (same reason `/dream` has no confirmation dialog), so the explicit `--force` flag — already the
+  established pattern for `/memory unlock` in this adapter — is the confirmation mechanism. Without it,
+  the command only reports the current holder and refuses to delete anything.
+
 ## Models
 
 The model value is core's single string; on the dsh side it is encoded as `"<provider>/<model>"` and
@@ -210,7 +316,7 @@ services, so the emitted `.js` has no host imports. CI guards it with
 
 ## Verification status
 
-Unit tests are green (dsh-memory `282 passed`) and the plugin has been run **end-to-end on real dsh
+Unit tests are green (dsh-memory `308 passed`) and the plugin has been run **end-to-end on real dsh
 `0.2.2-rc.1`** (isolated `DSH_HOME`, `file:` install) — the notes below are that verification record.
 
 Confirmed on a real host (web profile, long-lived):
@@ -227,6 +333,15 @@ Confirmed on a real host (web profile, long-lived):
   the index to three lines, and left a whole-directory snapshot under `<memoryDir>/.backups/`.
 - `/memory` and `/dream` register successfully (an empty `input.hint` makes the host reject the
   registration and roll back the whole bundle).
+
+Cross-device sync is **not** covered by a real-host run in this record: it is verified by unit tests
+(`dsh-memory/tests/sync.test.ts`, `sync-commands.test.ts`, `sync-wiring.test.ts`) that drive the real
+`memory-core` engine and git backend against a **local bare repository** (no network, no credentials),
+through the same `apply()` entry point and fake cordis context used by the rest of this suite. That
+covers init/baseline semantics, the origin-is-truth rules, the startup-before-first-index-refresh
+ordering, the write trigger for the main tool and both worker tools, remote change, and dispose/recovery
+— but it does not exercise a real `dsh` process talking to a real hosted git remote (GitHub/GitLab over
+SSH or HTTPS). Treat sync on a real host as unverified until someone runs it against an actual remote.
 
 ### Why the sub-session is a long-lived worker
 

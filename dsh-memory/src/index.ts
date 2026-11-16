@@ -1,23 +1,25 @@
-import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET, TASKS, taskModel } from "@yandy0725/memory-core";
-import type { HeadlessAgentPort } from "@yandy0725/memory-core";
+import type { HeadlessAgentPort, MemoryToolOnWrite } from "@yandy0725/memory-core";
+import { MEMORY_TOOL_GUIDELINES, MEMORY_TOOL_SNIPPET, projectIdentity, TASKS, taskModel } from "@yandy0725/memory-core";
+import type { AgentsLike, NestedMemoryToolOptions, SessionWorker } from "./agent-session.js";
 import { createSessionWorker } from "./agent-session.js";
-import type { AgentsLike, SessionWorker } from "./agent-session.js";
 import { createDreamCommand, createMemoryCommand } from "./commands.js";
 import { errorMessage } from "./errors.js";
 import { createTurnStoppingListener } from "./extract.js";
-import { createDshHeadless } from "./headless.js";
 import type { LlmLike } from "./headless.js";
+import { createDshHeadless } from "./headless.js";
 import type { Context, HostPreStepDecision, HostPromptSection, HostToolDefinition } from "./host-types.js";
 import { createIndexCache } from "./index-cache.js";
 import { createMemoryTool } from "./memory-tool.js";
-import { resolveSurfacingAvailability } from "./model.js";
 import type { ModuleAvailability, ResolveCallConfig } from "./model.js";
+import { resolveSurfacingAvailability } from "./model.js";
 import { resolveRowConfig, rowConfigSetKeys } from "./row-config.js";
-import { createSessionSearch } from "./session-search.js";
 import type { SessionQueryLike } from "./session-search.js";
-import { createStoreRegistry, isRootAgent } from "./store-registry.js";
+import { createSessionSearch } from "./session-search.js";
 import type { AgentLike, HostDirLike, SessionMemoryRuntime } from "./store-registry.js";
+import { createStoreRegistry, isRootAgent } from "./store-registry.js";
 import { createPreStepListener } from "./surfacing.js";
+import type { DshSyncSession } from "./sync.js";
+import { createDshSyncRuntime, syncErrorMessage } from "./sync.js";
 import { createDshTranscript } from "./transcript.js";
 
 /**
@@ -229,6 +231,32 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	>();
 	/** sessionId → 工具注册的清理项。 */
 	const cleanups = new Map<string, SessionCleanup>();
+	/** sessionId → 同步运行时与当前提示。dispose 只 abort/drain，绝不在 dsh 做退出 flush。 */
+	const syncSessions = new Map<string, DshSyncSession>();
+
+	/** 删除账本并等待该 runtime 已登记的手动/自动在途轮次 settle；重复调用是 no-op。 */
+	function disposeSyncSession(sessionId: string): Promise<void> | undefined {
+		const state = syncSessions.get(sessionId);
+		if (state === undefined) return undefined;
+		syncSessions.delete(sessionId);
+		return state.runtime?.dispose().catch((error: unknown) => {
+			ctx.logger.warn("simple-memory: memory sync cleanup failed: %s", syncErrorMessage(error));
+		});
+	}
+
+	function recordSyncErrors(state: DshSyncSession, values: readonly string[]): void {
+		const fresh = values.map(syncErrorMessage).filter((value) => value.trim() !== "" && !state.errors.includes(value));
+		if (fresh.length === 0) return;
+		state.errors = [...state.errors, ...fresh];
+		for (const message of fresh) ctx.logger.warn("simple-memory: memory sync: %s", message);
+	}
+
+	function recordSyncNotices(state: DshSyncSession, values: readonly string[]): void {
+		const fresh = values.map(syncErrorMessage).filter((value) => value.trim() !== "" && !state.notices.includes(value));
+		if (fresh.length === 0) return;
+		state.notices = [...state.notices, ...fresh];
+		for (const message of fresh) ctx.logger.info("simple-memory: memory sync notice: %s", message);
+	}
 
 	// 5. 全局注册（每进程一次）。宿主的 `section()` / `register()` / `on()` 内部就是
 	//    `ctx.fiber.effect(...)`（dsh-system-prompt/lib/index.js:257、dsh-tools:441、dsh-commands:268、
@@ -265,7 +293,17 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	// 用户在行 config 里写过的白名单顶层键，交给 `/memory` 就地报出未实现的任务
 	//（那些算未实现、是否只在真写了该键时才显示、怎么措辞，都在 commands.ts 的 renderStatus）。
 	const setKeys = rowConfigSetKeys(config);
-	ctx.commands.register(createMemoryCommand({ registry, indexCache, warnings: resolved.warnings, setKeys }));
+	ctx.commands.register(
+		createMemoryCommand({
+			registry,
+			indexCache,
+			warnings: resolved.warnings,
+			setKeys,
+			sync: { get: (sessionId) => syncSessions.get(sessionId) },
+			warn: (message, ...params) => ctx.logger.warn(message, ...params),
+			info: (message, ...params) => ctx.logger.info(message, ...params),
+		}),
+	);
 	// `/dream`：整目录整理。命令立刻返回「已开始」，摘要在宿主日志里（dream 的 timeout 是 600s，
 	// 不能把命令处理器挂在那里等）。
 	ctx.commands.register(
@@ -286,10 +324,63 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// 且每轮多付一次侧查询。判据是 `session.header.origin`（见 isRootAgent）。
 		if (!isRootAgent(like)) return;
 		const sessionId = like.session.id;
+		// 同一 session 重建时先收掉上一代 engine/timer，避免旧自动轮次跨代写远端。
+		await disposeSyncSession(sessionId);
 
 		// prepare 永不抛错：失败也给一个 store=null + error 的 runtime，让 /memory 与工具报错说出原因。
 		const rt = await registry.prepare(like, resolved, surfacing, signal);
+		const syncState: DshSyncSession = { runtime: null, errors: [], notices: [], persistentErrors: [] };
+		syncSessions.set(sessionId, syncState);
+		const isCurrent = () => syncSessions.get(sessionId) === syncState;
+
+		// 同步只是非致命增强：init/startup 的任何失败都只进同步账本与宿主日志。
+		// 这一段必须排在首次 indexCache.refresh 之前，startup push 拉下的 entry 才能进第一份 prompt 快照。
+		if (rt.store !== null && rt.memoryDir !== null && rt.config.sync?.enabled === true) {
+			try {
+				const identity = await projectIdentity(rt.cwd);
+				if (!isCurrent()) return;
+				const assembled = await createDshSyncRuntime({
+					config: rt.config,
+					store: rt.store,
+					projectDir: rt.memoryDir,
+					identity,
+				});
+				if (!isCurrent()) {
+					await assembled.runtime?.dispose();
+					return;
+				}
+				syncState.runtime = assembled.runtime;
+				syncState.persistentErrors = [...assembled.errors];
+				recordSyncErrors(syncState, assembled.errors);
+				recordSyncNotices(syncState, assembled.notices);
+				if (assembled.runtime) {
+					const started = await assembled.runtime.startup((warning) => recordSyncNotices(syncState, [warning]));
+					if (!isCurrent()) return;
+					if (!started.ok) {
+						recordSyncErrors(syncState, [started.reason]);
+					} else {
+						if (started.warning) recordSyncNotices(syncState, [started.warning]);
+						if (started.value !== null && !started.value.ok) {
+							recordSyncErrors(syncState, [started.value.skipped?.reason ?? "memory sync startup round failed"]);
+						}
+					}
+				}
+			} catch (error) {
+				if (!isCurrent()) return;
+				recordSyncErrors(syncState, [syncErrorMessage(error)]);
+			}
+		}
+		if (!isCurrent()) return;
 		await indexCache.refresh(rt);
+
+		/** 主工具与常驻 worker 共用：先保留原回调，再把每次成功写交给当前 engine。 */
+		const writeHook = (onWrite: MemoryToolOnWrite | undefined, refresh: boolean): MemoryToolOnWrite => {
+			return (info) => {
+				onWrite?.(info);
+				syncSessions.get(sessionId)?.runtime?.noteWrite();
+				if (refresh) void indexCache.refresh(rt).catch(() => {});
+			};
+		};
 		// 记住这条会话 agent 作用域下的 `agents` 服务（子会话的 owner 用它）。
 		const scopedAgents = (like as unknown as { ctx?: { agents?: AgentsLike } }).ctx?.agents;
 		if (scopedAgents !== undefined) agentAgents.set(sessionId, scopedAgents);
@@ -303,8 +394,8 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			const ownerAgents = scopedAgents ?? agents;
 			const extractPlan = TASKS.extractMemories.plan;
 			const dreamPlan = TASKS.dream.plan;
-			const buildTool = (options: Parameters<typeof createMemoryTool>[2] & { onWrite?: unknown }): unknown =>
-				createMemoryTool(rt, { searchSessions, onWrite: options?.onWrite as never }, options);
+			const buildTool = (options: NestedMemoryToolOptions): unknown =>
+				createMemoryTool(rt, { searchSessions, onWrite: writeHook(options.onWrite, false) }, options);
 			const makeWorker = async (task: "extractMemories" | "dream") => {
 				const plan = task === "dream" ? dreamPlan : extractPlan;
 				const model = taskModel(rt.config, task);
@@ -348,12 +439,9 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 
 		const tool = createMemoryTool(rt, {
 			searchSessions,
-			// 写入成功后刷新索引快照。core 的 onWrite 是同步回调（handler.ts:183 不 await 它），
-			// 而宿主的 section text 必须同步 —— 所以这里只能 fire-and-forget；refresh 自己永不抛错，
-			// 失败也只是保留旧快照。不过「refresh 不 reject」的保证住在另一个模块（index-cache.ts），
-			// 这里就地吞掉，让「本文件绝不产生 unhandled rejection」本地成立、不被未来的改动打破
-			// （Node 里一次 unhandled rejection 就能在没有全局 handler 时杀死进程）。
-			onWrite: () => void indexCache.refresh(rt).catch(() => {}),
+			// refresh 必须 fire-and-forget：core onWrite 同步、宿主 section text 也同步。
+			// 原写入语义不变，writeHook 另外把同一次成功写交给当前 sync engine。
+			onWrite: writeHook(undefined, true),
 		});
 
 		// 同一个 sessionId 可能再来一次 created（宿主的 clear / compact 会重建 agent）：先撤掉上一份，
@@ -387,6 +475,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	//    无界增长（子 agent 也发这个事件，但它们本来就没进账本，各调用都是幂等 no-op）。
 	ctx.on("agent/disposed", ({ agent }) => {
 		const sessionId = agent.session.id;
+		void disposeSyncSession(sessionId);
 		runCleanup(cleanups.get(sessionId));
 		cleanups.delete(sessionId);
 		registry.forget(sessionId);
@@ -460,6 +549,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			.drain()
 			.catch(() => false)
 			.then(() => Promise.allSettled(slots.flatMap((slot) => [slot.extract?.dispose(), slot.dream?.dispose()])));
+		for (const sessionId of [...syncSessions.keys()]) void disposeSyncSession(sessionId);
 		cleanups.clear();
 		agentAgents.clear();
 		injected.clear();
