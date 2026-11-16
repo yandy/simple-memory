@@ -249,8 +249,8 @@ describe("index wiring — config errors", () => {
 		expect(tools).toHaveLength(1);
 		notify.mockClear();
 
-		// ② 换一个既没有 getAvailable 也没有 getAll 的 registry：resolveModel 里 `registry.getAll()`
-		//    直接 TypeError。session_start 不得 reject，而是落到同一个配置错误态。
+		// ② 换一个既没有 getAvailable 也没有 getRegisteredProviderIds 的 registry：resolveModel 里
+		//    `registry.getAvailable()` 直接 TypeError。session_start 不得 reject，而是落到同一个配置错误态。
 		await expect(
 			handlers["session_start"][0]({}, { ...ctxUI(), modelRegistry: { find: () => undefined } as any }),
 		).resolves.toBeUndefined();

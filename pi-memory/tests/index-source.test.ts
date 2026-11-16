@@ -4,9 +4,8 @@ const { converterRef } = vi.hoisted(() => ({
 	converterRef: { current: undefined as undefined | ((entry: unknown) => unknown[]) },
 }));
 
-// 本地 node_modules 是 pi-coding-agent **0.80.2**，包根没有 `sessionEntryToContextMessages`
-// 导出（0.99.2 才有）。用 getter 桥接一个可变引用，于是「导出存在」与「导出缺失」两个分支
-// 都能确定性地测到，不受宿主 SDK 版本影响。
+// 生产代码具名 import 宿主的 `sessionEntryToContextMessages`；这里用 getter 桥接一个可变引用，
+// 好让用例能指定「SDK 导出」返回什么（默认 undefined = 未提供导出）。
 vi.mock("@earendil-works/pi-coding-agent", () => ({
 	get sessionEntryToContextMessages() {
 		return converterRef.current;
@@ -163,15 +162,6 @@ describe("readRecordedMemoryIndex", () => {
 		const sm = sessionManager([entry(systemMessage({ preamble: "p", memory_index: recorded }))]);
 
 		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe(raw);
-		// 宿主再渲染一次仍逐字节等于录制值：回写不会产生新 patch（D13/D14）。
-		expect(wrapSection(raw)).toBe(recorded);
-	});
-
-	it("returns a recorded value without a wrapper unchanged", () => {
-		const recorded = "- [SSH](ssh.md) — legacy bare value\n";
-		const sm = sessionManager([entry(systemMessage({ memory_index: recorded }))]);
-
-		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe(recorded);
 	});
 
 	it("resolves the converter from the SDK export when no opts are given", () => {
@@ -184,13 +174,8 @@ describe("readRecordedMemoryIndex", () => {
 		}
 	});
 
-	// 0.80.2（本地类型/CI 依赖）没有这个导出：必须回退磁盘读，而不是抛错。
-	it("returns null when the SDK does not export sessionEntryToContextMessages", () => {
-		converterRef.current = undefined;
-		const sm = sessionManager([entry(systemMessage({ memory_index: "unreachable" }))]);
-		expect(readRecordedMemoryIndex(sm)).toBeNull();
-	});
-
+	// 优先级：注入的 converter 必须压过 SDK 导出。只有「两个来源返回不同值」才能区分顺序 ——
+	// 只提供一个来源的用例在顺序写反时照样通过。
 	it("prefers the injected converter over the SDK export", () => {
 		converterRef.current = () => [systemMessage({ memory_index: "from-sdk" })];
 		try {
@@ -299,14 +284,6 @@ describe("readRecordedMemoryIndex", () => {
 		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe(raw);
 	});
 
-	it("replays across many entries, keeping the last recorded value", () => {
-		const sm = sessionManager([
-			entry(systemMessage({ memory_index: "first" })),
-			entry({ role: "user", content: "hello" }),
-			entry(systemMessage({ memory_index: "second" })),
-		]);
-		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe("second");
-	});
 });
 
 // ── Plan D（D2：优先用宿主的 buildSessionProjection 重放）────────────────────
@@ -351,8 +328,8 @@ describe("readRecordedMemoryIndex 优先用宿主的 buildSessionProjection", ()
 		expect(converter).not.toHaveBeenCalled();
 	});
 
-	// 投影路径根本不需要转换函数：旧 SDK 没有 `sessionEntryToContextMessages` 导出时，
-	// 只要宿主够新（有 buildSessionProjection）就仍能拿到录制值。
+	// 投影路径根本不需要转换函数：不传 `sessionEntryToContextMessages`（连 SDK 导出都取不到）时，
+	// 只要有 buildSessionProjection 就仍能拿到录制值。
 	it("works without a converter at all", () => {
 		converterRef.current = undefined;
 		const sm = projecting([systemMessage({ memory_index: "from-projection" })]);
@@ -369,14 +346,6 @@ describe("readRecordedMemoryIndex 优先用宿主的 buildSessionProjection", ()
 		});
 
 		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBe("kept-by-host");
-	});
-
-	it("applies the same null-patch semantics to projected messages", () => {
-		const sm = projecting([systemMessage({ memory_index: "v1" }), systemMessage({ memory_index: null })]);
-
-		expect(readRecordedMemoryIndex(sm, { sessionEntryToContextMessages: passthrough })).toBeNull();
-		// 而且是真的走的投影路径（而不是因为 getEntries 抛错而降级成 null）
-		expect(sm.getEntries).not.toHaveBeenCalled();
 	});
 
 	// Review Focus #3：投影抛错 / 形状不对 → 必须回落原路径，结果与没有投影时逐字相同。

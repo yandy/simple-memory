@@ -293,6 +293,13 @@ At `session_start` pi-memory resolves every required model against the model reg
 
 Fix `memory.json` and restart the session — the config is read once at session start. In headless/print sessions a config error is silent (no notification is shown), so check `/memory` in an interactive session.
 
+Resolution happens against the session's model registry, but the headless sub-session runs in a runtime
+pi-memory builds itself: providers from `models.json` and providers another extension registered at
+runtime with `pi.registerProvider()` are both available. Runtime-registered **virtual models** cannot be
+replayed into that runtime — such a model resolves at startup and then fails with an explicit
+`… resolves in the host registry but not in a headless runtime` error. Configure a physical provider in
+`models.json` if you use one.
+
 ## How it works
 
 ### Session lifecycle
@@ -300,7 +307,7 @@ Fix `memory.json` and restart the session — the config is read once at session
 | Event | What pi-memory does |
 |---|---|
 | `session_start` | Load config → validate the required models (a failure means nothing is initialised) → resolve the memory directory → **prepare cross-device sync** (auto-initialise on first use, always, even with `pullOnStart: false`) → with `pullOnStart` run one convergence round (a push round) → **pick the index value and freeze it** (disk for `startup`/`new`; the recorded transcript value for `resume`/`fork`/`reload`) → register the `memory` tool (once, five actions) → rebuild the manifest cache → dream nudge |
-| `before_agent_start` | Write the frozen value into `sections["memory_index"]` (**unconditionally, every turn**), then auto-surfacing (main session, not a subagent) |
+| `before_agent_start` | Write the frozen value into `sections["memory_index"]` (**unconditionally, every turn**), then auto-surfacing (main session, not a subagent, user-message runs only — a custom message that triggers a run carries no user input to search) |
 | `agent_end` | With `extractMemories.enabled`, fire the async extractor; notify `Extracted N memories.` when it wrote something, or `Extract failed: …` once per session |
 | `session_compact` | Clear the injected-file set **and re-read the index from disk** — the only in-session refresh point |
 | `session_shutdown` | Flush pending sync pushes (bounded by `sync.autoTimeoutMs`) and wait for in-flight writes to finish (bounded by `lock.timeoutMs`) so a quit leaves neither a stale `.lock` nor a memory that only ever reached local disk |
@@ -314,7 +321,9 @@ pi builds the system prompt from ordered sections and appends a *patch* message 
 
 The accepted trade-off: memories written during this session are **not** visible in this session's index. The tool result already confirms the write, and the next session sees it.
 
-If the host pi is older than the sections API, pi-memory falls back to appending the index to the system prompt string — same functionality, worse caching.
+`systemPromptOptions.sections` is a required field of the host event (pi 0.99.2+), and the
+`>=1.5.0` peer floor is stricter still: there is no append-to-prompt fallback. A host that does not
+supply `sections` violates the contract that pi-memory is written against.
 
 ### Auto-surfacing
 

@@ -5,7 +5,7 @@
  */
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, enableTestSync, flush, resetWiringMocks, runTaskMock, setupSession, syncEngines, uiCtx, uiWith } from "./helpers/wiring-harness";
+import { captureUnhandledRejections, createFakePi, createMemoryToolSpy, disposableCtx, enableTestSync, flush, resetWiringMocks, runTaskMock, sectionsEvent, setupSession, syncEngines, uiCtx, uiWith } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { MAIN_AGENT_ACTIONS, TASKS } from "@yandy0725/memory-core";
 
@@ -323,7 +323,7 @@ describe("index wiring — agent_end / extract", () => {
 			"project: never skip tests",
 			"</project_instructions>",
 		].join("\n");
-		await handlers["before_agent_start"][0]({ systemPrompt: sysPrompt }, s.uiCtx());
+		await handlers["before_agent_start"][0]({ ...sectionsEvent(), systemPrompt: sysPrompt }, s.uiCtx());
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hello" }] }, s.uiCtx());
 
 		const blocks = runTaskMock.mock.calls[0][1].agentsMdBlocks;
@@ -338,7 +338,7 @@ describe("index wiring — agent_end / extract", () => {
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		await handlers["before_agent_start"][0]({ systemPrompt: "no AGENTS.md here" }, s.uiCtx());
+		await handlers["before_agent_start"][0]({ ...sectionsEvent(), systemPrompt: "no AGENTS.md here" }, s.uiCtx());
 		await handlers["agent_end"][0]({ messages: [{ role: "user", content: "hello" }] }, s.uiCtx());
 
 		expect(runTaskMock.mock.calls[0][1].agentsMdBlocks).toEqual([]);

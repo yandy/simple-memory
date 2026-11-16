@@ -5,6 +5,8 @@ import {
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
+	type ModelRegistry,
+	ModelRuntime,
 	SessionManager,
 	SettingsManager,
 	type ToolDefinition,
@@ -17,6 +19,15 @@ import { resolveModel } from "./model-resolver";
 export interface HeadlessAgentOpts {
 	task: string;
 	cwd: string;
+	/**
+	 * 宿主会话的模型注册表：用它把配置里的模型名解析成 `Model`（`resolveModel`），并在
+	 * `replayRegisteredProviders` 里把**运行时注册**的 provider 搬到自建 runtime 上。
+	 *
+	 * 旧基线 0.80.2 的 `createAgentSession` 收 `modelRegistry`，宿主后来改成只收 `modelRuntime`
+	 * （0.99.2 起已是如此），而宿主不把 runtime 暴露给扩展（`ExtensionContext.modelRegistry` 是同步
+	 * 门面，没有取回 runtime 的公开途径）。因此子会话的 runtime 由我们自己造：默认只有
+	 * builtin + models.json，registry 里运行时注册的 provider 需要显式搬运。
+	 */
 	modelRegistry: import("@earendil-works/pi-coding-agent").ModelRegistry;
 	/** 必填：模型必须来自显式配置（启动校验已经保证可解析），没有父模型回退。 */
 	model: string;
@@ -63,6 +74,24 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 		throw new Error(`model "${opts.model}" is not resolvable (unknown id or missing credentials)`);
 	}
 
+	// 宿主的默认 runtime 只认识 builtin + models.json：另一扩展用 `pi.registerProvider` 注册的
+	// provider 会缺席 —— 模型在启动校验里能解析，执行时才 `Unknown provider`，而自动浮现还会把
+	// 那个错误静默吞掉。所以有运行时注册时自建 runtime 并把它们搬过来。
+	const modelRuntime =
+		opts.modelRegistry.getRegisteredProviderIds().length > 0 ? await ModelRuntime.create() : undefined;
+	if (modelRuntime) {
+		replayRegisteredProviders(opts.modelRegistry, modelRuntime);
+		// 搬不过来的只剩运行时虚拟模型（registry 没有读取 virtual definition 的途径）：给它一条
+		// 可操作的错误，而不是让宿主抛 `Unknown provider` 再被上层吞掉。
+		if (!modelRuntime.getModel(resolvedModel.provider, resolvedModel.id)) {
+			throw new Error(
+				`model "${opts.model}" resolves in the host registry but not in a headless runtime ` +
+					`(provider "${resolvedModel.provider}" is only registered at runtime, and runtime virtual ` +
+					"models cannot be replayed); configure that provider in models.json",
+			);
+		}
+	}
+
 	// 2. Build a pure resource loader (no extensions/skills/context files/etc.)
 	const settingsManager = SettingsManager.inMemory();
 	const loader = new DefaultResourceLoader({
@@ -88,9 +117,11 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 		tools: opts.tools ?? (opts.noTools ? undefined : [...FILE_IO_TOOLS]),
 		noTools: opts.noTools,
 		customTools: opts.customTools ?? [],
-		model: resolvedModel as any,
+		model: resolvedModel,
 		thinkingLevel: opts.thinkLevel as any,
-		modelRegistry: opts.modelRegistry,
+		// 只有存在运行时注册的 provider 时才自带 runtime（见上面）；否则留空，由宿主按
+		// agentDir/auth.json + models.json 自建，行为与之前一致。
+		modelRuntime,
 		sessionManager,
 		settingsManager,
 		resourceLoader: loader,
@@ -146,7 +177,32 @@ export async function runHeadlessAgent(opts: HeadlessAgentOpts): Promise<string>
 	} finally {
 		opts.signal?.removeEventListener("abort", onAbort);
 		unsubscribe();
-		session.dispose?.();
+		session.dispose();
+	}
+}
+
+/**
+ * 把宿主 registry 里**运行时注册**的 provider 搬到自建 runtime 上。
+ *
+ * 为什么需要搬：`createAgentSession` 只收 `modelRuntime`，而扩展拿不到宿主的 runtime
+ * （`ModelRegistry` 是同步门面，`runtime` 私有），所以宿主的默认行为是自建一个 —— 那里只有
+ * builtin + models.json。另一扩展用 `pi.registerProvider` 注册的 provider（配置式或 native）
+ * 必须显式搬过去，否则「启动校验解析成功、执行时 Unknown provider」。
+ *
+ * 搬不动的只有**运行时虚拟模型**：registry 没有读取 virtual definition 的途径，那种模型由
+ * `runHeadlessAgent` 的 `getModel` 检查变成一条显式错误。
+ *
+ * 导出仅为直接单测。
+ */
+export function replayRegisteredProviders(registry: ModelRegistry, runtime: ModelRuntime): void {
+	for (const id of registry.getRegisteredProviderIds()) {
+		const native = registry.getRegisteredNativeProvider(id);
+		if (native) {
+			runtime.registerNativeProvider(native);
+			continue;
+		}
+		const config = registry.getRegisteredProviderConfig(id);
+		if (config) runtime.registerProvider(id, config);
 	}
 }
 
@@ -197,7 +253,9 @@ export function createPiHeadlessAgent(deps: PiHeadlessDeps): HeadlessAgentPort {
 				cwd: req.cwd,
 				modelRegistry: deps.modelRegistry,
 				model: req.model,
-				// core 不解释档位；pi 的 6 值枚举由启动时的模型校验保证可解析。
+				// core 不解释档位：`EffortLevel` 是裸字符串，启动校验只查模型、不查档位。宿主 1.5.0 的
+				// `ThinkingLevel` 是七值 union（含 `max`），拼错的值会被宿主静默 clamp 成 `off`；
+				// 档位校验属于配置层的事，这里只能断言。
 				thinkLevel: req.effort as ThinkLevel | undefined,
 				maxTurns: req.maxTurns,
 				timeoutMs: req.timeoutMs,

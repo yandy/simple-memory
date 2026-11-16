@@ -1,6 +1,7 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
+	BeforeAgentStartEventResult,
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionUIContext,
@@ -31,7 +32,7 @@ import { createPiHeadlessAgent } from "./src/agent-runner";
 import { type LoadedConfig, legacyMemoryRoot, loadConfig, type MemoryConfig, modelConfigErrors } from "./src/config";
 import { createPiTranscript } from "./src/host-transcript";
 import { readRecordedMemoryIndex } from "./src/index-source";
-import { applyIndexSection, buildInjection } from "./src/inject-pi";
+import { applyIndexSection } from "./src/inject-pi";
 import { detectLegacyMemoryDir } from "./src/legacy-hint";
 import { createMemoryTool, type MemoryToolDeps, type MemoryToolOptions } from "./src/memory-tool";
 import { resolveModel } from "./src/model-resolver";
@@ -443,8 +444,8 @@ export default function (pi: ExtensionAPI) {
 
 		// D13 / D14：索引值在整个 session 内**冻结**。resume / fork / reload 必须用 transcript 里的
 		// 录制值 —— 否则被恢复会话的 system prompt 头部会被改写，而 memory_index 是头部的最后一段，
-		// 折叠路径下其后的整段对话全部失去缓存。录制值拿不到（更老的 session、旧 SDK 没有
-		// sessionEntryToContextMessages）才回退磁盘读。
+		// 折叠路径下其后的整段对话全部失去缓存。录制值拿不到（更老的 session 形状 / 投影不可用）
+		// 才回退磁盘读。
 		// 录制值**不再 re-sanitize**：写入当年已经净化过，而 sanitizeForInjection 是幂等的 ——
 		// 保持字节恒等更利于缓存。
 		const useRecorded = reason === "resume" || reason === "fork" || reason === "reload";
@@ -577,24 +578,26 @@ export default function (pi: ExtensionAPI) {
 		// 必须在 auto-surfacing **之前**：surfacing 的 `finally` 在 await 之后读 `ctx.hasUI`，
 		// session 在途中 dispose 会让 handler 从那里抛出（R49）——那时 section 已经被跳过，
 		// 这一轮就从「喂回冻结值」变成了「删段」。
-		const applied = applyIndexSection(event.systemPromptOptions, indexSnapshot);
-
+		applyIndexSection(event.systemPromptOptions, indexSnapshot);
 		const autoSurfacing = config.autoSurfacing;
 		// Skip auto-surfacing in subagent sessions: pi-subagents injects an
 		// <active_agent name="..."/> tag into every subagent's system prompt.
 		// Main sessions (including forks) never have this tag. Our own headless
 		// sessions use noExtensions (never bind), so they never reach here.
-		const isSubagent = event.systemPrompt?.includes('<active_agent name="');
-		// biome-ignore lint/suspicious/noExplicitAny: message injection result
-		let injectedMessage: any;
-		if (autoSurfacing?.enabled && event.prompt && !isSubagent) {
+		const isSubagent = event.systemPrompt.includes('<active_agent name="');
+		// 1.2.0 起 `before_agent_start` 是两种 run 的联合：`messageType: "user"` 带 `prompt`，
+		// `messageType: "custom"`（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）带 `message`。
+		// 自动浮现按用户输入检索，custom run 没有用户输入可检索，跳过（不是降级）。
+		const promptText = event.messageType === "user" ? event.prompt : undefined;
+		let injectedMessage: BeforeAgentStartEventResult["message"];
+		if (autoSurfacing?.enabled && promptText && !isSubagent) {
 			try {
 				if (ctx.hasUI) ctx.ui.setStatus("surfacing", "Searching relevant memories…");
 				const manifest = await scanEntries(activeStore);
 				if (manifest.length > 0) {
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
-						{ userPrompt: event.prompt.slice(0, 4000), injectedFiles, manifest },
+						{ userPrompt: promptText.slice(0, 4000), injectedFiles, manifest },
 						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless } },
 					);
 					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
@@ -614,11 +617,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		return {
-			// 旧 SDK（没有 sections，本地类型就是 0.80.2）的退路：功能不受损，只是缓存变差。
-			...(applied ? {} : { systemPrompt: buildInjection(event.systemPrompt, indexSnapshot) }),
-			...(injectedMessage ? { message: injectedMessage } : {}),
-		};
+		return injectedMessage ? { message: injectedMessage } : {};
 	});
 
 	// D14：compaction 是**唯一**的会话内刷新点。compaction 已经重写了对话中段，头部再变一次

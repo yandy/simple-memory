@@ -1,4 +1,4 @@
-import * as sdk from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 
 /**
  * 索引 section 的名字（spec §9.1）。pi 要求 section 名匹配 `/^[a-z][a-z0-9_-]*$/`
@@ -9,25 +9,26 @@ export const MEMORY_INDEX_SECTION = "memory_index";
 /**
  * 重放录制值所需的最小 `SessionManager` 面（结构类型）。
  *
- * 本地类型是 pi-coding-agent **0.80.2**，它的 `ReadonlySessionManager` 没有
- * `buildContextEntries`（0.99.2 才加），所以这里不 import SDK 的类型，而是按结构声明：
- * 0.80.2 能过 `tsc`，0.99.2 的实例天然满足，测试也能直接塞假对象。
+ * 不 import SDK 的类型，而是按结构声明：真实的 `ReadonlySessionManager`（peer 下限 1.5.0）天然满足，
+ * 测试可以直接塞假对象，低于下限的老宿主也不会因为缺方法让 `session_start` 抛错。
+ * `buildContextEntries` 在宿主实现里是**无参**的（靠内部状态算当前分支），这里按可选带参声明，
+ * 对真实实例多传实参无副作用。
  */
 export interface ReplayableSessionManager {
 	getEntries(): unknown[];
 	getLeafId(): string | null;
 	buildContextEntries?(entries: unknown[], leafId?: string | null): unknown[];
 	/**
-	 * 0.99.2 的实例方法（**无参**），返回 `{ entries, messages, thinkingLevel, model }`。
+	 * 宿主实例的**无参**方法（0.99.2 起），返回 `{ entries, messages, thinkingLevel, model }`。
 	 * 宿主自己算 system 消息用的就是它（`session-manager.js:882`：
 	 * `getCurrentSystemMessage(this.buildSessionProjection().messages)`），所以它才是「模型当前
-	 * 看到哪些 system 消息」的权威来源。本地类型是 0.80.2（没有这个方法）—— 因此声明为可选 +
-	 * 运行时特性探测，不得 import SDK 的类型。
+	 * 看到哪些 system 消息」的权威来源。声明为可选 + 运行时特性探测：0.99.2 之前的老宿主
+	 * 没有它，也不 import SDK 的类型。
 	 */
 	buildSessionProjection?(): { messages?: unknown[] } | undefined;
 }
 
-/** 可注入的转换函数（测试用；生产路径从 SDK 包根动态取）。 */
+/** 可注入的转换函数（测试用；生产路径用 SDK 包根的具名导出）。 */
 export interface ReplayOpts {
 	sessionEntryToContextMessages?: (entry: unknown) => unknown[];
 }
@@ -79,18 +80,6 @@ export function replaySystemSections(messages: unknown[]): Map<string, string> {
 }
 
 /**
- * 动态取 SDK 包根的 `sessionEntryToContextMessages`。
- *
- * 不能写成 `import { sessionEntryToContextMessages } from "…"`：本地类型是 0.80.2，
- * 具名导入会让 `tsc` 直接报 `has no exported member`，而这个包**不得**动 peerDependencies /
- * lockfile。取不到就返回 null，调用方回退磁盘读（spec §19 的退路）。
- */
-function resolveConverter(): ((entry: unknown) => unknown[]) | null {
-	const candidate = (sdk as unknown as Record<string, unknown>).sessionEntryToContextMessages;
-	return typeof candidate === "function" ? (candidate as (entry: unknown) => unknown[]) : null;
-}
-
-/**
  * 宿主投影里的 messages（0.99.2 的 `buildSessionProjection()`）。
  *
  * 不可用（没有该方法 / 抛错 / 返回值形状不对）时返回 `null`，调用方回落到下面的自实现重放。
@@ -111,13 +100,16 @@ function projectionMessages(sm: Partial<ReplayableSessionManager>): unknown[] | 
 }
 
 /**
- * 自实现的 entry 重放（旧 SDK / 老 session 的退路）：`getEntries` → `buildContextEntries`
- * → 逐条转成 context messages。任何一步不可得都返回 `null`：转换函数缺失（SDK 太旧）、
- * sessionManager 形状不认识、`getEntries` 抛错。
+ * 自实现的 entry 重放（投影不可用时的退路）：`getEntries` → `buildContextEntries`
+ * → 逐条转成 context messages。不可得时返回 `null`：sessionManager 形状不认识、
+ * `getEntries` 抛错。
  */
 function replayEntryMessages(sm: Partial<ReplayableSessionManager>, opts?: ReplayOpts): unknown[] | null {
-	const toMessages = opts?.sessionEntryToContextMessages ?? resolveConverter();
-	if (!toMessages) return null;
+	// 宿主的 entry → context messages 转换器，**刻意放宽成 `unknown` entry**：重放的是从磁盘
+	// session 文件读出的历史 entry，形状按定义未知（可能是更老的格式），不能假装它们是宿主的
+	// `SessionEntry`；单条不识别的 entry 由下面的 per-entry try 跳过。
+	const toMessages =
+		opts?.sessionEntryToContextMessages ?? (sessionEntryToContextMessages as (entry: unknown) => unknown[]);
 	if (typeof sm.getEntries !== "function" || typeof sm.getLeafId !== "function") return null;
 
 	let entries: unknown[] = [];
@@ -163,11 +155,11 @@ function replayEntryMessages(sm: Partial<ReplayableSessionManager>, opts?: Repla
  * 否则被恢复会话的 system prompt 头部会被改写，折叠路径下其后的整段对话全部失去缓存）。
  *
  * **优先用宿主的 `buildSessionProjection()`** —— 与宿主算 `getCurrentSystemMessage` 同源；
- * 拿不到（0.80.2 / 更老的 session / 投影抛错）才回落到自实现的 entry 重放（Plan C 终审 #4）。
+ * 拿不到（sessionManager 形状不认识 / 更老的 session / 投影抛错）才回落到自实现的 entry 重放（Plan C 终审 #4）。
  *
- * 两条路径都不可得时返回 `null`，由调用方回退磁盘读：SDK 太旧（既无投影也无转换函数）、
- * sessionManager 形状不认识（含 `buildSessionProjection()` 的返回值里没有 `messages` 数组，
- * `projectionMessages` 对非数组返回 `null`）、`buildSessionProjection` / `getEntries` 抛错、重放后没有这个键、
+ * 两条路径都不可得时返回 `null`，由调用方回退磁盘读：sessionManager 形状不认识（含
+ * `buildSessionProjection()` 的返回值里没有 `messages` 数组，`projectionMessages` 对非数组返回 `null`）、
+ * `buildSessionProjection` / `getEntries` 抛错、重放后没有这个键、
  * 或该键被 `null` patch 删除。**单条 entry 的形状不认识**不会让整次重放失败：那一条被跳过
  *（见 `replayEntryMessages`），其余 entry 照常重放 —— 它不会变成 `null` 返回值。
  * **绝不把 `null` 当录制值返回**（spec §9.1 的 null 陷阱）。
