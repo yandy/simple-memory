@@ -89,19 +89,12 @@ describe("loadConfig", () => {
 		expect(cfg.autoSurfacing.model).toBeUndefined();
 	});
 
-	it("passes the platform seam through to the tilde expansion", async () => {
-		// `~\` 只在 win32 展开；POSIX 上它是合法文件名。两边各跑一次才能钉住「缝确实传下去了」。
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~\\mem" }));
-		expect((await loadConfig({ ...ctx(false), _platform: "win32" })).config.memoryDir).toBe(join(homedir(), "mem"));
-		expect((await loadConfig({ ...ctx(false), _platform: "linux" })).config.memoryDir).toBe("~\\mem");
-	});
-
 	// ── 以下用例迁自 memory-core/tests/config.test.ts 的 describe("loadConfigFrom") ────────────────
 	// 迁移只动了三处：入参从「文件列表」换成 pi 的注入缝、`platform` 换成 `_platform`、删掉
 	// `dream.nudgeAfter*` 断言（那两个键已归 pi）。**期望值一字不改** —— 这就是「行为逐字不变」的证词。
 	// 已在上面被覆盖、不再重复的迁移用例：「project overrides global」由
-	// 「lets the project config override the global one when trusted」覆盖；两条 `~\` 平台规则由
-	// 「passes the platform seam through to the tilde expansion」与下面的 `~` 用例覆盖。
+	// 「lets the project config override the global one when trusted」覆盖；`~` 与 `~\` 两条平台规则由
+	// 下面的「expands ~ …」与「expands ~ only for win32 backslash forms」覆盖。
 
 	it("returns defaults when no config files exist", async () => {
 		expect((await loadConfig(ctx(true))).config.memIndexMaxLines).toBe(200);
@@ -136,19 +129,20 @@ describe("loadConfig", () => {
 		expect(cfg.dream.thinkLevel).toBe("high");
 	});
 
-	it("expands ~ in memoryDir", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~/mymem" }));
-		expect((await loadConfig(ctx(true))).config.memoryDir).toBe(join(homedir(), "mymem"));
-	});
-
 	it("handles malformed JSON gracefully", async () => {
 		await writeFile(join(globalDir, "memory.json"), "this is not json");
 		expect((await loadConfig(ctx(true))).config.memIndexMaxLines).toBe(200);
 	});
 
-	it("expands bare ~ to homedir", async () => {
-		await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: "~" }));
-		expect((await loadConfig(ctx(true))).config.memoryDir).toBe(homedir());
+	// `~` 的两种形态：`~/…` 与裸 `~`。反斜杠形态的平台规则另见下面的 win32 用例。
+	it("expands ~ in memoryDir, bare or with a subpath", async () => {
+		for (const row of [
+			{ input: "~/mymem", expected: join(homedir(), "mymem") },
+			{ input: "~", expected: homedir() },
+		]) {
+			await writeFile(join(globalDir, "memory.json"), JSON.stringify({ memoryDir: row.input }));
+			expect((await loadConfig(ctx(true))).config.memoryDir, row.input).toBe(row.expected);
+		}
 	});
 
 	it("has autoSurfacing defaults", async () => {
