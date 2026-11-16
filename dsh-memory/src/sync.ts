@@ -51,6 +51,15 @@ export interface DshSyncRuntime {
 	dispose(): Promise<void>;
 }
 
+export interface DshSyncSession {
+	runtime: DshSyncRuntime | null;
+	/** 当前要展示的错误/预告；启动与手动操作会更新它们。 */
+	errors: string[];
+	notices: string[];
+	/** 工厂阶段仍成立的错误（例如 origin 漂移）；手动成功只清瞬时错误。 */
+	persistentErrors?: string[];
+}
+
 /** 同步提示在 dsh 的唯一配置层是行 config；同时守住 URL userinfo 的日志/命令边界。 */
 export function syncErrorMessage(error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
