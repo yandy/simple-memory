@@ -468,7 +468,7 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(notify.mock.calls[0][0]).not.toContain("pi-memory sync error:");
 	});
 
-	it("does not initialize a local project and explains that v1 supports only git projects", async () => {
+	it("does not initialize a local project and reports non-git sync as a notice, not an error", async () => {
 		projectIdentityMock.mockResolvedValueOnce({ kind: "local", key: s.cwd });
 		await enableSync();
 		const notify = vi.fn();
@@ -479,10 +479,16 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 
 		expect(tools).toHaveLength(1);
 		expect(notify).toHaveBeenCalledTimes(1);
+		// 非 git 项目是环境降级，不是失败：必须走 info 预告通道，不得渲染成红色 Error。
+		expect(notify.mock.calls[0][1]).toBe("info");
+		expect(notify.mock.calls[0][0]).toContain("pi-memory sync notice:");
+		expect(notify.mock.calls[0][0]).not.toContain("pi-memory sync error:");
 		expect(notify.mock.calls[0][0]).toContain("v1 only supports git projects");
 		expect(await exists(syncRootPath(resolve(s.memoryDirRoot)))).toBe(false);
 		notify.mockClear();
 		await commands["memory"].handler("", s.uiCtx(uiWith(notify)));
+		expect(notify.mock.calls[0][1]).toBe("info");
+		expect(notify.mock.calls[0][0]).toContain("Sync notice:");
 		expect(notify.mock.calls[0][0]).toContain("v1 only supports git projects");
 		expect(notify.mock.calls[0][0]).toContain(`Dir: ${s.dir}`);
 	});

@@ -1043,7 +1043,10 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		await enableSync();
 		await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx());
 		await commands["memory"].handler("sync", s.uiCtx(uiWith(notify)));
-		expect(notify.mock.calls.at(-1)?.[0]).toContain("v1 only supports git projects");
+		const localText = notify.mock.calls.at(-1)?.[0] as string;
+		expect(localText).toContain("v1 only supports git projects");
+		// 环境降级不是「未启用」：别把用户引向改配置。
+		expect(localText).not.toContain("sync is not enabled");
 	});
 
 	it("shows the real model config error before generic sync-disabled text", async () => {
