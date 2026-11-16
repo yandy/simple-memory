@@ -444,8 +444,8 @@ export default function (pi: ExtensionAPI) {
 
 		// D13 / D14：索引值在整个 session 内**冻结**。resume / fork / reload 必须用 transcript 里的
 		// 录制值 —— 否则被恢复会话的 system prompt 头部会被改写，而 memory_index 是头部的最后一段，
-		// 折叠路径下其后的整段对话全部失去缓存。录制值拿不到（更老的 session、旧 SDK 没有
-		// sessionEntryToContextMessages）才回退磁盘读。
+		// 折叠路径下其后的整段对话全部失去缓存。录制值拿不到（更老的 session 形状 / 投影不可用）
+		// 才回退磁盘读。
 		// 录制值**不再 re-sanitize**：写入当年已经净化过，而 sanitizeForInjection 是幂等的 ——
 		// 保持字节恒等更利于缓存。
 		const useRecorded = reason === "resume" || reason === "fork" || reason === "reload";

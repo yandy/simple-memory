@@ -184,13 +184,6 @@ describe("readRecordedMemoryIndex", () => {
 		}
 	});
 
-	// 低于 peer 下限的老宿主没有这个导出：必须回退磁盘读，而不是抛错。
-	it("returns null when the SDK does not export sessionEntryToContextMessages", () => {
-		converterRef.current = undefined;
-		const sm = sessionManager([entry(systemMessage({ memory_index: "unreachable" }))]);
-		expect(readRecordedMemoryIndex(sm)).toBeNull();
-	});
-
 	it("prefers the injected converter over the SDK export", () => {
 		converterRef.current = () => [systemMessage({ memory_index: "from-sdk" })];
 		try {
@@ -351,8 +344,8 @@ describe("readRecordedMemoryIndex 优先用宿主的 buildSessionProjection", ()
 		expect(converter).not.toHaveBeenCalled();
 	});
 
-	// 投影路径根本不需要转换函数：旧 SDK 没有 `sessionEntryToContextMessages` 导出时，
-	// 只要宿主够新（有 buildSessionProjection）就仍能拿到录制值。
+	// 投影路径根本不需要转换函数：不传 `sessionEntryToContextMessages`（连 SDK 导出都取不到）时，
+	// 只要有 buildSessionProjection 就仍能拿到录制值。
 	it("works without a converter at all", () => {
 		converterRef.current = undefined;
 		const sm = projecting([systemMessage({ memory_index: "from-projection" })]);

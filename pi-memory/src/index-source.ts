@@ -1,4 +1,4 @@
-import * as sdk from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 
 /**
  * 索引 section 的名字（spec §9.1）。pi 要求 section 名匹配 `/^[a-z][a-z0-9_-]*$/`
@@ -80,17 +80,6 @@ export function replaySystemSections(messages: unknown[]): Map<string, string> {
 }
 
 /**
- * 动态取 SDK 包根的 `sessionEntryToContextMessages`。
- *
- * 不用具名 import：宿主早已导出它，但动态取让「宿主没有这个导出」变成可返回 `null` 的可回退情形，
- * 而不是编译不过。取不到就返回 null，调用方回退磁盘读（spec §19 的退路）。
- */
-function resolveConverter(): ((entry: unknown) => unknown[]) | null {
-	const candidate = (sdk as unknown as Record<string, unknown>).sessionEntryToContextMessages;
-	return typeof candidate === "function" ? (candidate as (entry: unknown) => unknown[]) : null;
-}
-
-/**
  * 宿主投影里的 messages（0.99.2 的 `buildSessionProjection()`）。
  *
  * 不可用（没有该方法 / 抛错 / 返回值形状不对）时返回 `null`，调用方回落到下面的自实现重放。
@@ -111,13 +100,16 @@ function projectionMessages(sm: Partial<ReplayableSessionManager>): unknown[] | 
 }
 
 /**
- * 自实现的 entry 重放（旧 SDK / 老 session 的退路）：`getEntries` → `buildContextEntries`
- * → 逐条转成 context messages。任何一步不可得都返回 `null`：转换函数缺失（SDK 太旧）、
- * sessionManager 形状不认识、`getEntries` 抛错。
+ * 自实现的 entry 重放（投影不可用时的退路）：`getEntries` → `buildContextEntries`
+ * → 逐条转成 context messages。不可得时返回 `null`：sessionManager 形状不认识、
+ * `getEntries` 抛错。
  */
 function replayEntryMessages(sm: Partial<ReplayableSessionManager>, opts?: ReplayOpts): unknown[] | null {
-	const toMessages = opts?.sessionEntryToContextMessages ?? resolveConverter();
-	if (!toMessages) return null;
+	// 宿主的 entry → context messages 转换器，**刻意放宽成 `unknown` entry**：重放的是从磁盘
+	// session 文件读出的历史 entry，形状按定义未知（可能是更老的格式），不能假装它们是宿主的
+	// `SessionEntry`；单条不识别的 entry 由下面的 per-entry try 跳过。
+	const toMessages =
+		opts?.sessionEntryToContextMessages ?? (sessionEntryToContextMessages as (entry: unknown) => unknown[]);
 	if (typeof sm.getEntries !== "function" || typeof sm.getLeafId !== "function") return null;
 
 	let entries: unknown[] = [];
@@ -163,11 +155,11 @@ function replayEntryMessages(sm: Partial<ReplayableSessionManager>, opts?: Repla
  * 否则被恢复会话的 system prompt 头部会被改写，折叠路径下其后的整段对话全部失去缓存）。
  *
  * **优先用宿主的 `buildSessionProjection()`** —— 与宿主算 `getCurrentSystemMessage` 同源；
- * 拿不到（低于 peer 下限的老宿主 / 更老的 session / 投影抛错）才回落到自实现的 entry 重放（Plan C 终审 #4）。
+ * 拿不到（sessionManager 形状不认识 / 更老的 session / 投影抛错）才回落到自实现的 entry 重放（Plan C 终审 #4）。
  *
- * 两条路径都不可得时返回 `null`，由调用方回退磁盘读：SDK 太旧（既无投影也无转换函数）、
- * sessionManager 形状不认识（含 `buildSessionProjection()` 的返回值里没有 `messages` 数组，
- * `projectionMessages` 对非数组返回 `null`）、`buildSessionProjection` / `getEntries` 抛错、重放后没有这个键、
+ * 两条路径都不可得时返回 `null`，由调用方回退磁盘读：sessionManager 形状不认识（含
+ * `buildSessionProjection()` 的返回值里没有 `messages` 数组，`projectionMessages` 对非数组返回 `null`）、
+ * `buildSessionProjection` / `getEntries` 抛错、重放后没有这个键、
  * 或该键被 `null` patch 删除。**单条 entry 的形状不认识**不会让整次重放失败：那一条被跳过
  *（见 `replayEntryMessages`），其余 entry 照常重放 —— 它不会变成 `null` 返回值。
  * **绝不把 `null` 当录制值返回**（spec §9.1 的 null 陷阱）。

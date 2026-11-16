@@ -14,7 +14,7 @@ interface ModelEntry {
  */
 export function resolveModel(input: string, registry: ModelRegistry): Model<any> | undefined {
 	if (!input) return undefined;
-	const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+	const all = registry.getAvailable() as ModelEntry[];
 	if (all.length === 0) return undefined;
 	const availableSet = new Set(all.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
 
