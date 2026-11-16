@@ -23,8 +23,9 @@ extract 与 dream 都靠**子会话**跑（dsh 里唯一能跑工具循环的机
    `<project_instructions path="…">` 抠出这些块塞进 extract prompt；dsh 的 AGENTS.md 由
    `dsh-agent-instructions` 拼成**不透明的 prompt 文本**，没有稳定标记可切。所以 `## AGENTS.md Rules`
    那一段在 dsh 侧是空的 —— 指令本身对主 agent 依然可见，只是不会单独递给 extract。
-6. **没有跨设备同步。** 同步引擎（`.sync/` 暂存 clone、manifest 基线、去抖推送、`/memory sync` 子命令）
-   只接在 `pi-memory` 里；dsh 适配层只读写本地记忆目录。需要多机共享时在 pi 侧开启同步。
+6. **同步没有退出兜底推送。** 长寿命宿主里 `agent/disposed` 不是可靠的收口点（见下文
+   [跨设备同步](#跨设备同步)），所以不同于 pi 的 `session_shutdown` flush，dsh 不会在会话销毁时
+   尝试推送。没发布出去的写入由下一次 `agent/created` 的启动轮次补上。
 
 除此之外，`dream` / `extractMemories` 两个配置子树与 pi 的 `memory.json` 逐字同名，可以照抄；
 它们的 `model` / `thinkLevel` / 预算值全部由 core 自己消费，本适配层一个都不读（除了 `/memory` 的
@@ -32,7 +33,9 @@ extract 与 dream 都靠**子会话**跑（dsh 里唯一能跑工具循环的机
 
 不冻结索引的原因是 dsh 每一步都重新装配 system prompt（pi 是整个会话冻结索引、回放录制值来护住 prompt
 cache），所以索引是一份快照：在 `agent/created`、每次记忆写入成功后、`/memory` 执行后、每个 `pre-step`
-之前异步刷新，读侧同步查表。
+之前异步刷新，读侧同步查表。跨设备同步（开启时）会在一次会话的**第一次**刷新**之前**跑完（见
+[跨设备同步](#跨设备同步)），所以启动轮次拉下来的 entry 在第一份 `memory_index` 里就看得见 ——
+这里没有 pi 那种「冻结的录制索引」问题（`resume` / `fork` / `reload`）。
 
 ## 安装
 
@@ -114,6 +117,93 @@ dsh plugin --profile web remove @yandy0725/dsh-memory
 `/memory` 的第一行会打印解析出的 `Dir:`，这正是用来发现这种不一致的入口：两边的 `Dir:` 对不上，
 就是配置没对齐。
 
+## 跨设备同步
+
+dsh-memory 可以把一个项目的记忆 entry 同步到**一个 git 远端**，同一仓库在另一台机器上打开时会落到
+同一份记忆。**默认关闭** —— 同步会把你的记忆写到远端，这份代价必须显式开启，与 `extractMemories`
+同理。引擎本身（三方差集、冲突收敛、manifest 基线、git 传输）与 pi 用的是同一份
+`@yandy0725/memory-core` 代码；本节只写 **dsh 侧不一样**的部分 —— 配置来源、生命周期挂点、以及没有
+退出兜底。共享的 core 语义（同步范围、磁盘布局、冲突后缀规则、`status` 字段）见
+[pi-memory 参考](./pi-memory.zh.md#跨设备同步)，这里完全一致。
+
+### 初始化 —— 没有 `/memory sync init`
+
+1. 远端仓库自己准备好（**空仓库也行**），并确保 dsh 运行环境里的 `git` 能非交互地 `clone` / `push`
+   它 —— SSH key、credential helper、URL 里带 token，用你现成的方式都行。dsh-memory 自己不存凭据，
+   也从不弹提示；它只是从 `PATH` 上调 `git`。**私有**远端是预期的默认用法。
+2. 在行 config 里指向它：
+
+```yaml
+- id: memory
+  name: '@yandy0725/dsh-memory'
+  config:
+    sync: { enabled: true, remote: "git@github.com:you/simple-memory.git" }
+```
+
+3. 开一次会话。第一个带着这份配置的根 agent `agent/created` 会**自动初始化**：clone 到一个唯一的
+   staging 目录，原子发布为 `<memoryDir>/.sync/repo`，并写下这个项目的第一份基线。初始化与换 origin
+   由有界根锁串行；被 abort 的 init 只清理自己的 staging，绝不动另一个进程已经发布的 clone。刻意
+   **没有 `/memory sync init` 命令**，理由与 pi 相同。
+
+「origin 是真相来源」衍生出的规则与 pi 完全一致（见上面的共享参考）：初始化之后暂存 clone 的
+`origin` 优先于 `sync.remote`；`sync.remote` 漂移是一条非致命提醒，不是错误；`enabled` /
+`pullOnStart` / `pushOnWrite` 按**类型**校验而不是按真值；初始化失败降级为只用本地记忆，配一条
+可读提醒。
+
+### 生命周期（dsh 特有）
+
+```
+agent/created（只对根 agent；子 agent 被门禁挡掉，与 memory 工具同一套判据）
+  1. registry.prepare —— 解析记忆目录 / store（不变）
+  2. sync：createDshSyncRuntime + prepare（首次使用、基线缺失、或 origin/branch transport 不匹配时
+     初始化）—— 无论 pullOnStart 是否开启都会跑这一步
+  3. pullOnStart === true → 只用剩余共享启动预算跑一轮 push
+  4. indexCache.refresh —— 这个会话的**第一份**快照，在 2–3 步都完成之后才取
+
+每一次成功的记忆写入（主工具、extract worker、dream worker）
+  → core 去抖：标脏，静默期 pushDebounceMs 后排一次推送（静默期从第一次写入算起）
+
+agent/disposed
+  → dispose() 这个 runtime：abort 在途的 init，dispose engine（连带 abort 当前轮次的 signal），
+    排空已登记的手动/自动轮次。**不会**尝试推送。
+```
+
+- **为什么没有退出兜底**：长寿命宿主进程里，一个只是闲置的会话，`agent/disposed` 触发得太晚（甚至
+  实际上永不触发）—— 这一点在 extract 触发点上已经实测过，也是 `extract.ts` 改用
+  `agent/turn-stopping` 的同一个理由（见[子会话为什么是「常驻 worker」](#子会话为什么是常驻-worker)）。
+  在那里推送要么根本不会跑，要么与进程销毁抢时序，所以 dsh 干脆不做。**一轮 push 仍然是完整的收敛**
+  （fetch → 三方应用 → publish），所以*下一次* `agent/created` 的启动轮次会接住上一个会话没发布出去
+  的内容 —— 这就是补推路径，替代 pi 的 `session_shutdown` flush。如果 `pushOnWrite` 与 `pullOnStart`
+  都关着，就用 `/memory sync push` 手动补。
+- **`pullOnStart: false` 仍然会 prepare** —— 只是从不自动 fetch / pull / push。与 pi 语义相同。
+- **本地已有 entry**：新基线初始化时，prepare 会在**任何启动 push 之前**预告可能产生确定性冲突副本，
+  每份基线只预告一次，走的是预告通道（`simple-memory: memory sync notice: …`，info 级），不是错误。
+- **非 git 项目**：`sync.enabled` 为真但项目不是 git 仓库时，v1 完全不初始化同步；同样是一条预告，
+  `/memory sync` 会复述这条原因，而不是笼统地说「同步没开」。
+- **按会话，不是按进程**：不同于 pi 的单个 `syncRuntime` 变量，dsh 用一张 `sessionId → runtime` 的表，
+  因为一个长寿命宿主进程要服务很多会话（与 store registry、index cache 按 session 分键是同一个理由）。
+  同一个 `sessionId` 重建 agent（宿主 `clear` / `compact`）时会先 dispose 上一代 runtime，所以陈旧的
+  自动轮次绝不会跨代写远端。`apply` 自己的 disposer 也会同样排空剩下每个会话的 runtime。
+
+### 命令
+
+```
+/memory sync                    — status（等价于 `/memory sync status`）；严格 dry-run
+/memory sync pull               — 把远端变更收敛进磁盘 + 刷新索引快照；不发布
+/memory sync push               — 先收敛，再发布
+/memory sync remote <url>       — 把暂存 clone 的 origin 指向 <url>，并重置这个项目的基线
+/memory sync unlock [--force]   — 清除遗留的 .sync/sync.lock
+```
+
+`status`、`pull`、`push`、`remote <url>` 的行为与 pi 完全一致（见共享参考）。两处是 dsh 特有的：
+
+- **`pull` / `push` 会顺带刷新索引快照**（经 `indexCache.refresh`），因为 dsh 没有需要保护的冻结索引 ——
+  下一个 `pre-step` 本来也会刷新它，但就地刷一次意味着手动轮次之后立刻敲 `/memory`，看到的就是收敛后
+  的状态，不用等下一步。
+- **`unlock` 用 `--force`，不用交互式确认。** dsh 的命令处理器没有交互通道（与 `/dream` 没有确认框
+  是同一个理由），所以显式的 `--force` 旗标 —— 本适配层 `/memory unlock` 已有的既定模式 —— 就是确认
+  机制。不带它时，命令只报告当前持有者，拒绝删除任何东西。
+
 ## 模型
 
 模型值沿用 core 的单一字符串，dsh 侧编码为 `"<provider>/<model>"`，按**第一个**斜杠拆开 —— 所以
@@ -187,7 +277,7 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 
 ## 验证状态
 
-单元测试全绿（dsh-memory `282 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上端到端跑通（隔离
+单元测试全绿（dsh-memory `308 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上端到端跑通（隔离
 `DSH_HOME` + `file:` 装包）—— 下面就是这次的验收记录。
 
 真机确认（web profile，长寿命宿主）：
@@ -202,6 +292,14 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
   `turn/end: completed`；结果是**真的合并了**两条冲突记忆（旧文件已删除）、改写了另一条的
   description、并把索引重建为 3 行。同时在 `<memoryDir>/.backups/` 留下了整目录快照（回滚点）。
 - `/memory`、`/dream` 两个命令注册成功（空 `input.hint` 会让宿主拒绝注册并回滚整个 bundle）。
+
+跨设备同步**没有**真机验收记录：它由单元测试覆盖（`dsh-memory/tests/sync.test.ts`、
+`sync-commands.test.ts`、`sync-wiring.test.ts`），这些测试用**本地 bare 仓库**（不联网、不涉及凭据）
+驱动真实的 `memory-core` 引擎与 git backend，走的是与本套件其余部分相同的 `apply()` 入口和假 cordis
+上下文。这覆盖了初始化/基线语义、「origin 是真相来源」规则、「启动同步先于第一次索引刷新」的时序、
+主工具与两个 worker 工具的写触发、换远端、以及 dispose/恢复 —— 但没有覆盖一个真实的 `dsh` 进程对着
+真实托管 git 远端（GitHub/GitLab，SSH 或 HTTPS）说话的场景。在有人对着真实远端跑一遍之前，请把真机
+上的同步当作**未验证**。
 
 ### 子会话为什么是「常驻 worker」
 

@@ -49,6 +49,42 @@ value here.
 - Per-turn auto-surfacing
 - Per-turn extraction (`extractMemories.enabled`, off by default)
 - `/dream` tidy-up
+- **Cross-device sync** (off by default) — push this project's memory to a git remote and share it with
+  another machine working on the same repository (see below)
+
+## Cross-device sync (optional, off by default)
+
+Push **this project's** memory entries to a git remote so another machine working on the same
+repository shares them:
+
+```yaml
+- id: memory
+  name: '@yandy0725/dsh-memory'
+  config:
+    sync: { enabled: true, remote: "git@github.com:you/project-memory.git" }
+```
+
+- **There is no init command**: the next session start with this config clones into
+  `<memoryDir>/.sync/repo` and records a baseline. Once initialized, `sync.remote` in the row config is
+  only used for the **first** clone — afterwards the staged clone's `origin` is the source of truth, and
+  an empty or drifted `sync.remote` value only produces a non-fatal notice (`/memory sync remote <url>`
+  changes the origin; it never rewrites your row config).
+- Prepare the remote yourself (an empty repository is fine) and make sure `git` can clone/push it
+  non-interactively — dsh-memory stores no credentials.
+- Only entry `*.md` files sync: `MEMORY.md`, `.lock`, `.backups/` and `sessions/` stay local.
+- If both sides rewrite the same memory, **both are kept**: the other becomes a deterministic conflict
+  copy that `/dream` merges later.
+- On the **first** sync of a project that already has local entries, expect one notice
+  (`simple-memory: memory sync notice: …`) that same-named entries may land as conflict copies. It is
+  not a failure and it does not repeat for that baseline.
+- Manual commands: `/memory sync` (= `status`, a strict dry-run) / `pull` / `push` / `remote <url>` /
+  `unlock [--force]` (clears the root `.sync/sync.lock` left behind by a crash).
+- **No exit-flush**: `agent/disposed` is not reliable in a long-lived host, so dsh does not attempt a
+  push on session teardown. Unpublished writes are picked up by the next `agent/created` startup round
+  (one `push()` that both converges remote changes and retries anything left over) or by the next
+  debounced write-trigger push (`sync.pushOnWrite`, default on).
+
+Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.md#cross-device-sync).
 
 ## Real differences from pi
 
@@ -59,8 +95,10 @@ value here.
 - There is no "time to tidy up" nudge; only an explicit `/dream`.
 - The extract prompt has no AGENTS.md block (dsh assembles it as opaque text with no stable marker).
 - The index is not frozen: dsh reassembles the system prompt every step, so the index is an
-  asynchronously refreshed snapshot.
-- No cross-device sync: the sync engine is wired up in pi only; dsh uses local memory.
+  asynchronously refreshed snapshot. Sync runs to completion **before** the first snapshot refresh of a
+  session, so a startup pull is already visible in the very first `memory_index` render.
+- Sync configuration lives in the cordis row config (there is no `memory.json` on this side), and there
+  is no exit-flush push (see above).
 
 ## Requirements
 
@@ -69,7 +107,7 @@ value here.
 
 ## Docs
 
-- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.md): full configuration, models, verification status, implementation limits
+- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.md): full configuration, cross-device sync, models, verification status, implementation limits
 - [Architecture and hard constraints](https://github.com/yandy/simple-memory/blob/main/docs/guides/architecture.md)
 - [Dependency management](https://github.com/yandy/simple-memory/blob/main/docs/guides/dependencies.md)
 
