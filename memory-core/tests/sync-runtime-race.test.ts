@@ -16,6 +16,7 @@ import {
 	remoteProjectKey,
 	syncRootPath,
 	syncTransport,
+	withFsRetry,
 	writeManifest,
 	type MemoryConfig,
 	type ProjectIdentity,
@@ -82,7 +83,9 @@ describe.skipIf(!GIT)("sync runtime × 真 git 的并发边界", { timeout: TEST
 	afterEach(async () => {
 		for (const runtime of runtimes.splice(0)) await runtime.dispose();
 		vi.unstubAllEnvs();
-		await rm(dir, { recursive: true, force: true });
+		// windows：即使 dispose() 已 await 过 drain，被 abort 的 git 子进程也可能还没释放
+		// 句柄，直接 rm 会撞 EBUSY（本仓在 CI 上实测过）。withFsRetry 就是为这类瞬时占用写的。
+		await withFsRetry(() => rm(dir, { recursive: true, force: true }));
 	});
 
 	async function git(args: string[], cwd: string): Promise<string> {
@@ -183,7 +186,7 @@ describe.skipIf(!GIT)("sync runtime × 真 git 的并发边界", { timeout: TEST
 
 		const changing = session.runtime.changeRemote(remoteB, GIT_TIMEOUT_MS);
 		// 在途 push 还在 publish 里：换远端不得抢先完成（它的第一步是 drain 这本账）
-		expect(await Promise.race([changing.then(() => "done" as const), sleep(100).then(() => "pending" as const)])).toBe(
+		expect(await Promise.race([changing.then(() => "done" as const), sleep(1000).then(() => "pending" as const)])).toBe(
 			"pending",
 		);
 
@@ -239,7 +242,7 @@ describe.skipIf(!GIT)("sync runtime × 真 git 的并发边界", { timeout: TEST
 		await publishEntered;
 
 		const disposing = session.runtime.dispose();
-		expect(await Promise.race([disposing.then(() => "done" as const), sleep(100).then(() => "pending" as const)])).toBe(
+		expect(await Promise.race([disposing.then(() => "done" as const), sleep(1000).then(() => "pending" as const)])).toBe(
 			"pending",
 		);
 
