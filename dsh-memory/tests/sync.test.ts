@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
+	createGitSyncBackend,
+	createSyncEngine,
 	DEFAULT_CONFIG,
 	devicePath,
 	gitAvailable,
@@ -15,7 +17,13 @@ import {
 	syncRootPath,
 	withFsRetry,
 } from "@yandy0725/memory-core";
-import type { MemoryConfig, ProjectIdentity, SyncConfig } from "@yandy0725/memory-core";
+import type {
+	MemoryConfig,
+	ProjectIdentity,
+	SyncBackend,
+	SyncConfig,
+	SyncEngine,
+} from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDshSyncRuntime } from "../src/sync.js";
 import type { DshSyncRuntime } from "../src/sync.js";
@@ -39,6 +47,9 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 	let secondRemote: string;
 	let thirdRemote: string;
 	let runtimes: DshSyncRuntime[];
+	/** 工厂捕获缝的账本：里面的实例都是真实现，core 的 runtime 刻意不把 backend 放上公开面。 */
+	let backends: SyncBackend[];
+	let engines: SyncEngine[];
 
 	beforeEach(async () => {
 		dir = await mkdtemp(join(tmpdir(), "am-dsh-sync-"));
@@ -53,6 +64,8 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 			await execFileP("git", ["init", "--bare", "--quiet", "--initial-branch=main", path]);
 		}
 		runtimes = [];
+		backends = [];
+		engines = [];
 	});
 
 	afterEach(async () => {
@@ -104,9 +117,26 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 			projectDir,
 			identity,
 			now: () => new Date("2026-11-16T01:02:03.000Z"),
+			// 只记录、不替换：装配出来的仍是 core 的公开真实现，spy 与 origin 断言都命中它。
+			createBackend: (context) => {
+				const backend = createGitSyncBackend(context);
+				backends.push(backend);
+				return backend;
+			},
+			createEngine: (engineOptions) => {
+				const engine = createSyncEngine(engineOptions);
+				engines.push(engine);
+				return engine;
+			},
 		});
 		if (assembled.runtime) runtimes.push(assembled.runtime);
 		return assembled;
+	}
+
+	function currentBackend(): SyncBackend {
+		const backend = backends.at(-1);
+		if (!backend) throw new Error("sync backend was not assembled");
+		return backend;
 	}
 
 	function paths(cfg: MemoryConfig) {
@@ -185,7 +215,8 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		expect(await exists(state.syncRoot)).toBe(false);
 		expect(await exists(state.manifest)).toBe(false);
 
-		const init = vi.spyOn(runtime.backend, "init");
+		const backend = currentBackend();
+		const init = vi.spyOn(backend, "init");
 		expect((await runtime.startup()).ok).toBe(true);
 		expect(init).toHaveBeenCalledTimes(1);
 		expect(runtime.engine).not.toBeNull();
@@ -304,7 +335,7 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 			warning:
 				"Memory sync initialized with 1 local entry; same-named entries with different content may be kept as deterministic conflict copies.",
 		});
-		expect(await runtime.backend.getRemote()).toBe(secondRemote);
+		expect(await currentBackend().getRemote()).toBe(secondRemote);
 		expect(await readManifest(paths(cfg).manifest)).toMatchObject({
 			version: 2,
 			transport: { remoteHash: remoteHash(secondRemote), branch: "main" },
@@ -317,15 +348,57 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		await expect(remoteFile(remote, "After.md")).rejects.toThrow();
 	});
 
+	it("queues a status behind an in-flight manual round and gates a new activity on changeRemote", async () => {
+		const cfg = config();
+		const { runtime } = await makeRuntime(cfg, storeFor(cfg));
+		if (!runtime) throw new Error("runtime was not created");
+		const backend = currentBackend();
+		const readyCalls: string[] = [];
+		const initEntered = deferred();
+		const releaseInit = deferred();
+		const originalInit = backend.init.bind(backend);
+		vi.spyOn(backend, "init").mockImplementation(async (options) => {
+			initEntered.resolve();
+			await releaseInit.promise;
+			return originalInit(options);
+		});
+		const originalReady = backend.ready.bind(backend);
+		vi.spyOn(backend, "ready").mockImplementation(async () => {
+			readyCalls.push("ready");
+			return originalReady();
+		});
+
+		const round = runtime.run("pull", 10_000);
+		await initEntered.promise;
+		// 这一轮已经真的在跑（prepare 用掉了一次 ready 探测，engine 还没交付）。
+		const status = runtime.status(10_000);
+		await new Promise((resolveTimer) => setTimeout(resolveTimer, 100));
+		// serial：排在后面的 status 不得在上一轮结束前开始；抢跑的话它会自己再探一次 backend.ready。
+		expect(readyCalls).toEqual(["ready"]);
+
+		const change = runtime.changeRemote(secondRemote, 10_000);
+		// 换远端在公开调用时就同步关闸：之后的新活动立即 busy，而不是排到队尾共享前一活动的结果。
+		const gated = await runtime.status(10_000);
+		expect(gated.ok).toBe(false);
+		if (!gated.ok) expect(gated.reason).toContain("already in progress");
+
+		releaseInit.resolve();
+		expect((await round).ok).toBe(true);
+		expect((await status).ok).toBe(true);
+		expect((await change).ok).toBe(true);
+		expect(await backend.getRemote()).toBe(secondRemote);
+	});
+
 	it("rejects a second remote URL while a remote change is active", async () => {
 		const cfg = config();
 		const { runtime } = await makeRuntime(cfg, storeFor(cfg));
 		if (!runtime) throw new Error("runtime was not created");
 		expect((await runtime.startup()).ok).toBe(true);
-		const original = runtime.backend.setRemote.bind(runtime.backend);
+		const backend = currentBackend();
+		const original = backend.setRemote.bind(backend);
 		const entered = deferred();
 		const release = deferred();
-		vi.spyOn(runtime.backend, "setRemote").mockImplementation(async (url, options) => {
+		vi.spyOn(backend, "setRemote").mockImplementation(async (url, options) => {
 			entered.resolve();
 			await release.promise;
 			await original(url, options);
@@ -338,7 +411,7 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		if (!second.ok) expect(second.reason).toContain("already in progress");
 		release.resolve();
 		expect((await first).ok).toBe(true);
-		expect(await runtime.backend.getRemote()).toBe(secondRemote);
+		expect(await backend.getRemote()).toBe(secondRemote);
 	});
 
 	it("drains the old automatic round and carries a gated write into the replacement engine", async () => {
@@ -351,8 +424,9 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		if (!oldEngine) throw new Error("engine was not prepared");
 		const oldRound = deferred();
 		Object.defineProperty(oldEngine, "inFlight", { configurable: true, get: () => oldRound.promise });
-		const original = runtime.backend.setRemote.bind(runtime.backend);
-		const setRemote = vi.spyOn(runtime.backend, "setRemote");
+		const backend = currentBackend();
+		const original = backend.setRemote.bind(backend);
+		const setRemote = vi.spyOn(backend, "setRemote");
 
 		await store.addEntry({ name: "Gap write", description: "during remote change", body: "gap body" });
 		const changed = runtime.changeRemote(secondRemote, 10_000);
@@ -361,6 +435,9 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		expect(setRemote).not.toHaveBeenCalled();
 		oldRound.resolve();
 		expect((await changed).ok).toBe(true);
+		// 收尾必须经同一注入工厂恢复一台新 engine：旧 dirty 与关闸写入才有下一次发布机会。
+		expect(engines).toHaveLength(2);
+		expect(engines.at(-1)).toBe(runtime.engine);
 
 		await vi.waitFor(async () => {
 			await expect(remoteFile(secondRemote, "Gap-write.md")).resolves.toContain("gap body");
@@ -420,7 +497,8 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 		const { runtime } = await makeRuntime(cfg, storeFor(cfg));
 		if (!runtime) throw new Error("runtime was not created");
 		expect((await runtime.startup()).ok).toBe(true);
-		vi.spyOn(runtime.backend, "init").mockRejectedValueOnce(new Error("network unreachable"));
+		const backend = currentBackend();
+		vi.spyOn(backend, "init").mockRejectedValueOnce(new Error("network unreachable"));
 
 		const changed = await runtime.changeRemote(secondRemote, 10_000);
 		expect(changed.ok).toBe(false);
@@ -429,6 +507,6 @@ describe.skipIf(!GIT)("dsh sync runtime", { timeout: 60_000 }, () => {
 			expect(changed.reason).toContain(secondRemote);
 			expect(changed.reason).toContain("network unreachable");
 		}
-		expect(await runtime.backend.getRemote()).toBe(secondRemote);
+		expect(await backend.getRemote()).toBe(secondRemote);
 	});
 });
