@@ -24,10 +24,13 @@ import {
 	remotePrefix,
 	remotePrefixFromKey,
 	remoteProjectKey,
+	renderSyncRound,
+	renderSyncStatus,
 	resolveConflict,
 	scanLocalEntries,
 	sha256Hex,
 	sameSyncRemote,
+	syncErrorMessage,
 	syncLockPath,
 	syncRootPath,
 	writeManifest,
@@ -104,6 +107,10 @@ describe("公开出口上的同步符号", () => {
 			sha256Hex,
 			writeManifest,
 			gitAvailable,
+			// 共同报告格式化与错误脱敏也是装配入口的一部分：宿主不该各写一份（两份正则必然分叉）
+			syncErrorMessage,
+			renderSyncRound,
+			renderSyncStatus,
 		]) {
 			expect(typeof fn).toBe("function");
 		}

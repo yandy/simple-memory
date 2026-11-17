@@ -203,6 +203,10 @@ export type { SyncConflict, SyncDiff } from "./sync/diff.js";
 export { createSyncEngine } from "./sync/engine.js";
 export type { SyncEngine, SyncEngineOptions, SyncRoundResult, SyncStatusReport } from "./sync/engine.js";
 
+// 同步错误文本的最后一站：归一 + 凭据脱敏。宿主各自复制一份正则正是 token 进日志的那条路，
+// 所以这是**唯一**实现（`backend-git` 拼的错误文本也走它）。
+export { syncErrorMessage } from "./sync/errors.js";
+
 export { sha256Hex } from "./sync/hash.js";
 
 export {
@@ -240,3 +244,8 @@ export { createSyncScheduler } from "./sync/scheduler.js";
 export type { SyncScheduler, SyncSchedulerOptions } from "./sync/scheduler.js";
 
 export type { SyncFileInfo, SyncFileSet } from "./sync/types.js";
+
+// 报告的**共同格式**：字段集合、排序去重、失败轮展开、revision 空/缺区分与出口脱敏。
+// 漂移提示与尾部行由宿主注入（`SyncViewOptions`）：core 不含 slash 命令，也不猜配置入口叫什么。
+export { renderSyncRound, renderSyncStatus } from "./sync/view.js";
+export type { SyncViewOptions } from "./sync/view.js";

@@ -13,6 +13,8 @@ import {
 	type SyncRunOptions,
 	type SyncScope,
 } from "./backend.js";
+// 凭据脱敏只有一份实现：本模块拼的每一条错误文本（含 cause 链）都用它，口径见 `errors.ts`。
+import { redactCredentials } from "./errors.js";
 import { sha256Hex } from "./hash.js";
 import { sameSyncRemote, syncLockPath } from "./paths.js";
 
@@ -119,25 +121,6 @@ function budgeted<T extends SyncRunOptions>(o: T): T {
 		enumerable: true,
 		get: (): number => Math.max(1, deadline - Date.now()),
 	});
-}
-
-/**
- * 抹掉 URL 里的口令。
- *
- * `https://user:<token>@host/...` 是 git 官方支持的凭据写法，也是 CI 上免交互推送的常规做法，
- * 而 `args` 原样进错误信息就等于把 token 复制进同步错误 —— 错误会被宿主记进日志、被人贴进 issue。
- * git 自己往终端与 stderr 里写的那份我们管不了，**我们拼出来的这一条**必须干净。
- * HTTP(S)（含 git+http 别名）还允许 `https://<token>@host/...`：整个 userinfo 都是秘密，
- * 必须变成 `***`；带冒号的既有 `user:pass` 仍保留用户名、只隐去口令。其它 scheme 继续走
- * 原来的 user:pass 规则，本地路径里的 `:` 与 `@` 不受影响。
- */
-function redactCredentials(text: string): string {
-	return text
-		.replace(/\b((?:git\+)?https?:\/\/)([^/\s@]+)@/gi, (_whole, scheme: string, userinfo: string) => {
-			const colon = userinfo.indexOf(":");
-			return colon === -1 ? `${scheme}***@` : `${scheme}${userinfo.slice(0, colon)}:***@`;
-		})
-		.replace(/(\/\/[^/\s:@]+:)[^@\s]+@/g, "$1***@");
 }
 
 /** 把子进程失败拼成一条能读的错误：带上命令与 git 自己的 stderr（远端路径、拒绝原因都在里面）。 */
