@@ -279,6 +279,8 @@ export interface FakeEngine extends SyncEngine {
 	noteWriteFailure: Error | null;
 	/** `dispose()` 一进来就 resolve。 */
 	disposeStarted: Deferred<void> | null;
+	/** 非 null 时 `dispose()` 记录调用后同步抛出它：端口违约也必须被 runtime 兜住。 */
+	disposeFailure: Error | null;
 	rounds: { pull: SyncRoundResult; push: SyncRoundResult };
 	flushRound: SyncRoundResult | null;
 	statusReport: SyncStatusReport;
@@ -302,6 +304,7 @@ export function createFakeEngine(events: string[]): FakeEngine {
 		flushFailure: null,
 		noteWriteFailure: null,
 		disposeStarted: null,
+		disposeFailure: null,
 		rounds: { pull: PULL_ROUND, push: PUSH_ROUND },
 		flushRound: FLUSH_ROUND,
 		statusReport: STATUS_REPORT,
@@ -344,6 +347,7 @@ export function createFakeEngine(events: string[]): FakeEngine {
 			events.push("engine:dispose");
 			engine.disposeCalls += 1;
 			engine.disposeStarted?.resolve(undefined);
+			if (engine.disposeFailure !== null) throw engine.disposeFailure;
 		},
 	};
 	return engine;

@@ -18,7 +18,9 @@
 与合并语义 `mergeConfig`）。
 
 执行点是 `memory-core/tests/neutrality.test.ts`，它同时禁止 core 里出现只有本仓才读得懂的坐标
-（spec 章节号、决策编号、宿主斜杠命令、宿主事件名）。放宽这条等于让第二个 harness 装不上这个包。
+（spec 章节号、决策编号、宿主斜杠命令、宿主事件名）。它只按 import 说明符与这份**列出的**坐标扫描，
+不负责发现任意宿主配置文件名或命令文案——这类词汇靠审查与新文案的注入参数约束，不能把 neutrality
+测试当成全量黑名单。放宽这条等于让第二个 harness 装不上这个包。
 
 ## 公开 API 只从 `src/index.ts` 出
 

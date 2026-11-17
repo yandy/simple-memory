@@ -12,9 +12,12 @@
 - **core 不在 registry 上就发 `pi-memory`，得到的是一个装不上的包**：用户会拿到
   `No matching version found for @yandy0725/memory-core@^2.2.0`。
 - 反过来安全：只发 core、不发 `pi-memory`，不影响任何现有用户。
-- **在 core 2.2.0 发布、且 workspace 的 `memory-core` 版本升到 2.2.0 之前，仓内 `npm ci` 必然失败**：
-  `npm error notarget No matching version found for @yandy0725/memory-core@^2.2.0`。这是「先发 core」
-  的顺序在闸门上说话，**不是**靠放宽范围或改锁能绕过的问题。
+- **只要 workspace 的 `memory-core` 版本没有满足适配层声明的 `^2.2.0`，仓内 `npm ci` 就会失败**：
+  `npm error notarget No matching version found for @yandy0725/memory-core@^2.2.0`。本地/PR 阶段的闸门
+  看的是 workspace 版本与范围，与 core 是否已发布无关；把 workspace 版本升到 2.2.0 后，`npm ci` 走的
+  是 workspace 链接。
+- **registry 安装是另一道门**：用户与 `registry-smoke` 只会从 registry 解析，所以还必须先把 core 2.2.0
+  真正发布；否则同一条 `notarget` 会在干净目录里重现。不能靠放宽范围或改锁绕过任何一道。
 
 ## 步骤
 
@@ -27,7 +30,7 @@ git add memory-core/package.json package-lock.json
 git commit -m "memory-core v2.2.0"
 COMMIT=$(git rev-parse HEAD)
 
-# 2. 此刻 workspace 版本才满足 ^2.2.0，npm ci 与全量校验才有意义
+# 2. 此刻 workspace 版本已满足 ^2.2.0；npm ci 验证的是本地 workspace 链接，与 registry 是否已有 2.2.0 无关
 npm ci && npm run typecheck && npm run lint && npm test
 git push origin main
 

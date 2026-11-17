@@ -441,7 +441,9 @@ describe("changeRemote 诊断与恢复", () => {
 
 		expect(changed).toEqual({
 			ok: false,
-			reason: "prepare failed for https://***@example.invalid/new.git",
+			reason:
+				"prepare failed for https://***@example.invalid/new.git\n" +
+				"remote change context: stage=prepare, originChanged=true",
 		});
 		expect(JSON.stringify(changed)).not.toContain("prepare-token");
 		expect(JSON.stringify(changed)).not.toContain("formatter-token");
@@ -468,7 +470,9 @@ describe("changeRemote 诊断与恢复", () => {
 
 		expect(changed).toEqual({
 			ok: false,
-			reason: "warning callback failed for https://***@example.invalid/new.git",
+			reason:
+				"warning callback failed for https://***@example.invalid/new.git\n" +
+				"remote change context: stage=operation, originChanged=true",
 		});
 		expect(JSON.stringify(changed)).not.toContain("operation-token");
 		expect(JSON.stringify(changed)).not.toContain("formatter-token");
@@ -614,6 +618,36 @@ describe("flush 与 dispose 边界", () => {
 		expect(rejection).toBeInstanceOf(Error);
 		expect((rejection as Error).message).toBe("flush failed for https://***@example.invalid/org/proj.git");
 		expect(String(rejection)).not.toContain("s3cr3t-token");
+	});
+
+	it("engine.dispose 同步抛错也不阻断收摊、drain 或幂等", async () => {
+		const { h, runtime } = await harnessFor();
+		const oldEngine = await prepareOldEngine(h, runtime);
+		oldEngine.disposeFailure = new Error(
+			"dispose failed for https://dispose-token@example.invalid/diagnostic.git",
+		);
+		const statusGate = deferred();
+		const statusStarted = deferred();
+		oldEngine.statusBarrier = statusGate;
+		oldEngine.statusStarted = statusStarted;
+
+		const activeStatus = runtime.status(1000);
+		await statusStarted.promise;
+		const draining = runtime.dispose();
+		let settled = false;
+		void draining.then(() => {
+			settled = true;
+		});
+		await sleep(0);
+
+		expect(runtime.dispose()).toBe(draining);
+		expect(settled).toBe(false);
+		expect(runtime.engine).toBeNull();
+		expect(oldEngine.disposeCalls).toBe(1);
+
+		statusGate.resolve(undefined);
+		await expect(draining).resolves.toBeUndefined();
+		expect(await activeStatus).toEqual({ ok: false, reason: DISPOSED_REASON });
 	});
 
 	it.each(["concurrent", "serial"] as const)(
