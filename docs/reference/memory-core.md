@@ -143,6 +143,47 @@ custom tools, then "no builtin tools, only the `memory` tool" must be expressed 
 pi's is `noTools: "builtin"`; passing `tools: []` there silently strips the `memory` tool, so dream
 can call nothing yet still "succeeds".
 
+### Sync orchestration
+
+Sync has two layers, split the same way as the rest of the package:
+
+- `createSyncEngine` converges **one round**: remote snapshot + local scan + last baseline → three-way
+  diff, conflict resolution, snapshot, disk, index rebuild, publish.
+- `createSyncRuntime` turns a round into a **session-scoped runtime**: config gate, lazy engine,
+  `prepare`, `startup` / `run` / `status` / `flush`, `changeRemote`, the write trigger and `dispose`.
+
+The runtime assembles nothing itself: the adapter injects the backend, the engine and the first-baseline
+writer (`writeManifest`) from this package's public exports, plus its own wording (`originDrift`,
+`uninitializedRemoteChange`, optionally `formatRemoteChangeFailure`). core owns their lifecycle and call
+order, but it neither picks a transport implementation nor reads a config file.
+
+`scheduling` is a real session-behaviour choice, not a refactor knob:
+
+| Mode | Used by | Behaviour |
+|---|---|---|
+| `concurrent` | pi | `startup` / `run` / `status` / `flush` start before the public call returns and are registered as activities; concurrent `prepare` calls share one flight. `changeRemote` closes its gate at call time and lets already-admitted work finish; operations called after the gate reject busy rather than wait |
+| `serial` | dsh | `startup` / `run` / `status` / `flush` / `changeRemote` queue on one FIFO. Work admitted or queued before the `changeRemote` gate may finish; operations called after the gate reject busy immediately rather than queue and wait |
+
+Both modes share one `changeRemote` persistent ordering (close the gate → drain → dispose the old engine
+→ wait for its `inFlight` to settle → delete this project's manifest → `setRemote` → prepare a new empty
+baseline the same way → exactly one replacement `noteWrite()`), and one `dispose()` contract: the
+synchronous part closes the gate, aborts and disposes, and the returned promise only drains — it never
+flushes. An atomic manifest write already started before `dispose()` may finish inside that drain and is
+awaited, leaving a consistent empty v2 baseline without delivering an engine or firing a replacement
+trigger. No new manifest write starts after disposal, and no write or I/O remains or starts after the drain
+resolves.
+
+The common report format lives here too: `renderSyncRound` / `renderSyncStatus` own the field set,
+ordering, dedupe, failed-round expansion and the empty/missing revision distinction; `syncErrorMessage`
+is the single normalisation + redaction exit every sync error text passes through, and the git backend
+renders its own messages through the same `redactCredentials` implementation. Display policy stays with
+the adapter: drift wording and trailing lines are injected, notification prefixes and notice/error levels
+plus error ledgers stay host-side, and a host may re-map config vocabulary on its own output path.
+
+Still host-owned: which host event calls `startup` / `flush` / `dispose` (a long-lived host may have no
+exit flush at all), command parsing and confirmation, notifications and error ledgers, the index
+freeze/refresh policy, and per-session state.
+
 ### What this package deliberately does not own
 
 | Concern | Why it stays in the adapter |
@@ -181,6 +222,7 @@ can call nothing yet still "succeeds".
 | The `memory` tool | `memoryToolSchema`, `MEMORY_TOOL_*`, `createMemoryActionHandler` | typebox + `ToolDefinition` + pi-tui rendering + `ctx.ui.notify` |
 | dream / extract rounds | `runTask(TASKS.dream, …)`, `runTask(TASKS.extractMemories, …)`, prompts | `createAgentSession` via `createPiHeadlessAgent` |
 | Past-session search | `HostTranscriptPort.searchSessions` | `SessionManager` |
+| Cross-device sync | `createSyncRuntime`, `createSyncEngine`, `createGitSyncBackend`, `renderSyncRound`/`renderSyncStatus` | `createPiSyncRuntime` (`scheduling: "concurrent"`) + `memory.json` config, host events, commands and notifications |
 
 ## Windows
 

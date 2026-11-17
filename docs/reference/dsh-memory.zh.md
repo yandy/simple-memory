@@ -121,10 +121,10 @@ dsh plugin --profile web remove @yandy0725/dsh-memory
 
 dsh-memory 可以把一个项目的记忆 entry 同步到**一个 git 远端**，同一仓库在另一台机器上打开时会落到
 同一份记忆。**默认关闭** —— 同步会把你的记忆写到远端，这份代价必须显式开启，与 `extractMemories`
-同理。引擎本身（三方差集、冲突收敛、manifest 基线、git 传输）与 pi 用的是同一份
-`@yandy0725/memory-core` 代码；本节只写 **dsh 侧不一样**的部分 —— 配置来源、生命周期挂点、以及没有
-退出兜底。共享的 core 语义（同步范围、磁盘布局、冲突后缀规则、`status` 字段）见
-[pi-memory 参考](./pi-memory.zh.md#跨设备同步)，这里完全一致。
+同理。引擎本身（三方差集、冲突收敛、manifest 基线、git 传输）与会话编排（门禁、`prepare`、启动与
+手动轮次、换远端、写触发、收摊）与 pi 用的是同一份 `@yandy0725/memory-core` 代码；本节只写 **dsh 侧
+不一样**的部分 —— 配置来源、生命周期挂点、以及没有退出兜底。共享的 core 语义（同步范围、磁盘布局、
+冲突后缀规则、`status` 字段）见 [pi-memory 参考](./pi-memory.zh.md#跨设备同步)，这里完全一致。
 
 ### 初始化 —— 没有 `/memory sync init`
 
@@ -182,8 +182,27 @@ agent/disposed
   `/memory sync` 会复述这条原因，而不是笼统地说「同步没开」。
 - **按会话，不是按进程**：不同于 pi 的单个 `syncRuntime` 变量，dsh 用一张 `sessionId → runtime` 的表，
   因为一个长寿命宿主进程要服务很多会话（与 store registry、index cache 按 session 分键是同一个理由）。
-  同一个 `sessionId` 重建 agent（宿主 `clear` / `compact`）时会先 dispose 上一代 runtime，所以陈旧的
-  自动轮次绝不会跨代写远端。`apply` 自己的 disposer 也会同样排空剩下每个会话的 runtime。
+  同一个 `sessionId` 重建 agent（宿主 `clear` / `compact`）时，`agent/created` 会先 await 上一代
+  runtime 的 dispose 再准备新一代，所以陈旧的自动轮次绝不会跨代写远端。`apply` 自己的 disposer
+  只对剩余会话逐个 `void disposeSyncSession(sessionId)` 启动清理；它不会 await 这些 promise，也不会在返回前
+  排空所有会话。
+
+### 编排在 core，dsh 只留宿主策略
+
+会话级编排同样由 core 的 `createSyncRuntime` 提供：配置门禁、懒 engine、`prepare`、启动与手动轮次、
+严格 dry-run 的 `status`、`changeRemote` 的持久顺序、写触发与 `dispose`。dsh 注入与保留的部分：
+
+- **调度 `serial`**：startup / run / status / changeRemote 排一条 FIFO，已排队的操作允许跑完；换远端在
+  公开调用时就关闸，第二个请求立刻得到 `sync remote change is already in progress`。
+- **注入原语**：backend、engine 与 `writeManifest` 从 core 公开出口传入 —— 测试因此能在装配时捕获实例
+  做故障注入。
+- **宿主文案**：漂移指引指向行 config 与 `/memory sync remote`；「origin 已切换，但 prepare/后续操作
+  失败」经 `formatRemoteChangeFailure` 保留 dsh 的既有措辞；文本出口仍把 `memory.json` 换成
+  `plugin row config`。
+- **宿主生命周期与账本**：`agent/created` 中先 await 上一代的 dispose，再 await `startup()` 且排在
+  第一次索引快照之前；`agent/disposed` 只是 fire-and-forget 收摊（`void disposeSyncSession(sessionId)`，
+  没有退出 flush）；此外还有按 session 保存 runtime/errors/notices、手动轮次后的索引刷新、命令解析与
+  `--force` 确认。
 
 ### 命令
 
@@ -277,7 +296,7 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 
 ## 验证状态
 
-单元测试全绿（dsh-memory `308 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上端到端跑通（隔离
+单元测试全绿（dsh-memory `321 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上端到端跑通（隔离
 `DSH_HOME` + `file:` 装包）—— 下面就是这次的验收记录。
 
 真机确认（web profile，长寿命宿主）：

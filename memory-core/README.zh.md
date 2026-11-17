@@ -3,7 +3,8 @@
 [English](./README.md) | 中文
 
 与 harness 无关的文件系统记忆层。一条记忆一个 Markdown 文件，`MEMORY.md` 索引里每条一行；读写门面、
-两级锁、快照回滚、注入策略、以及围绕它们的 LLM 编排都在这里。`src/**` 只 import `node:*` 与相对路径。
+两级锁、快照回滚、注入策略、围绕它们的 LLM 编排、以及会话级同步编排都在这里。`src/**` 只 import
+`node:*` 与相对路径。
 
 适配层负责宿主那一半：何时注入、怎么渲染、调哪个模型。本包负责必须处处一致的那一半 —— 所以同一台
 机器上的两个 harness 能共享同一份记忆。
@@ -53,6 +54,7 @@ for (const entry of await store.listEntries()) console.log(entry.name, entry.des
 | LLM 编排 | `TASKS` 里的三个任务描述符与 `runTask` 入口，跑在 `HeadlessAgentPort` / `HostTranscriptPort` 上 |
 | 注入策略 | 索引窗口、正文截断、容量口径、`scanEntries`、`renderSurfacedBlock` —— 返回字符串的纯函数 |
 | 工具契约 | action 集合、JSON Schema、模型可见文案、`createMemoryActionHandler` |
+| 跨设备同步 | `createSyncEngine`（一轮收敛）+ `createSyncRuntime`（会话编排：门禁、懒 engine、启动/手动轮次、换远端、写触发、收摊）+ `SyncBackend` 端口与 git 实现、manifest 与报告格式化；传输、engine 与基线 writer 由适配层注入 |
 | 配置 | 默认值、`mergeConfig`、`~` 展开、模型校验、`defaultMemoryRoot()` —— 不读文件 |
 
 没有 LLM 调用、没有 UI、没有宿主 API。这条由 `tests/neutrality.test.ts` 守着，它也是第二个 harness

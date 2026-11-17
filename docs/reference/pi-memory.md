@@ -231,6 +231,26 @@ session_shutdown
   are **not** in this session's `memory_index` until the next compaction (or the next session).
   `/memory sync status` says so in its last line.
 
+### Orchestration lives in core; pi keeps host policy
+
+Session-level sync orchestration comes from `@yandy0725/memory-core`'s `createSyncRuntime`: config gate,
+lazy engine, `prepare`, startup and manual rounds, strict dry-run `status`, the persistent ordering of
+`changeRemote`, the write trigger and `dispose`. pi injects only its own half:
+
+- **`concurrent` scheduling**: startup and manual rounds start before the call returns and are registered,
+  running alongside pi's other session-level work; `prepare` is single-flight, so concurrent preparations
+  share one attempt.
+- **Injected primitives**: the backend, the engine and the first-baseline `writeManifest` are all passed in
+  from core's public exports, so the wrapping factories in the wiring tests keep hitting the real
+  implementation.
+- **Wording and display**: the drift hint points only at `/memory sync remote`; separate guidance for changing
+  the remote before initialization points at `sync.remote` in `memory.json`. pi also owns the report's trailing
+  "index frozen for this session" line and the `pi-memory sync notice:` / `pi-memory sync error:` prefixes with
+  their notice/error levels.
+- **Host lifecycle**: awaiting `startup()` in `session_start` before the index value is chosen, the bounded
+  `flush()` and wait in `session_shutdown`, and a `dispose()` that only tears down; command parsing and
+  confirmation plus the error/notice ledgers live here too.
+
 ### Commands
 
 ```

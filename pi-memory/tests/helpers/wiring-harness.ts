@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { SyncEngine } from "@yandy0725/memory-core";
+import type { SyncBackend, SyncEngine, SyncRuntime } from "@yandy0725/memory-core";
 import { vi } from "vitest";
 import type { MemoryConfig } from "../../src/config";
 import { PI_HOST_DEFAULTS } from "../../src/config";
@@ -37,6 +37,16 @@ const mocks = vi.hoisted(() => ({
 	projectIdentityMock: vi.fn(),
 	/** 真 backend/engine 的观察带：只记顺序，调用仍委托 core 的真实现。 */
 	syncEvents: [] as string[],
+	/**
+	 * 真实 backend 捕获带。core 的 runtime 刻意不把 backend 放上公开面，所以故障注入与
+	 * origin 断言都从这里取「当前装配出的那一个」，而不是从 runtime 字段读。
+	 */
+	syncBackends: [] as SyncBackend[],
+	/**
+	 * core 建出的真实 runtime 捕获带（原样返回，只记录）：宿主测试要钉的是「写入与收摊走
+	 * runtime 入口」这件事本身，替换掉它只会让观察点失效。
+	 */
+	syncRuntimes: [] as SyncRuntime[],
 	/** 当前装配出的真实 engine 包装；测试可在慢 I/O 边界上 spy，不替换调度与落盘实现。 */
 	syncEngines: [] as SyncEngine[],
 	/** dispose 竞争测试只延迟真实 push/init 的起点，不替换其结果或行为。 */
@@ -92,7 +102,7 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 		})),
 		createGitSyncBackend: (options: Parameters<typeof actual.createGitSyncBackend>[0]) => {
 			const backend = actual.createGitSyncBackend(options);
-			return {
+			const observed: SyncBackend = {
 				...backend,
 				init: async (opts: Parameters<typeof backend.init>[0]) => {
 					mocks.syncEvents.push("init:start");
@@ -109,6 +119,13 @@ vi.mock("@yandy0725/memory-core", async (importOriginal) => {
 					return backend.fetch(scope, opts);
 				},
 			};
+			mocks.syncBackends.push(observed);
+			return observed;
+		},
+		createSyncRuntime: async (options: Parameters<typeof actual.createSyncRuntime>[0]) => {
+			const created = await actual.createSyncRuntime(options);
+			if (created.runtime !== null) mocks.syncRuntimes.push(created.runtime);
+			return created;
 		},
 		writeManifest: async (...args: Parameters<typeof actual.writeManifest>) => {
 			const failure = mocks.syncManifestWriteFailure.current;
@@ -203,6 +220,8 @@ export const loadConfigMock = mocks.loadConfigMock;
 export const resolveMemoryDirMock = mocks.resolveMemoryDirMock;
 export const projectIdentityMock = mocks.projectIdentityMock;
 export const syncEvents = mocks.syncEvents;
+export const syncBackends = mocks.syncBackends;
+export const syncRuntimes = mocks.syncRuntimes;
 export const syncEngines = mocks.syncEngines;
 export const syncPushBarrier = mocks.syncPushBarrier;
 export const syncPushTimeouts = mocks.syncPushTimeouts;
@@ -254,6 +273,8 @@ export function resetWiringMocks(): void {
 		key: `example.com/org/${config.basename(cwd)}`,
 	}));
 	syncEvents.length = 0;
+	syncBackends.length = 0;
+	syncRuntimes.length = 0;
 	syncEngines.length = 0;
 	syncPushBarrier.current = null;
 	syncPushTimeouts.length = 0;

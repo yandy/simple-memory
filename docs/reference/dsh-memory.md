@@ -137,10 +137,11 @@ two `Dir:` lines disagree, the configuration is not aligned.
 dsh-memory can replicate a project's memory entries to **one git remote**, so the same repository opened
 on another machine lands on the same memories. It is **off by default** — syncing writes your memories to
 a remote, so that cost has to be opted into, exactly like `extractMemories`. The engine (three-way diff,
-conflict resolution, manifest baselines, the git transport) is the same `@yandy0725/memory-core` code pi
-uses; this section only describes what is **different on the dsh side** — configuration source, lifecycle
-hooks, and the absence of an exit flush. For the shared core semantics (scope, layout, conflict suffix
-rules, `status` fields) see the
+conflict resolution, manifest baselines, the git transport) and the session-level orchestration (config
+gate, `prepare`, startup/manual rounds, remote change, write trigger, dispose) are the same
+`@yandy0725/memory-core` code pi uses; this section only describes what is **different on the dsh side** —
+configuration source, lifecycle hooks, and the absence of an exit flush. For the shared core semantics
+(scope, layout, conflict suffix rules, `status` fields) see the
 [pi-memory reference](./pi-memory.md#cross-device-sync); they are identical here.
 
 ### Setup — there is no `/memory sync init`
@@ -207,9 +208,29 @@ agent/disposed
 - **Per-session, not per-process**: unlike pi's single `syncRuntime` variable, dsh keeps a
   `sessionId → runtime` map, because one long-lived host process serves many sessions (same reason the
   store registry and index cache are keyed by session). Re-creating an agent with the same `sessionId`
-  (host `clear` / `compact`) disposes the previous runtime first, so a stale automatic round can never
-  write to the remote across generations. `apply`'s own disposer drains every remaining session's
-  runtime the same way.
+  (host `clear` / `compact`) awaits the previous generation's disposal in `agent/created` before the new
+  runtime is prepared, so a stale automatic round can never write to the remote across generations.
+  `apply`'s own disposer only starts cleanup for each remaining session with `void disposeSyncSession(sessionId)`;
+  it does not await those promises or drain every session before returning.
+
+### Orchestration lives in core; dsh keeps host policy
+
+Session-level orchestration also comes from core's `createSyncRuntime`: config gate, lazy engine, `prepare`,
+startup and manual rounds, strict dry-run `status`, the persistent ordering of `changeRemote`, the write
+trigger and `dispose`. What dsh injects and keeps:
+
+- **`serial` scheduling**: startup / run / status / changeRemote queue on one FIFO, and an already-queued
+  operation is allowed to finish; a remote change closes the gate as soon as it is called, so a second
+  request immediately gets `sync remote change is already in progress`.
+- **Injected primitives**: the backend, the engine and `writeManifest` come from core's public exports —
+  which is what lets the tests capture instances at assembly time for fault injection.
+- **Host wording**: the drift hint points at the row config and `/memory sync remote`; "origin already
+  changed, but prepare/follow-up failed" keeps dsh's established phrasing through
+  `formatRemoteChangeFailure`; the text output still maps `memory.json` to `plugin row config`.
+- **Host lifecycle and ledgers**: in `agent/created`, awaiting the previous generation's disposal and then
+  `startup()` before the first index snapshot; in `agent/disposed`, fire-and-forget disposal
+  (`void disposeSyncSession(sessionId)`, no exit flush); plus the per-session runtime/errors/notices map,
+  the index refresh after a manual round, command parsing and the `--force` confirmation.
 
 ### Commands
 
@@ -316,7 +337,7 @@ services, so the emitted `.js` has no host imports. CI guards it with
 
 ## Verification status
 
-Unit tests are green (dsh-memory `308 passed`) and the plugin has been run **end-to-end on real dsh
+Unit tests are green (dsh-memory `321 passed`) and the plugin has been run **end-to-end on real dsh
 `0.2.2-rc.1`** (isolated `DSH_HOME`, `file:` install) — the notes below are that verification record.
 
 Confirmed on a real host (web profile, long-lived):

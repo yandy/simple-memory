@@ -38,6 +38,7 @@ import {
 	setupSession,
 	syncEngines,
 	syncEvents,
+	syncBackends,
 	syncInitBarrier,
 	syncManifestWriteFailure,
 	uiWith,
@@ -245,6 +246,16 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 			indexMaxBytes: config.memIndexMaxBytes,
 			lock: config.lock,
 		});
+	}
+
+	/**
+	 * 最近一次装配出的真实 backend。core 的 runtime 不再把 backend 放上公开面，所以故障注入与
+	 * origin 断言都从 harness 的捕获带取「当前那一个」，而不是去读 runtime 字段。
+	 */
+	function currentBackend() {
+		const backend = syncBackends.at(-1);
+		if (!backend) throw new Error("sync backend was not created");
+		return backend;
 	}
 
 	async function snapshotTree(root: string): Promise<Record<string, string>> {
@@ -547,21 +558,24 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect(Object.keys((await readManifest(paths.manifest))?.files ?? {})).toHaveLength(1);
 		const nextRemote = join(s.cwd, "next.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
-		const init = vi.spyOn(runtime.backend, "init");
+		const backend = currentBackend();
+		const init = vi.spyOn(backend, "init");
 
 		const changed = await runtime.changeRemote(nextRemote, 4_321);
 
 		if (!changed.ok) throw new Error(`changeRemote failed: ${changed.reason}`);
 		expect(init).toHaveBeenCalledTimes(1);
 		expect(init.mock.calls[0][0].timeoutMs).toBe(4_321);
-		expect(await runtime.backend.getRemote()).toBe(nextRemote);
+		expect(await backend.getRemote()).toBe(nextRemote);
 		expect(await readManifest(paths.manifest)).toEqual({
 			version: 2,
 			transport: syncTransport(nextRemote, "main"),
 			base: { revision: "", syncedAt: expect.any(String) },
 			files: {},
 		});
-		expect((await changed.engine.push(10_000)).ok).toBe(true);
+		const replacement = runtime.engine;
+		if (!replacement) throw new Error("replacement engine was not restored");
+		expect((await replacement.push(10_000)).ok).toBe(true);
 		expect(await git(["ls-remote", nextRemote])).not.toBe("");
 		runtime.dispose();
 	});
@@ -582,7 +596,7 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		const nextRemote = join(s.cwd, "recovery.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
 		const init = vi
-			.spyOn(runtime.backend, "init")
+			.spyOn(currentBackend(), "init")
 			.mockRejectedValueOnce(new Error("revalidate https://user:super-secret@example.invalid/x failed"));
 
 		const changed = await runtime.changeRemote(nextRemote, 10_000);
@@ -597,7 +611,7 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		const recovered = await runtime.prepare(10_000);
 		if (!recovered.ok) throw new Error(`recovery failed: ${recovered.reason}`);
 		expect(init).toHaveBeenCalledTimes(2);
-		expect(await runtime.backend.getRemote()).toBe(nextRemote);
+		expect(await currentBackend().getRemote()).toBe(nextRemote);
 		expect((await readManifest(paths.manifest))?.base.revision).toBe("");
 		expect((await readManifest(paths.manifest))?.files).toEqual({});
 		expect((await recovered.engine.push(10_000)).ok).toBe(true);
@@ -620,7 +634,7 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		syncManifestWriteFailure.current = new Error("controlled manifest write failure");
 		const nextRemote = join(s.cwd, "manifest-recovery.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
-		const init = vi.spyOn(runtime.backend, "init");
+		const init = vi.spyOn(currentBackend(), "init");
 
 		const changed = await runtime.changeRemote(nextRemote, 10_000);
 		expect(changed.ok).toBe(false);
@@ -658,7 +672,7 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		expect(Object.keys((await readManifest(paths.manifest))?.files ?? {})).toHaveLength(1);
 		const nextRemote = join(s.cwd, "restart-after-init-failure.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
-		vi.spyOn(runtime.backend, "init").mockRejectedValueOnce(new Error("controlled revalidation failure"));
+		vi.spyOn(currentBackend(), "init").mockRejectedValueOnce(new Error("controlled revalidation failure"));
 
 		const changed = await runtime.changeRemote(nextRemote, 10_000);
 		expect(changed.ok).toBe(false);
@@ -707,7 +721,7 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		const initStarted = new Promise<void>((resolveStarted) => {
 			markInitStarted = resolveStarted;
 		});
-		vi.spyOn(runtime.backend, "init").mockImplementation(({ signal }) => {
+		vi.spyOn(currentBackend(), "init").mockImplementation(({ signal }) => {
 			markInitStarted();
 			return new Promise<never>((_resolve, reject) => {
 				const stop = () => reject(new Error("process stopped before init"));
@@ -718,7 +732,7 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 
 		const changing = runtime.changeRemote(nextRemote, 10_000);
 		await initStarted;
-		expect(await runtime.backend.getRemote()).toBe(nextRemote);
+		expect(await currentBackend().getRemote()).toBe(nextRemote);
 		runtime.dispose();
 		await changing;
 		expect(await readManifest(paths.manifest)).toBeNull();
@@ -755,14 +769,14 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		await mkdir(paths.manifest);
 		const nextRemote = join(s.cwd, "invalidation-failure.git");
 		await git(["init", "--bare", "--quiet", nextRemote]);
-		const setRemote = vi.spyOn(runtime.backend, "setRemote");
+		const setRemote = vi.spyOn(currentBackend(), "setRemote");
 		syncEvents.length = 0;
 
 		const changed = await runtime.changeRemote(nextRemote, 10_000);
 
 		expect(changed.ok).toBe(false);
 		expect(setRemote).not.toHaveBeenCalled();
-		expect(await runtime.backend.getRemote()).toBe(remote);
+		expect(await currentBackend().getRemote()).toBe(remote);
 		expect(runtime.engine).not.toBeNull();
 		expect(syncEvents.filter((event) => event === "noteWrite")).toHaveLength(1);
 		runtime.dispose();
@@ -796,9 +810,9 @@ describe.skipIf(!GIT)("index wiring — /memory sync commands", { timeout: 60_00
 		release();
 		const firstResult = await first;
 		syncInitBarrier.current = null;
-		const originAfterFirst = await runtime.backend.getRemote();
+		const originAfterFirst = await currentBackend().getRemote();
 		const later = await runtime.changeRemote(secondRemote, 10_000);
-		const originAfterLater = await runtime.backend.getRemote();
+		const originAfterLater = await currentBackend().getRemote();
 		runtime.dispose();
 
 		expect(second).not.toBe(pending);

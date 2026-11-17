@@ -15,6 +15,7 @@ import {
 	setupSession,
 	syncEngines,
 	syncEvents,
+	syncRuntimes,
 } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 import { loadConfig } from "../src/config";
@@ -109,6 +110,22 @@ describe.skipIf(!GIT)("index wiring — sync write triggers", { timeout: 60_000 
 		const pulled = await engine.pull(10_000);
 		expect(pulled).toMatchObject({ ok: true, pulled: ["Remote-note.md"] });
 		expect(noteWrite).toHaveBeenCalledTimes(3);
+	});
+
+	it("routes every successful write through the runtime trigger instead of the engine handle", async () => {
+		await enableTestSync(s);
+		const { tools } = await start();
+		const runtime = syncRuntimes.at(-1);
+		if (!runtime) throw new Error("sync runtime was not created");
+		// 宿主必须交给 core 的入口：直接摸 engine.noteWrite 会绕过收摊与换远端关闸。
+		const runtimeTrigger = vi.spyOn(runtime, "noteWrite");
+		const engineTrigger = vi.spyOn(currentEngine(), "noteWrite");
+
+		await run(tools[0], { action: "add", name: "A", description: "d", content: "one" });
+		await run(tools[0], { action: "list" });
+
+		expect(runtimeTrigger).toHaveBeenCalledTimes(1);
+		expect(engineTrigger).toHaveBeenCalledTimes(1);
 	});
 
 	it("forwards every write even when pushOnWrite is false, leaving the switch and debounce to core", async () => {

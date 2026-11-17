@@ -429,6 +429,46 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		syncPushTimeouts.length = 0;
 	}
 
+	it("runtime.startup owns the automatic budget and delivers the baseline warning before pushing", async () => {
+		const config = memoryConfig({ pullOnStart: true, autoTimeoutMs: 1_000 });
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		await store.addEntry({ name: "Existing local memory", description: "local before first sync", body: "keep me" });
+		const { runtime, errors } = await createPiSyncRuntime({
+			config,
+			store,
+			projectDir: s.dir,
+			identity: gitIdentity(s.cwd),
+		});
+		expect(errors).toEqual([]);
+		if (!runtime) throw new Error("runtime was not created");
+		const warnings: string[] = [];
+		const start = 1_700_000_000_000;
+		// 第一次 Date.now 给启动的 autoTimeoutMs deadline；此后一律 +400，剩余预算必须恰好是 600。
+		const clock = vi.spyOn(Date, "now").mockReturnValueOnce(start).mockReturnValue(start + 400);
+		const outcome = await runtime
+			.startup((warning) => {
+				warnings.push(warning);
+				syncEvents.push("startup-warning");
+			})
+			.finally(() => clock.mockRestore());
+		runtime.dispose();
+
+		expect(outcome.ok).toBe(true);
+		if (!outcome.ok) throw new Error(`startup failed: ${outcome.reason}`);
+		expect(outcome.value).not.toBeNull();
+		expect(syncPushTimeouts).toEqual([600]);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("deterministic conflict copies");
+		expect(syncEvents.indexOf("startup-warning")).toBeGreaterThanOrEqual(0);
+		expect(syncEvents.indexOf("startup-warning")).toBeLessThan(syncEvents.indexOf("push:start"));
+		expect(outcome.warning).toContain("deterministic conflict copies");
+	});
+
 	it("prepare and startup push share one automatic deadline", async () => {
 		await enableSync({ pullOnStart: true, autoTimeoutMs: 1_000 });
 		await initializeForBudgetTest();
@@ -466,6 +506,38 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 		expect(notify.mock.calls[0]?.[1]).toBe("info");
 		expect(notify.mock.calls[0][0]).toContain("pi-memory sync notice:");
 		expect(notify.mock.calls[0][0]).not.toContain("pi-memory sync error:");
+	});
+
+	it("records only the exhausted startup budget after an earlier first-baseline preview", async () => {
+		const config = memoryConfig({ pullOnStart: true, autoTimeoutMs: 300 });
+		const store = new MemoryStore({
+			memoryDir: s.dir,
+			indexMaxLines: config.memIndexMaxLines,
+			indexMaxBytes: config.memIndexMaxBytes,
+			lock: config.lock,
+		});
+		await store.addEntry({ name: "Existing local memory", description: "local before first sync", body: "keep me" });
+		await enableSync({ pullOnStart: true, autoTimeoutMs: 300 });
+		const start = 1_700_000_000_000;
+		const clock = vi.spyOn(Date, "now").mockReturnValueOnce(start).mockReturnValue(start + 400);
+		const notify = vi.fn();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		try {
+			await handlers["session_start"][0]({ reason: "startup" }, s.uiCtx(uiWith(notify)));
+		} finally {
+			clock.mockRestore();
+		}
+
+		expect(syncPushTimeouts).toEqual([]);
+		expect(notify).toHaveBeenCalledTimes(2);
+		expect(notify.mock.calls[0][0]).toContain("deterministic conflict copies");
+		expect(notify.mock.calls[0][1]).toBe("info");
+		// 预告已经即时通知过：预算用尽只补新增那一句，不能把同一条预告再报一遍。
+		expect(notify.mock.calls[1][0]).toContain("startup budget");
+		expect(notify.mock.calls[1][0]).toContain("next round");
+		expect(notify.mock.calls[1][0]).not.toContain("deterministic conflict copies");
+		expect(notify.mock.calls[1][1]).toBe("info");
 	});
 
 	it("does not initialize a local project and reports non-git sync as a notice, not an error", async () => {

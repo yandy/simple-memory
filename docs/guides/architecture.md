@@ -18,7 +18,9 @@
 与合并语义 `mergeConfig`）。
 
 执行点是 `memory-core/tests/neutrality.test.ts`，它同时禁止 core 里出现只有本仓才读得懂的坐标
-（spec 章节号、决策编号、宿主斜杠命令、宿主事件名）。放宽这条等于让第二个 harness 装不上这个包。
+（spec 章节号、决策编号、宿主斜杠命令、宿主事件名）。它只按 import 说明符与这份**列出的**坐标扫描，
+不负责发现任意宿主配置文件名或命令文案——这类词汇靠审查与新文案的注入参数约束，不能把 neutrality
+测试当成全量黑名单。放宽这条等于让第二个 harness 装不上这个包。
 
 ## 公开 API 只从 `src/index.ts` 出
 
@@ -27,6 +29,25 @@
 `dsh-memory` 遵循同一条规则：`exports` 只有 `.`（`dist/index.js`）、`cordis.patch.yml` 与
 `package.json`。宿主类型只从 `src/host-types.ts` 走，且只允许 `import type` —— tsc 擦除后
 `dist/**/*.js` 零宿主命中（`npm run build` 的验收点）。
+
+## 同步：core 编排，适配层接线
+
+跨设备同步分两层，与本仓其余部分的切分同构：
+
+- `memory-core` 的 `createSyncEngine` 收敛**一轮**：传输段、三方差集、冲突收敛、快照、落盘、重建索引、
+  发布段。
+- `memory-core` 的 `createSyncRuntime` 把一轮变成**会话级生命周期**：配置门禁、懒 engine、`prepare`、
+  `startup` / `run` / `status` / `flush`、`changeRemote`、写触发与 `dispose`。
+
+适配层负责接线：从公开出口注入 `createBackend` / `createEngine` / `writeManifest` 三个原语与自己的文案，
+并选一种 `scheduling` —— pi 用 `concurrent`（活动在公开调用返回前起跑并登记），dsh 用 `serial`（一条
+FIFO，已排队的操作允许跑完）。core 拥有它们的生命周期与调用顺序，但不选传输实现、不认识宿主、也不读
+任何配置文件。
+
+仍留宿主的是宿主那一半：调用 runtime 的宿主事件（启动、退出 flush、dispose）、命令解析与确认、通知与
+错误账本、索引的冻结/刷新策略、按会话保存的状态。共同报告格式（`renderSyncRound` /
+`renderSyncStatus`）与统一的凭据脱敏出口（`syncErrorMessage`，git backend 复用同一
+`redactCredentials`）在 core；宿主只注入漂移提示与尾部行，并在自己的出口做配置词汇替换。
 
 ## 用户契约
 

@@ -2,7 +2,6 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-	createGitSyncBackend,
 	DEFAULT_CONFIG,
 	LOCK_FILE,
 	MemoryStore,
@@ -73,16 +72,15 @@ function memoryRuntime(cfg: MemoryConfig, over: Partial<SessionMemoryRuntime> = 
 	};
 }
 
-function fakeRuntime(cfg: MemoryConfig, over: Partial<DshSyncRuntime> = {}): DshSyncRuntime {
-	const syncRoot = syncRootPath(resolve(cfg.memoryDir));
+function fakeRuntime(over: Partial<DshSyncRuntime> = {}): DshSyncRuntime {
 	return {
 		engine: null,
-		backend: createGitSyncBackend({ syncRoot, memoryRoot: resolve(cfg.memoryDir), remote: "", branch: "main" }),
-		syncRoot,
+		prepare: vi.fn(async () => ({ ok: false as const, reason: "commands never prepare directly" })),
 		startup: vi.fn(async () => ({ ok: true as const, value: null })),
 		run: vi.fn(async () => ({ ok: true as const, value: round({ ok: true }) })),
 		status: vi.fn(async () => ({ ok: true as const, value: { initialized: false, origin: null } })),
 		changeRemote: vi.fn(async () => ({ ok: true as const, value: null })),
+		flush: vi.fn(async () => null),
 		noteWrite: vi.fn(),
 		dispose: vi.fn(async () => {}),
 		...over,
@@ -207,10 +205,51 @@ describe("sync rendering", () => {
 		expect(text).toContain("continuing to use origin");
 	});
 
+	it("renders a failed round reason in the row config vocabulary, not memory.json", () => {
+		const text = renderSyncRound(
+			round({
+				ok: false,
+				skipped: {
+					reason:
+						'the sync backend is not initialized: set "sync.remote" in memory.json so the host can initialize it',
+				},
+			}),
+		);
+
+		expect(text).toContain("Result: failed");
+		expect(text).toContain('set "sync.remote" in plugin row config so the host can initialize it');
+		expect(text).not.toContain("memory.json");
+	});
+
+	it("renders status errors in the row config vocabulary, not memory.json", () => {
+		const report: SyncStatusReport = {
+			configured: false,
+			initialized: false,
+			remote: "",
+			branch: "main",
+			device: { id: "device-id", hostname: "laptop", createdAt: "2026-11-16T00:00:00.000Z" },
+			projectDir: join(dir, "project-memory"),
+			projectKey: "example.com__owner__repo",
+			base: null,
+			ahead: [],
+			behind: [],
+			conflicts: [],
+			rejected: [],
+			unparsableLocal: [],
+			outOfScopeRemote: [],
+			errors: ['sync is not configured: set "sync.enabled" and "sync.remote" in memory.json'],
+		};
+		const text = renderSyncStatus(report, "");
+
+		expect(text).toContain("Errors (1):");
+		expect(text).toContain('set "sync.enabled" and "sync.remote" in plugin row config');
+		expect(text).not.toContain("memory.json");
+	});
+
 	it("appends ready, uninitialized, notice and error state to the normal memory status", async () => {
 		const cfg = config();
 		const rt = memoryRuntime(cfg);
-		const ready = fakeRuntime(cfg, { engine: {} as DshSyncRuntime["engine"] });
+		const ready = fakeRuntime({ engine: {} as DshSyncRuntime["engine"] });
 		const text = await renderStatus(
 			rt,
 			[],
@@ -223,7 +262,7 @@ describe("sync rendering", () => {
 		expect(text).toContain("Sync error:");
 		expect(text).toContain("origin drift");
 
-		expect(renderSyncSummary(session(fakeRuntime(cfg)))).toContain("Sync: not initialized");
+		expect(renderSyncSummary(session(fakeRuntime()))).toContain("Sync: not initialized");
 		expect(renderSyncSummary(session(null))).toContain("Sync: disabled");
 	});
 });
@@ -261,7 +300,7 @@ describe("/memory sync commands", () => {
 			pulled: ["partial.md"],
 			rejected: [{ file: "bad.md", reason: "invalid" }],
 		});
-		const runtime = fakeRuntime(cfg, { run: vi.fn(async () => ({ ok: true as const, value: failed })) });
+		const runtime = fakeRuntime({ run: vi.fn(async () => ({ ok: true as const, value: failed })) });
 		const rt = memoryRuntime(cfg);
 		const state = session(runtime);
 		const { command, refresh } = commandFor(rt, state);
@@ -278,7 +317,7 @@ describe("/memory sync commands", () => {
 
 	it("changes origin without exposing credentials and says the row config was not modified", async () => {
 		const cfg = config();
-		const runtime = fakeRuntime(cfg);
+		const runtime = fakeRuntime();
 		const { command } = commandFor(memoryRuntime(cfg), session(runtime));
 		const url = "https://user:super-secret@example.invalid/private.git";
 
@@ -344,7 +383,7 @@ describe("/memory sync commands", () => {
 	it.each(["pull", "push"] as const)("surfaces the conflict-copy warning in the %s result and logs it before the round finishes", async (kind) => {
 		const cfg = config();
 		const events: string[] = [];
-		const runtime = fakeRuntime(cfg, {
+		const runtime = fakeRuntime({
 			run: vi.fn(async (_kind, _timeout, onWarning) => {
 				// 这个 fake 忠实地复现真实 run() 的契约：prepare 产生预告时先回调 onWarning，再跑真正的一轮。
 				onWarning?.("same-named entries may be kept as deterministic conflict copies");
@@ -371,7 +410,7 @@ describe("/memory sync commands", () => {
 	it("surfaces the conflict-copy warning in the remote result and logs it before the change finishes", async () => {
 		const cfg = config();
 		const events: string[] = [];
-		const runtime = fakeRuntime(cfg, {
+		const runtime = fakeRuntime({
 			changeRemote: vi.fn(async (_remote, _timeout, onWarning) => {
 				onWarning?.("same-named entries may be kept as deterministic conflict copies");
 				events.push("noteWrite");
@@ -393,7 +432,7 @@ describe("/memory sync commands", () => {
 		const cfg = config({ remote: join(dir, "second-remote.git") });
 		const driftError = SYNC_REMOTE_DRIFT_ERROR;
 		const unrelatedError = "Failed to inspect memory sync state: disk on fire";
-		const runtime = fakeRuntime(cfg);
+		const runtime = fakeRuntime();
 		const state = session(runtime, { persistentErrors: [driftError, unrelatedError], errors: [driftError, unrelatedError] });
 		const { command } = commandFor(memoryRuntime(cfg), state);
 
@@ -406,7 +445,7 @@ describe("/memory sync commands", () => {
 	it("keeps the origin-drift error when the new remote still does not match the configured remote", async () => {
 		const cfg = config({ remote: join(dir, "configured.git") });
 		const driftError = SYNC_REMOTE_DRIFT_ERROR;
-		const runtime = fakeRuntime(cfg);
+		const runtime = fakeRuntime();
 		const state = session(runtime, { persistentErrors: [driftError], errors: [driftError] });
 		const { command } = commandFor(memoryRuntime(cfg), state);
 

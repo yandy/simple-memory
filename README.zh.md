@@ -38,8 +38,8 @@ $XDG_DATA_HOME/simple-memory/<git|local>/<project>/
 
 ## 跨设备同步
 
-记忆默认只在本机。`pi-memory` 可以把当前项目的记忆推进一个 git 远端（默认关闭），同一仓库在另一台
-机器上打开时落到同一批文件上；dsh 侧还没有接线。见 [pi-memory](./pi-memory) 与
+记忆默认只在本机。两个适配层都可以把当前项目的记忆推进一个 git 远端（默认关闭），同一仓库在另一台
+机器上打开时落到同一批文件上。见 [pi-memory](./pi-memory)、[dsh-memory](./dsh-memory) 与
 [参考文档](./docs/reference/pi-memory.zh.md#跨设备同步)。
 
 ## 文档
