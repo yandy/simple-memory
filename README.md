@@ -43,6 +43,11 @@ Memory is local by default. Both adapters can push this project's memory to a gi
 so another machine working on the same repository lands on the same files. See [pi-memory](./pi-memory),
 [dsh-memory](./dsh-memory) and the [reference](./docs/reference/pi-memory.md#cross-device-sync).
 
+One known behaviour: on `resume` / `fork` / `reload` pi keeps the index recorded in the transcript (changing
+it would break the prompt cache), so startup convergence still runs and the disk still updates, but **this
+session's `memory_index` will not show the memories that just synced in** until the next compaction or the
+next session. See [why the index is frozen](./docs/reference/pi-memory.md#why-the-index-is-frozen).
+
 ## Docs
 
 - Reference: [memory-core](./docs/reference/memory-core.md) · [pi-memory](./docs/reference/pi-memory.md) · [dsh-memory](./docs/reference/dsh-memory.md)

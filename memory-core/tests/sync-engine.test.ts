@@ -913,7 +913,7 @@ describe("sync engine（假 backend）", () => {
 			skipped: { reason: expect.stringMatching(/not initialized/i) },
 		});
 		// 文案指向配置，而不是那条已经不存在的初始化命令（用户照着敲只会得到「没有这个命令」）
-		expect(res.skipped?.reason).toContain("memory.json");
+		expect(res.skipped?.reason).toContain("the host configuration");
 		expect(res.skipped?.reason).toContain("sync.remote");
 		expect(res.skipped?.reason).not.toMatch(/sync init command/i);
 		expect(spy).not.toHaveBeenCalled();
@@ -924,7 +924,7 @@ describe("sync engine（假 backend）", () => {
 		const off = engineWith(remote, { enabled: false });
 		const res = await off.pull();
 		expect(res).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
-		expect(res.skipped?.reason).toContain("memory.json");
+		expect(res.skipped?.reason).toContain("the host configuration");
 		expect(remote.fetches).toBe(0);
 		off.dispose();
 	});
@@ -938,7 +938,7 @@ describe("sync engine（假 backend）", () => {
 		const res = await eng.push();
 		expect(res).toMatchObject({ ok: false, skipped: { reason: expect.stringMatching(/not configured/i) } });
 		expect(res.skipped?.reason).toContain("sync.remote");
-		expect(res.skipped?.reason).toContain("memory.json");
+		expect(res.skipped?.reason).toContain("the host configuration");
 		expect(res.skipped?.reason).not.toMatch(/sync init command/i);
 		expect(spy).not.toHaveBeenCalled();
 		expect(remote.fetches).toBe(0);

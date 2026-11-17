@@ -229,20 +229,36 @@ export function requiredModels(
 }
 
 /**
+ * 宿主配置来源的**中立**称呼。
+ *
+ * core 不认识任何宿主的配置文件（`memory.json`、cordis 行 config 都不在本包的词汇里），所以
+ * 「该去哪儿改」类错误默认指向这个短语；适配层在自己的出口传 `configSource`，把它换成用户真正
+ * 看得见的名字。这样 core 里不会出现宿主专有的文件名，宿主也不必靠反向 `replaceAll` 打补丁。
+ *
+ * 刻意不从 `src/index.ts` 导出：它不是给适配层用的默认值（宿主总知道自己的配置叫什么），
+ * 只是本包内部的兜底。
+ */
+export const HOST_CONFIG_SOURCE = "the host configuration";
+
+/**
  * 启动校验：空数组 = 通过。
  * `resolve` 由调用方注入（生产时是 `(v) => resolveModel(v, ctx.modelRegistry) !== undefined`），
  * 因此本函数不依赖 SDK 的 registry 类型，可用假 resolve 单测。
  * `tasks`：原样透传给 `requiredModels`（只校验列出的任务；`null` 子树跳过那个例外同上）。
+ * `options.configSource`：错误文案里点名的配置来源，由适配层传入自己的叫法（默认见
+ * `HOST_CONFIG_SOURCE`）。
  */
 export function modelConfigErrors(
 	cfg: MemoryConfig,
 	resolve: (value: string) => boolean,
 	tasks?: readonly ModelTask[],
+	options: { configSource?: string } = {},
 ): string[] {
+	const configSource = options.configSource ?? HOST_CONFIG_SOURCE;
 	const errors: string[] = [];
 	for (const { task, value } of requiredModels(cfg, tasks)) {
 		if (value === undefined) {
-			errors.push(`no model for ${task} — set "${task}.model" or "defaults.model" in memory.json`);
+			errors.push(`no model for ${task} — set "${task}.model" or "defaults.model" in ${configSource}`);
 		} else if (!resolve(value)) {
 			errors.push(`model "${value}" for ${task} is not resolvable (unknown id or missing credentials)`);
 		}
@@ -262,9 +278,14 @@ export function modelConfigErrors(
  * 顺序固定：enabled → pullOnStart → pushOnWrite → remote → branch → pushDebounceMs → autoTimeoutMs
  * → timeoutMs；每条消息都点名键，便于直接改配置。
  * `options.initialized === true` 时本地 origin 已是远端真相来源，因此只放宽 remote 为空这一条，
- * 其余键与同意边界的校验完全不变。
+ * 其余键与同意边界的校验完全不变。`options.configSource` 同 `modelConfigErrors`：文案里点名的配置
+ * 来源由适配层传到，core 不内置宿主的文件名。
  */
-export function syncConfigErrors(cfg: MemoryConfig, options: { initialized?: boolean } = {}): string[] {
+export function syncConfigErrors(
+	cfg: MemoryConfig,
+	options: { initialized?: boolean; configSource?: string } = {},
+): string[] {
+	const configSource = options.configSource ?? HOST_CONFIG_SOURCE;
 	const sync = cfg.sync;
 	// 读不懂的子树（`deepMerge` 会把用户写的 `"sync": null`、甚至一个字符串原样带进来）按「未启用」
 	// 处理，一条都不报：没有键可校验，也没有开关可开。不抛 TypeError 是底线。
@@ -290,7 +311,9 @@ export function syncConfigErrors(cfg: MemoryConfig, options: { initialized?: boo
 			`sync is enabled but "sync.remote" must be a string (got ${String(sync.remote)}) — set a remote URL or unset "sync.enabled"`,
 		);
 	} else if (options.initialized !== true && sync.remote.trim() === "") {
-		errors.push('sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"');
+		errors.push(
+			`sync is enabled but "sync.remote" is empty — set "sync.remote" in ${configSource} or unset "sync.enabled"`,
+		);
 	}
 	if (typeof sync.branch !== "string" || sync.branch.trim() === "") {
 		errors.push('sync is enabled but "sync.branch" is empty — set a branch name or unset "sync.enabled"');
@@ -311,7 +334,7 @@ export function syncConfigErrors(cfg: MemoryConfig, options: { initialized?: boo
 export function requiredModel(cfg: MemoryConfig, task: ModelTask): string {
 	const value = taskModel(cfg, task);
 	if (value === undefined) {
-		throw new Error(`no model for ${task} — set "${task}.model" or "defaults.model" in memory.json`);
+		throw new Error(`no model for ${task} — set "${task}.model" or "defaults.model" in ${HOST_CONFIG_SOURCE}`);
 	}
 	return value;
 }

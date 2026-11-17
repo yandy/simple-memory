@@ -90,6 +90,11 @@ typecheck。`src/host-types.ts` 从 `@deepseek-ai/dsh-agent` 取 `Agent`，而 `
 「只服务一个宿主」的键，只属于那个宿主的配置（pi 侧的 `PiHostConfig`），不得进 `MemoryConfig`。core 的
 配置契约只收两个宿主共有的语义。
 
+反过来，`sync.pushDebounceMs` 正因为它**在两个宿主上都有消费者**（「写入后去抖一次发布」是 pi 与 dsh
+同一语义，去抖本身由 core 的写触发 scheduler 实现）才能落在 `MemoryConfig` 的 `sync` 子树里；而退出
+兜底的那一轮推送**不设键** —— 那是 pi 自己的接线细节，dsh 没有可靠的退出事件，配了也不会生效。
+判定标准是「有没有第二个消费者」，不是「听起来像不像全局选项」。
+
 执行点三条：
 
 - `npm run check:memory-core-deps`（`scripts/check-memory-core-deps.mjs`，CI 的 `test` job）—— 静态检查

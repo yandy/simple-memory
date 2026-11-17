@@ -316,9 +316,16 @@ export interface RemoteView {
 	/** 取内容。只会被 list() 报出的路径调用。 */
 	read(path: string): Promise<string>;
 	/**
-	 * 远端存在、但不属于本 scope 的 entry 的路径（**仓库根相对**）。纯报告用：引擎把它抄进
-	 * 同步结果与 `status`，让人知道远端有东西没被同步（有人手工推了 `MEMORY.md`、`local/...`、
-	 * 或 scope 下的嵌套目录）。**不得静默丢弃范围外路径**；无法廉价判断的 backend 返回 `[]`。
+	 * 远端存在、但**不该在那儿**的路径（**仓库根相对**，原样保留）。纯报告用：引擎把它抄进
+	 * 同步结果与 `status`，让人知道远端有内容没被同步 —— 有人手工推了索引文件、`local/...`、
+	 * 或本前缀底下的嵌套目录都算。
+	 *
+	 * **判据是「异常」，不是「不在本 scope 内」**：远端按设计镜像整个记忆根，而一次会话只同步当前
+	 * 那一个项目，所以兄弟项目的 `git/<other-key>/*.md` 是每一轮的常态；把它们报进来，条数就随
+	 * 项目数 × 记忆数线性增长，而异常报告一旦和正常数据同量级就等于没有报告 —— 真正那一条信号
+	 * 会被永久埋掉。
+	 *
+	 * **不得静默丢弃异常路径**；无法廉价判断的 backend 返回 `[]`。
 	 */
 	readonly outOfScope: string[];
 }
@@ -377,7 +384,12 @@ export interface SyncBackend {
 	): Promise<string>;
 }
 
-/** 每次 backend 调用的运行参数。timeoutMs 由调用方按"自动/手动"两档给（§6.9）。 */
+/**
+ * 每次 backend 调用的运行参数。`timeoutMs` 由调用方按「自动路径 / 用户显式在等」两档给（§6.9），
+ * 且它是**这次调用的总预算**，不是单次往返的上限：backend 内部多个 git 子进程共享它（实现里
+ * `budgeted()` 每跑一个子进程现算剩余量），引擎一轮在多段 backend 调用之间交下去的也是剩余量。
+ * `signal` 由宿主在退出 / 切会话时接上，在途的远端操作据此尽快收尾。
+ */
 export interface SyncRunOptions {
 	timeoutMs: number;
 	signal?: AbortSignal;
@@ -453,12 +465,25 @@ async applyEntryFiles(
 的口径）。差集因此只对**可解析**的 entry 成立；解析不出的本地 `.md` 不参与同步，由 `status` 报一行
 「本地有 N 个无法解析的 .md，未同步」—— 不推上去污染远端，也不让用户毫不知情。
 
-**一个有意的读路径收窄**（建造者审阅提出、已裁定）：`isEntryFileName` 把「含 `/` 或 `\`」也判为
-不合格，而 `MemoryStore.#entryFiles()` 现在复用它 —— 于是在 POSIX 上，一个名字里**字面含反斜杠**的
+**文件名口径按方向拆成两个谓词**（修复波据此改名，`isEntryFileName` 已不存在 —— 一个没有方向的
+「是不是条目名」正是让读口径与写口径互相串味的形状）：
+
+- `isEntryFileNameForRead(name, platform = process.platform)`：**读方向**。只在 win32 上剔除保留设备名
+  （按名打开 `con.md` 在 win32 上会命中控制台；而在 Linux / macOS 上它是一条合法记忆，全平台剔除等于
+  静默丢记忆）。消费者是 `MemoryStore.#entryFiles()` 与同步的本地扫描，两处必须共用同一份，否则会出现
+  「store 看得到、同步看不到」的记忆。**绝不用它判「能不能写」。**
+- `isEntryFileNameForWrite(name)`：**写方向**，恒为全平台最严，**没有 platform 参数**。消费者是
+  `applyEntryFiles` 的整批路径断言，以及一切从网络进来的名字（引擎在把远端清单交给差集之前先过它）。
+  用读方向去判远端名字，就是把「本机读得懂」当成「每台设备都写得下」。
+- 两者共用的形状判据（单层 `.md`、不是 `MEMORY.md`、不以 `.` 开头、不含 `/` 或 `\`）住在不导出的
+  `isEntryFileNameShape`。
+
+**一个有意的读路径收窄**（建造者审阅提出、已裁定）：读方向的形状判据把「含 `/` 或 `\`」也判为
+不合格，而 `MemoryStore.#entryFiles()` 复用它 —— 于是在 POSIX 上，一个名字里**字面含反斜杠**的
 `.md` 文件（ext4/APFS 允许，但 store 自己永远造不出来：`entryFileName` 的 `UNSAFE` 类会剔掉 `\`）
 不再出现在 `listEntries()` / 搜索 / dream 里。这是对既有可见集合的收窄，记在这里而不是悄悄发生：
 
-- **为什么接受**：这种文件只能来自手工创建或外部工具。若留在读路径里，它会被同步扇描收进
+- **为什么接受**：这种文件只能来自手工创建或外部工具。若留在读路径里，它会被同步扫描收进
   manifest、推到远端，然后在**对端**的 `applyEntryFiles` 触发整批 fail-closed 抛错 —— 一个怪文件
   会让两台设备的同步全断。收窄到"看不见"的代价是一条记忆不可见（文件仍在盘上，重命名即恢复），
   比"同步全断"轻。
@@ -819,6 +844,11 @@ re-review 又报出 1 条 Important + 6 条 Minor 的残留。按流程**不开�
 - `pullOnStart` 在 core 里**没有消费者**（引擎只在被调用时干活），接线时必须照 `=== true` 判定。
 
 ### 归第四刀（文档）
+
+> **状态（2026-11-17）：本节两项均已落地。** `docs/guides/architecture.md` 补了 `.sync/` 布局、端口契约
+> 与规模/复杂度（含 39ms / 183ms / 72–77ms / 78ms 与 oid 缓存的触发条件）；§6.5 的 `outOfScope` 判据与
+> `SyncRunOptions` 总预算/`signal`、§6.6 的读写方向两个谓词也都按实现回写了。保留原文是为了让
+> 「当初错在哪」可查。
 
 - 本文件 §6.6 仍写 `isEntryFileName`，修复波已把它按方向拆成 `isEntryFileNameForRead(name, platform)`
   与 `isEntryFileNameForWrite(name)`（网络进来的名字一律走写方向）。§6.5 的端口形状也要跟上

@@ -91,9 +91,9 @@ describe("model config", () => {
 
 	it("reports every missing model with the exact wording and order", () => {
 		expect(modelConfigErrors(allOn(), () => true)).toEqual([
-			'no model for dream — set "dream.model" or "defaults.model" in memory.json',
-			'no model for extractMemories — set "extractMemories.model" or "defaults.model" in memory.json',
-			'no model for autoSurfacing — set "autoSurfacing.model" or "defaults.model" in memory.json',
+			'no model for dream — set "dream.model" or "defaults.model" in the host configuration',
+			'no model for extractMemories — set "extractMemories.model" or "defaults.model" in the host configuration',
+			'no model for autoSurfacing — set "autoSurfacing.model" or "defaults.model" in the host configuration',
 		]);
 	});
 
@@ -107,11 +107,21 @@ describe("model config", () => {
 		]);
 	});
 
+	it("configSource 由适配层注入：core 默认用中立词，不内置任何宿主的文件名", () => {
+		const errors = modelConfigErrors(allOn(), () => true);
+		expect(errors[0]).toContain("in the host configuration");
+		// `memory.json` 是 pi 的配置文件名，绝不能出现在 core 的文案里
+		expect(errors.join("\n")).not.toContain("memory.json");
+		expect(modelConfigErrors(allOn(), () => true, undefined, { configSource: "plugin row config" })[0]).toContain(
+			'in plugin row config',
+		);
+	});
+
 	it("requiredModel returns the resolved value and throws when missing", () => {
 		const c = allOn({ defaults: { model: "test/shared", sessionPersistence: { enabled: false } } });
 		expect(requiredModel(c, "extractMemories")).toBe("test/shared");
 		expect(() => requiredModel(allOn(), "dream")).toThrow(
-			'no model for dream — set "dream.model" or "defaults.model" in memory.json',
+			'no model for dream — set "dream.model" or "defaults.model" in the host configuration',
 		);
 	});
 
@@ -132,7 +142,7 @@ describe("model config", () => {
 		});
 
 		expect(modelConfigErrors(withoutDefaults, () => true)).toEqual([
-			'no model for dream — set "dream.model" or "defaults.model" in memory.json',
+			'no model for dream — set "dream.model" or "defaults.model" in the host configuration',
 		]);
 	});
 });
@@ -240,15 +250,24 @@ describe("sync 配置", () => {
 		expect(DEFAULT_CONFIG.sync.remote).toBe("");
 	});
 
-	it("syncConfigErrors：enabled 而 remote 为空 → 一条指向 memory.json 的可读错误", () => {
+	it("syncConfigErrors：enabled 而 remote 为空 → 一条指向配置来源的可读错误", () => {
 		const errors = syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true } }));
 		expect(errors).toEqual([
-			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
+			'sync is enabled but "sync.remote" is empty — set "sync.remote" in the host configuration or unset "sync.enabled"',
 		]);
 		// 初始化不是一条命令（它在启动路径上自动发生）：文案再把用户指向那条已移除的命令，
 		// 他敲下去只会得到「没有这个命令」，而真正该改的那个键一个字都没提到。
 		expect(errors[0]).not.toMatch(/sync init command/i);
-		expect(errors[0]).toContain("memory.json");
+		// core 不认识任何宿主的配置文件：默认文案只能指中立词，具体文件名由宿主注入。
+		expect(errors[0]).toContain("the host configuration");
+		expect(errors[0]).not.toContain("memory.json");
+	});
+
+	it("syncConfigErrors：configSource 由适配层注入（dsh 的行 config 形状）", () => {
+		const errors = syncConfigErrors(mergeConfig(DEFAULT_CONFIG, { sync: { enabled: true } }), {
+			configSource: "plugin row config",
+		});
+		expect(errors[0]).toContain('set "sync.remote" in plugin row config');
 	});
 
 	// 已初始化之后，origin 才是「同步到底去哪儿」的真相来源，配置里的 remote 只是「未初始化时的输入」。

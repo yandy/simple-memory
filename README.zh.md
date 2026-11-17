@@ -42,6 +42,10 @@ $XDG_DATA_HOME/simple-memory/<git|local>/<project>/
 机器上打开时落到同一批文件上。见 [pi-memory](./pi-memory)、[dsh-memory](./dsh-memory) 与
 [参考文档](./docs/reference/pi-memory.zh.md#跨设备同步)。
 
+一个已知语义：pi 在 `resume` / `fork` / `reload` 里沿用会话开始时录制的索引（改它会破坏 prompt cache），
+所以启动收敛照常跑、磁盘照常更新，但**本会话的 `memory_index` 里看不到刚同步来的记忆**，直到下一次
+compaction 或下一个会话。见[为什么索引要冻结](./docs/reference/pi-memory.zh.md#为什么索引要冻结)。
+
 ## 文档
 
 - 参考：[memory-core](./docs/reference/memory-core.zh.md) · [pi-memory](./docs/reference/pi-memory.zh.md) · [dsh-memory](./docs/reference/dsh-memory.zh.md)

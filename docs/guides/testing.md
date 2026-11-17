@@ -71,7 +71,8 @@ loadConfigMock.mockRejectedValueOnce(new Error("getAgentDir failed"));
 真机上插件一次都没激活）。
 
 各有宿主的包把「真机验过什么、怎么验、还有哪些限制」写在自己的参考文档里
-（`docs/reference/dsh-memory.md` 的「验证状态」一节）；
+（`docs/reference/dsh-memory.md` 的「验证状态」一节）；跨设备同步还有一层**真实托管远端**（网络 + 凭据）
+的验收，自动化测试覆盖不到，照 [sync-e2e.md](./sync-e2e.md) 手动走一遍。
 `memory-core` 另有冒烟脚本替它守发布形态（`scripts/pack-smoke.mjs`；`scripts/registry-smoke.mjs` 分
 `--workspace-core` 的仓内 tarball 模式与默认的 registry 模式）。
 这里不重复这些内容，避免同一份实现被两处文档追着改。

@@ -58,6 +58,11 @@ export interface SyncRuntimeOptions {
 		/** 未初始化却请求换远端时，指向宿主自己的配置来源。 */
 		uninitializedRemoteChange: string;
 		/**
+		 * 可选：在**错误文案**里称呼配置来源的方式（例如 `memory.json`、`plugin row config`）。
+		 * core 不内置宿主的文件名，不传时用中立的 `HOST_CONFIG_SOURCE`。
+		 */
+		configSource?: string;
+		/**
 		 * 可选：保留宿主对「origin 已改但后续失败」的既有措辞。
 		 *
 		 * `remote` 是原始输入，可能含 URL userinfo，不得未脱敏就写日志；`reason` 已脱敏，formatter
@@ -142,6 +147,7 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 	notices: string[];
 }> {
 	const { config, store, projectDir, identity, messages } = options;
+	const configSource = messages.configSource;
 	const now = options.now ?? ((): Date => new Date());
 	const sync = config.sync;
 	const enabled = sync?.enabled === true;
@@ -150,9 +156,10 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 	if (identity.kind !== "git") {
 		// 环境不支持（非 git 项目）是**降级**，不是故障：走预告通道，别让宿主把它渲染成红色 Error。
 		if (enabled) notices.push("Memory sync v1 only supports git projects; sync is disabled for this session.");
-		return { runtime: null, errors: syncConfigErrors(config).map(syncErrorMessage), notices };
+		return { runtime: null, errors: syncConfigErrors(config, { configSource }).map(syncErrorMessage), notices };
 	}
-	if (!enabled) return { runtime: null, errors: syncConfigErrors(config).map(syncErrorMessage), notices };
+	if (!enabled)
+		return { runtime: null, errors: syncConfigErrors(config, { configSource }).map(syncErrorMessage), notices };
 
 	const memoryRoot = resolve(config.memoryDir);
 	const syncRoot = syncRootPath(memoryRoot);
@@ -169,7 +176,7 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 		errors.push(`Failed to inspect memory sync state: ${syncErrorMessage(error)}`);
 	}
 
-	const configErrors = syncConfigErrors(config, { initialized }).map(syncErrorMessage);
+	const configErrors = syncConfigErrors(config, { initialized, configSource }).map(syncErrorMessage);
 	if (configErrors.length > 0) return { runtime: null, errors: [...errors, ...configErrors], notices };
 
 	if (initialized && remote.trim() !== "") {

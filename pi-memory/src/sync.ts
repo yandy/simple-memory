@@ -32,6 +32,9 @@ import type { MemoryConfig } from "./config";
 const ORIGIN_DRIFT_MESSAGE =
 	'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)';
 
+/** 错误文案里点名的配置来源：pi 的配置文件叫 memory.json（core 不内置这个名字）。 */
+export const PI_CONFIG_SOURCE = "memory.json";
+
 /** 尚未初始化却请求换远端：pi 的配置来源叫 memory.json。 */
 const UNINITIALIZED_REMOTE_CHANGE = 'sync is not initialized: set "sync.remote" in memory.json instead';
 
@@ -76,10 +79,14 @@ export async function createPiSyncRuntime(options: {
 		projectDir: options.projectDir,
 		identity: options.identity,
 		scheduling: "concurrent",
-		createBackend: (context) => createGitSyncBackend(context),
-		createEngine: (engineOptions) => createSyncEngine(engineOptions),
+		createBackend: (context) => createGitSyncBackend({ ...context, configSource: PI_CONFIG_SOURCE }),
+		createEngine: (engineOptions) => createSyncEngine({ ...engineOptions, configSource: PI_CONFIG_SOURCE }),
 		writeManifest,
-		messages: { originDrift: ORIGIN_DRIFT_MESSAGE, uninitializedRemoteChange: UNINITIALIZED_REMOTE_CHANGE },
+		messages: {
+			originDrift: ORIGIN_DRIFT_MESSAGE,
+			uninitializedRemoteChange: UNINITIALIZED_REMOTE_CHANGE,
+			configSource: PI_CONFIG_SOURCE,
+		},
 		now: options.now,
 	});
 }
