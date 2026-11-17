@@ -82,5 +82,5 @@ main tool / extract / dream, remote change with a reset baseline, and `unlock --
 stale root lock. Conflicts resolved to content-derived copies and converged.
 ```
 
-只走了子集时**把没走的条目显式写进「Not covered」**（pi 的当前记录就是这么写的：unlock 与凭据脱敏
-仍只有单元测试覆盖）。记录里只写做过什么、在什么环境下，不写迁移史。
+只走了子集时**把没走的条目显式写进「Not covered」**，补测通过后再把那一段删掉（pi 的记录就是这样
+从「两项未覆盖」变成「P1–P10 全通」的）。记录里只写做过什么、在什么环境下，不写迁移史。

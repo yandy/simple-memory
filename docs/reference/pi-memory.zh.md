@@ -229,8 +229,8 @@ session_shutdown
 - 降级路径（非 git 项目只出 notice、不建 `.sync`；`sync.remote` 为空是非致命配置错误，其余记忆功能
   照常）与 `resume` / `fork` / `reload` 上录制索引的已知语义。
 
-**没有**覆盖：手工遗留 `.sync/sync.lock` 后的 `/memory sync unlock`，以及带 token 的 HTTPS 远端的凭据
-脱敏。这两条目前仍只有单元测试覆盖。
+清单里的 P1–P10 已全部走通：除上面几条，还包括手工遗留 `.sync/sync.lock` 后的 `/memory sync unlock`，
+以及带 token 的 HTTPS 远端在报告与错误里的凭据脱敏。
 
 ## 模型配置
 

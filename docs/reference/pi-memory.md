@@ -310,8 +310,9 @@ Cross-device sync has been run **end to end against a real hosted git remote** o
   non-fatal config error while the rest of memory keeps working) and the frozen recorded index on
   `resume` / `fork` / `reload`.
 
-**Not covered** by that run: `/memory sync unlock` after a hand-made stale root lock, and credential
-redaction with a token-bearing HTTPS remote. Those two are still covered by unit tests only.
+All of P1–P10 have been walked: besides the items above, that includes `/memory sync unlock` after a
+hand-made stale root lock, and credential redaction (token shown as `***`) for a token-bearing HTTPS
+remote in reports and errors.
 
 ## Model configuration
 
