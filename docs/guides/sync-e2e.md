@@ -68,17 +68,19 @@ cd /tmp/e2e-project-a && git init -q . && pi
 
 ## 4. 回写 Verification status
 
-验收通过后，在 `docs/reference/dsh-memory.md` 与 `docs/reference/dsh-memory.zh.md` 的
-`## Verification status` 里，把「Cross-device sync is **not** covered by a real-host run」那段替换成
-实测记录，例如：
+- **pi**：`docs/reference/pi-memory.md` / `.zh.md` 的「跨设备同步」小节末尾有一个
+  `### Verification status` / `### 验证状态` —— 照实际走过的条目更新它。
+- **dsh**：`docs/reference/dsh-memory.md` / `.zh.md` 的 `## Verification status` 里，把
+  「Cross-device sync is **not** covered by a real-host run」那段替换成实测记录。
+
+dsh 的模板：
 
 ```md
-Cross-device sync **is** covered by a real-host run (2026-11-17, dsh `<version>`, GitHub over SSH,
+Cross-device sync **is** covered by a real-host run (<日期>, dsh `<version>`, <平台> over <协议>,
 branch `main`): init on an empty remote, pull on a second device, write-triggered debounced push for the
 main tool / extract / dream, remote change with a reset baseline, and `unlock --force` after a hand-made
-stale root lock. Conflicts resolved to content-derived copies and converged. P6/P7 的退出补推与
-监控降级路径 <走通 / 未走>。
+stale root lock. Conflicts resolved to content-derived copies and converged.
 ```
 
-`docs/reference/pi-memory.md` / `.zh.md` 目前**没有**这个章节：走完 P1–P10 后在其「跨设备同步」小节末尾
-加一段同格式的记录（只说做过什么、在什么环境下，不写迁移史）。
+只走了子集时**把没走的条目显式写进「Not covered」**（pi 的当前记录就是这么写的：unlock 与凭据脱敏
+仍只有单元测试覆盖）。记录里只写做过什么、在什么环境下，不写迁移史。

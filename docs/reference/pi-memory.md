@@ -296,6 +296,23 @@ without throwing, so status never presents a stale base as current.
 - Before the first initialisation there is no origin to change: it tells you to set `sync.remote` in
   `memory.json` instead.
 
+### Verification status
+
+Cross-device sync has been run **end to end against a real hosted git remote** over the network
+(2026-11-17) — not the local bare repositories the test suite uses:
+
+- first-time initialization with no `/memory sync init`, a write-triggered debounced push, a second device
+  pulling the same entries, and `/memory sync remote` changing the remote;
+- a conflict between two devices editing the same entry: the copy is named from content (`modified` +
+  content sha256 prefix), both versions are kept, and the sides converge after the next push;
+- the exit flush: a write followed by an immediate quit is pushed at the next session start;
+- the documented degradation paths (non-git project → notice only, no `.sync`; empty `sync.remote` →
+  non-fatal config error while the rest of memory keeps working) and the frozen recorded index on
+  `resume` / `fork` / `reload`.
+
+**Not covered** by that run: `/memory sync unlock` after a hand-made stale root lock, and credential
+redaction with a token-bearing HTTPS remote. Those two are still covered by unit tests only.
+
 ## Model configuration
 
 Every task that will run must resolve a model — **there is no shipped default and no parent-model fallback**. `defaults.model` satisfies all of them; a per-task `model` (`dream.model`, `extractMemories.model`, `autoSurfacing.model`) overrides it.

@@ -216,6 +216,22 @@ session_shutdown
 - `memory.json` **绝不会被改写**（这一层没有配置写入能力）—— 通知里会明说。想让新地址成为下次启动的配置默认值，请自己改文件。
 - 首次初始化之前没有 origin 可改：它会告诉你改 `memory.json` 里的 `sync.remote`。
 
+### 验证状态
+
+跨设备同步已对**真实托管 git 远端**端到端跑通（2026-11-17，走网络上的远端，而不是测试套件用的
+本地 bare 仓库）：
+
+- 首次初始化（没有 `/memory sync init`）、写入后的去抖推送、第二台设备从同一远端拉到同一批文件、
+  `/memory sync remote` 换远端；
+- 两台设备改同一条 entry 产生的冲突：副本按内容命名（`modified` + 内容 sha256 前 6 位），两份都保留，
+  各再推一轮后收敛；
+- 退出兜底：写入后立刻退出，下一次会话启动时补推成功；
+- 降级路径（非 git 项目只出 notice、不建 `.sync`；`sync.remote` 为空是非致命配置错误，其余记忆功能
+  照常）与 `resume` / `fork` / `reload` 上录制索引的已知语义。
+
+**没有**覆盖：手工遗留 `.sync/sync.lock` 后的 `/memory sync unlock`，以及带 token 的 HTTPS 远端的凭据
+脱敏。这两条目前仍只有单元测试覆盖。
+
 ## 模型配置
 
 会执行的任务必须能解析出模型 —— **既没有随包默认值，也没有父会话模型回退**。`defaults.model` 可以满足全部任务；各任务自己的 `model`（`dream.model` / `extractMemories.model` / `autoSurfacing.model`）优先于它。
