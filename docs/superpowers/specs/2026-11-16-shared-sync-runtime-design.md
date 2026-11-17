@@ -72,8 +72,9 @@ engine 与写触发 scheduler。但“怎样把这些能力装成一个可用的
 - core 源码和测试不得出现宿主 slash 命令与宿主事件名。含 `/memory sync remote ...` 的漂移提示必须由
   宿主注入，不能原样搬进 core。
 - 新公开符号只从 `memory-core/src/index.ts` 导出，不增加子路径 export。
-- backend 与 engine 都由工厂注入。core 拥有它们的生命周期与调用顺序，但不在通用 runtime 里写死
-  `createGitSyncBackend`；这也让现有宿主测试的包装工厂继续成为有效观察点。
+- backend、engine 与首份基线的 manifest writer 都由宿主从 core 公开出口注入。core 拥有它们的生命周期与
+  调用顺序，但不在通用 runtime 里写死 `createGitSyncBackend`；这也让现有宿主测试的包装工厂与
+  `writeManifest` 故障注入继续成为有效观察点，避免 core 内部相对 import 绕过包级测试替身。
 
 ## 4. 方案比较与选择
 
@@ -113,6 +114,8 @@ export interface SyncRuntimeOptions {
     branch: string;
   }): SyncBackend;
   createEngine(options: SyncEngineOptions): SyncEngine;
+  /** 首份基线的写入原语；由宿主从公开出口传入，保留故障注入观察点。 */
+  writeManifest: typeof writeManifest;
   messages: {
     /** 含宿主自己的命令指引；core 不内置 slash 命令。 */
     originDrift: string;
