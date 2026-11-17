@@ -14,14 +14,16 @@ import { SYNC_REMOTE_DRIFT_ERROR, syncErrorMessage } from "./sync.js";
  * 不是同步报告的格式。
  */
 
-/** 纯渲染包装：core 拥有全部字段与排序，dsh 不再维护第二份实现。 */
+/** 纯渲染包装：core 拥有全部字段与排序，dsh 不再维护第二份实现；出口再换成 dsh 的配置词汇。 */
 export function renderSyncRound(result: SyncRoundResult): string {
-	return renderCoreSyncRound(result);
+	return syncErrorMessage(renderCoreSyncRound(result));
 }
 
 /** 纯渲染包装：共同格式 + dsh 自己的漂移指引（origin 是真相来源，配置漂移只是一条非致命提醒）。 */
 export function renderSyncStatus(report: SyncStatusReport, configuredRemote: string): string {
-	return renderCoreSyncStatus(report, configuredRemote, { originDriftMessage: SYNC_REMOTE_DRIFT_ERROR });
+	return syncErrorMessage(
+		renderCoreSyncStatus(report, configuredRemote, { originDriftMessage: SYNC_REMOTE_DRIFT_ERROR }),
+	);
 }
 
 /** `/memory` 的轻量状态区：不调用 engine.status，因此不会联网或初始化。 */

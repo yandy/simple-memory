@@ -205,6 +205,47 @@ describe("sync rendering", () => {
 		expect(text).toContain("continuing to use origin");
 	});
 
+	it("renders a failed round reason in the row config vocabulary, not memory.json", () => {
+		const text = renderSyncRound(
+			round({
+				ok: false,
+				skipped: {
+					reason:
+						'the sync backend is not initialized: set "sync.remote" in memory.json so the host can initialize it',
+				},
+			}),
+		);
+
+		expect(text).toContain("Result: failed");
+		expect(text).toContain('set "sync.remote" in plugin row config so the host can initialize it');
+		expect(text).not.toContain("memory.json");
+	});
+
+	it("renders status errors in the row config vocabulary, not memory.json", () => {
+		const report: SyncStatusReport = {
+			configured: false,
+			initialized: false,
+			remote: "",
+			branch: "main",
+			device: { id: "device-id", hostname: "laptop", createdAt: "2026-11-16T00:00:00.000Z" },
+			projectDir: join(dir, "project-memory"),
+			projectKey: "example.com__owner__repo",
+			base: null,
+			ahead: [],
+			behind: [],
+			conflicts: [],
+			rejected: [],
+			unparsableLocal: [],
+			outOfScopeRemote: [],
+			errors: ['sync is not configured: set "sync.enabled" and "sync.remote" in memory.json'],
+		};
+		const text = renderSyncStatus(report, "");
+
+		expect(text).toContain("Errors (1):");
+		expect(text).toContain('set "sync.enabled" and "sync.remote" in plugin row config');
+		expect(text).not.toContain("memory.json");
+	});
+
 	it("appends ready, uninitialized, notice and error state to the normal memory status", async () => {
 		const cfg = config();
 		const rt = memoryRuntime(cfg);
