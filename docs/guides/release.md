@@ -6,37 +6,37 @@
 
 ## 顺序：`memory-core` 必须在 `pi-memory` 之前
 
-`pi-memory` 的 `dependencies` 指向 `@yandy0725/memory-core@^2.1.0`（跨设备同步用到的 core API 在 2.1.0
-才发布）。
+`pi-memory` 与 `dsh-memory` 的 `dependencies` 都指向 `@yandy0725/memory-core@^2.2.0`（跨设备同步的
+会话级编排 API 从 core 2.2.0 起才提供）。下面的步骤以发布 `pi-memory` 为例。
 
 - **core 不在 registry 上就发 `pi-memory`，得到的是一个装不上的包**：用户会拿到
-  `No matching version found for @yandy0725/memory-core@^2.1.0`。
+  `No matching version found for @yandy0725/memory-core@^2.2.0`。
 - 反过来安全：只发 core、不发 `pi-memory`，不影响任何现有用户。
-- **在 core 2.1.0 发布、且 workspace 的 `memory-core` 版本升到 2.1.0 之前，仓内 `npm ci` 必然失败**：
-  `npm error notarget No matching version found for @yandy0725/memory-core@^2.1.0`。这是「先发 core」
+- **在 core 2.2.0 发布、且 workspace 的 `memory-core` 版本升到 2.2.0 之前，仓内 `npm ci` 必然失败**：
+  `npm error notarget No matching version found for @yandy0725/memory-core@^2.2.0`。这是「先发 core」
   的顺序在闸门上说话，**不是**靠放宽范围或改锁能绕过的问题。
 
 ## 步骤
 
-### 0. 先发 `memory-core` 的新版本（本功能要求 2.1.0）
+### 0. 先发 `memory-core` 的新版本（本功能要求 2.2.0）
 
 ```bash
 # 1. 升 core 版本并提交（不动 pi-memory 的版本号）
-npm version 2.1.0 --workspace=memory-core --no-git-tag-version
+npm version 2.2.0 --workspace=memory-core --no-git-tag-version
 git add memory-core/package.json package-lock.json
-git commit -m "memory-core v2.1.0"
+git commit -m "memory-core v2.2.0"
 COMMIT=$(git rev-parse HEAD)
 
-# 2. 此刻 workspace 版本才满足 ^2.1.0，npm ci 与全量校验才有意义
+# 2. 此刻 workspace 版本才满足 ^2.2.0，npm ci 与全量校验才有意义
 npm ci && npm run typecheck && npm run lint && npm test
 git push origin main
 
 # 3. 创建 GitHub Release（gh 自动创建 tag；--target 必须是完整 SHA）
-gh release create memory-core-v2.1.0 --target "$COMMIT" \
-  --title "memory-core v2.1.0" --notes ""
+gh release create memory-core-v2.2.0 --target "$COMMIT" \
+  --title "memory-core v2.2.0" --notes ""
 ```
 
-然后按下面「验收」一节确认 2.1.0 在 registry 上真的可查、latest 已翻过去、shasum 对得上。
+然后按下面「验收」一节确认 2.2.0 在 registry 上真的可查、latest 已翻过去、shasum 对得上。
 
 ### 1. 再发 `pi-memory`（必须等上一步验收通过）
 
@@ -47,7 +47,7 @@ git add pi-memory/package.json package-lock.json
 git commit -m "pi-memory v<新版本号>"
 COMMIT=$(git rev-parse HEAD)
 
-# 2. 全量校验 + 运行时解析闸门（这一次会真的从 registry 装 core 2.1.0）
+# 2. 全量校验 + 运行时解析闸门（这一次会真的从 registry 装 core 2.2.0）
 npm ci && npm run typecheck && npm run lint && npm test
 npm run build -w memory-core -w dsh-memory
 npm run smoke:registry -- pi-memory
@@ -70,15 +70,15 @@ PR 的 `workspace-smoke` 把 core 与适配层各自的**仓内 tarball** 在干
 所以当核心的新版本还没发布时，这条路径**客观上无法验证**，也不会用 workspace 的结果冒充。脚本按
 「声明的范围在 registry 上存不存在」与「适配层自己是否已发布」分三种情形：
 
-- **适配层已发布、而 `dependencies` 里的 core 范围在 registry 上不存在** → **硬失败**。本功能就是这种：
-  `pi-memory@4.0.1` 已经在 registry 上，把范围改成 `^2.1.0` 之后立刻报
+- **适配层已发布、而 `dependencies` 里的 core 范围在 registry 上不存在** → **硬失败**。上一次（`2.1.0`）
+  发布时就是这种：`pi-memory@4.0.1` 已经在 registry 上，把范围改成 `^2.1.0` 之后立刻报
   `@yandy0725/pi-memory: registry 上查不到满足 "@yandy0725/memory-core@^2.1.0" 的版本，而
   @yandy0725/pi-memory@4.0.1 已发布 —— 这份声明装不起来`。这是发布前的**闸门**：不许用降低依赖范围或跳过 job 来「修」它。
 - **发布进行中**（核心范围在 registry 上查不到，**且**适配层自己声明的版本也未发布）→ `::notice::` 跳过，
   不报错。不要把它当成代码错，也不要把跳过看成验证通过。
 - **范围在 registry 上查得到** → 真装一遍，并断言解析到的 core 带声明的版本范围。
 
-因此顺序固定为：先发 core → 在 registry 上确认新版本可查 → 再升 `pi-memory` 版本并发布。在 core 2.1.0
+因此顺序固定为：先发 core → 在 registry 上确认新版本可查 → 再升 `pi-memory` 版本并发布。在 core 2.2.0
 上架之前，main 的 `registry-smoke` job 会一直是红的（硬失败），那是闸门在正常工作；PR 则先由
 `workspace-smoke` 验证仓内 tarball，不以它为借口跳过发布后的 registry 验收。
 
@@ -97,7 +97,7 @@ npm 的 publish 成功不等于 registry 立刻可查（会先返回「being pro
 
 ```bash
 # 1. 轮询版本文档到 200
-curl -s -o /tmp/v.json -w "%{http_code}\n" https://registry.npmjs.org/@yandy0725%2Fmemory-core/2.1.0
+curl -s -o /tmp/v.json -w "%{http_code}\n" https://registry.npmjs.org/@yandy0725%2Fmemory-core/2.2.0
 # 2. 把 dist.shasum 与 publish 日志里 npm notice 打的 shasum: 逐字比对
 node -e 'console.log(require("/tmp/v.json").dist.shasum)'
 # 3. 确认 dist-tags.latest 已翻到新版本

@@ -208,9 +208,9 @@ agent/disposed
 - **Per-session, not per-process**: unlike pi's single `syncRuntime` variable, dsh keeps a
   `sessionId → runtime` map, because one long-lived host process serves many sessions (same reason the
   store registry and index cache are keyed by session). Re-creating an agent with the same `sessionId`
-  (host `clear` / `compact`) disposes the previous runtime first, so a stale automatic round can never
-  write to the remote across generations. `apply`'s own disposer drains every remaining session's
-  runtime the same way.
+  (host `clear` / `compact`) awaits the previous generation's disposal in `agent/created` before the new
+  runtime is prepared, so a stale automatic round can never write to the remote across generations.
+  `apply`'s own disposer drains every remaining session's runtime the same way.
 
 ### Orchestration lives in core; dsh keeps host policy
 
@@ -226,9 +226,10 @@ trigger and `dispose`. What dsh injects and keeps:
 - **Host wording**: the drift hint points at the row config and `/memory sync remote`; "origin already
   changed, but prepare/follow-up failed" keeps dsh's established phrasing through
   `formatRemoteChangeFailure`; the text output still maps `memory.json` to `plugin row config`.
-- **Host lifecycle and ledgers**: awaiting `startup()` in `agent/created` before the first index snapshot,
-  `await dispose()` in `agent/disposed` (no exit flush), the per-session runtime/errors/notices map, the
-  index refresh after a manual round, command parsing and the `--force` confirmation.
+- **Host lifecycle and ledgers**: in `agent/created`, awaiting the previous generation's disposal and then
+  `startup()` before the first index snapshot; in `agent/disposed`, fire-and-forget disposal
+  (`void disposeSyncSession(sessionId)`, no exit flush); plus the per-session runtime/errors/notices map,
+  the index refresh after a manual round, command parsing and the `--force` confirmation.
 
 ### Commands
 

@@ -182,8 +182,9 @@ agent/disposed
   `/memory sync` 会复述这条原因，而不是笼统地说「同步没开」。
 - **按会话，不是按进程**：不同于 pi 的单个 `syncRuntime` 变量，dsh 用一张 `sessionId → runtime` 的表，
   因为一个长寿命宿主进程要服务很多会话（与 store registry、index cache 按 session 分键是同一个理由）。
-  同一个 `sessionId` 重建 agent（宿主 `clear` / `compact`）时会先 dispose 上一代 runtime，所以陈旧的
-  自动轮次绝不会跨代写远端。`apply` 自己的 disposer 也会同样排空剩下每个会话的 runtime。
+  同一个 `sessionId` 重建 agent（宿主 `clear` / `compact`）时，`agent/created` 会先 await 上一代
+  runtime 的 dispose 再准备新一代，所以陈旧的自动轮次绝不会跨代写远端。`apply` 自己的 disposer
+  也会同样排空剩下每个会话的 runtime。
 
 ### 编排在 core，dsh 只留宿主策略
 
@@ -197,9 +198,10 @@ agent/disposed
 - **宿主文案**：漂移指引指向行 config 与 `/memory sync remote`；「origin 已切换，但 prepare/后续操作
   失败」经 `formatRemoteChangeFailure` 保留 dsh 的既有措辞；文本出口仍把 `memory.json` 换成
   `plugin row config`。
-- **宿主生命周期与账本**：`agent/created` 中 await `startup()` 且排在第一次索引快照之前、
-  `agent/disposed` 的 `await dispose()`（没有退出 flush）、按 session 保存 runtime/errors/notices、
-  手动轮次后的索引刷新、命令解析与 `--force` 确认。
+- **宿主生命周期与账本**：`agent/created` 中先 await 上一代的 dispose，再 await `startup()` 且排在
+  第一次索引快照之前；`agent/disposed` 只是 fire-and-forget 收摊（`void disposeSyncSession(sessionId)`，
+  没有退出 flush）；此外还有按 session 保存 runtime/errors/notices、手动轮次后的索引刷新、命令解析与
+  `--force` 确认。
 
 ### 命令
 
