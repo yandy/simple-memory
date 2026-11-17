@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { lstat, stat } from "node:fs/promises";
 import { join, posix, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
 import { windowsSafeName } from "./windows-names.js";
@@ -242,11 +243,40 @@ export function assertInsideRoot(base: string, dir: string, platform: NodeJS.Pla
 }
 
 export async function resolveMemoryDir(config: { memoryDir: string }, cwd: string): Promise<string> {
-	const { kind, key } = await projectIdentity(cwd);
 	// 相对路径配置（如 `"./memory"`）固化成绝对路径：逻辑锁的 key 用这个字符串，
 	// 同一目录的不同写法不该得到两把锁（见 `memory-store.ts` 的 `#logicalKey`）。
 	const base = resolve(config.memoryDir);
+	// 根不可用时先失败，不去 spawn git：错的是配置，不是项目身份。
+	await assertUsableRoot(base);
+	const { kind, key } = await projectIdentity(cwd);
 	const dir = join(base, kind, projectDirName(key));
 	assertInsideRoot(base, dir);
 	return dir;
+}
+
+/**
+ * 根必须是**可用目录**或**还不存在**（写入路径会 `mkdir -p`）。
+ *
+ * 这两种之外的情况必须现在就报出来：
+ * - 存在但不是目录（同名文件、共享盘上被别的程序占位的 `E:` 之类）；
+ * - 悬空符号链接 / Windows 目录联结 —— 目标目录还没建好时，`mkdir` 在链接上抛的是裸
+ *   `ENOTDIR: not a directory, mkdir '…'`，而这恰好是「两个系统共用同一个记忆根」时最容易
+ *   踩的一步（链接先建、目标后建，或者只在一侧建好了）。
+ *
+ * 判据用 `stat`（跟随链接）+ `lstat`（看链接本身）：`stat` 对悬空链接是 `ENOENT`，与「根不存在」
+ * 不区分，只有 `lstat` 能分辨。两条都是 best-effort —— 只看得到「现在」的状态，之后被外部
+ * 删掉/换掉仍由写入路径的原始错误暴露。
+ */
+async function assertUsableRoot(base: string): Promise<void> {
+	const info = await stat(base).catch(() => null);
+	if (info) {
+		if (info.isDirectory()) return;
+		throw new Error(`Refusing to use memory root ${base}: it exists but is not a directory`);
+	}
+	const link = await lstat(base).catch(() => null);
+	if (link?.isSymbolicLink()) {
+		throw new Error(
+			`Refusing to use memory root ${base}: it is a symbolic link (or Windows junction) whose target does not exist`,
+		);
+	}
 }

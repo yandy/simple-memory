@@ -117,6 +117,11 @@ dsh plugin --profile web remove @yandy0725/dsh-memory
 `/memory` 的第一行会打印解析出的 `Dir:`，这正是用来发现这种不一致的入口：两边的 `Dir:` 对不上，
 就是配置没对齐。
 
+`memoryDir` 本身还有一道形状校验：**另一个平台**写法的绝对路径（POSIX 上的 `E:/…` / `\\server\share`，
+Windows 上的 `/mnt/…`）、空值，以及「根存在但不是目录」或悬空符号链接/联结，都会让这个 session 进入
+错误态（不建 store、不注册工具，`/memory` 打印原因），而**不是**被 `resolve()` 悄悄落到工作目录下开一个
+新库。这道校验不依赖环境变量或平台配置，零配置即可用。
+
 ## 跨设备同步
 
 dsh-memory 可以把一个项目的记忆 entry 同步到**一个 git 远端**，同一仓库在另一台机器上打开时会落到

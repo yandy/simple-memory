@@ -132,6 +132,12 @@ directories and the sharing fails silently.
 The first line of `/memory` prints the resolved `Dir:` — that is the intended way to spot this: if the
 two `Dir:` lines disagree, the configuration is not aligned.
 
+`memoryDir` is also validated for **shape**: an absolute path written for the other platform
+(`E:/…` / `\\server\share` on POSIX, `/mnt/…` on Windows), an empty value, and a root that exists but is
+not a directory (or a dangling symlink/junction) put the session into the error state — no store, no tool,
+and `/memory` prints why. They are never silently re-rooted under the working directory by `resolve()`.
+The check needs no environment variable or platform-specific configuration.
+
 ## Cross-device sync
 
 dsh-memory can replicate a project's memory entries to **one git remote**, so the same repository opened

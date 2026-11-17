@@ -29,7 +29,14 @@ import {
 	withFsRetry,
 } from "@yandy0725/memory-core";
 import { createPiHeadlessAgent } from "./src/agent-runner";
-import { type LoadedConfig, legacyMemoryRoot, loadConfig, type MemoryConfig, modelConfigErrors } from "./src/config";
+import {
+	type LoadedConfig,
+	legacyMemoryRoot,
+	loadConfig,
+	type MemoryConfig,
+	modelConfigErrors,
+	pathConfigErrors,
+} from "./src/config";
 import { createPiTranscript } from "./src/host-transcript";
 import { readRecordedMemoryIndex } from "./src/index-source";
 import { applyIndexSection } from "./src/inject-pi";
@@ -513,14 +520,21 @@ export default function (pi: ExtensionAPI) {
 			// 启动校验（spec §2.3）：模型键缺失 / 不可解析 → 本会话**完全不初始化**
 			//（不解析目录、不建 store、不注册工具），错误态由 `/memory` 重复显示。
 			// 校验本身抛错（registry 不合契约）也走同一个 catch：failConfig 自己会复位运行时。
-			const errors = modelConfigErrors(
-				loaded.config,
-				(value) => resolveModel(value, modelRegistry) !== undefined,
-				undefined,
-				{
-					configSource: PI_CONFIG_SOURCE,
-				},
-			);
+			// 路径错误排在模型错误之前：`memoryDir` 指错地方时，后面所有「能不能用」的判断都没意义。
+			// 它守的是**静默分叉**：另一个平台写法的绝对路径会被 `resolve()` 改写成相对 cwd 的
+			// 路径（POSIX 上的 `E:/…`、win32 上的 `/mnt/…`），于是记忆落进一个用户没预期的
+			// 新库 —— 现象就是「记忆全丢了」（issue #12）。
+			const errors = [
+				...pathConfigErrors(loaded.config, process.platform, { configSource: PI_CONFIG_SOURCE }),
+				...modelConfigErrors(
+					loaded.config,
+					(value) => resolveModel(value, modelRegistry) !== undefined,
+					undefined,
+					{
+						configSource: PI_CONFIG_SOURCE,
+					},
+				),
+			];
 			if (errors.length > 0) {
 				failConfig(errors, syncUi);
 				return;

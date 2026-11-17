@@ -146,6 +146,27 @@ describe("resolveRowConfig", () => {
 		expect(resolveRowConfig({ memoryDir: "~\\.agent\\memory" }, "linux").config.memoryDir).toBe("~\\.agent\\memory");
 	});
 
+	// issue #12：另一个平台写法的绝对 memoryDir 会被 `resolve()` 悄悄改写成「相对 cwd」的路径，
+	// 于是记忆落进一个用户没预期的新库。行 config 这一侧必须把错误交出去（`prepare` 会把它变成
+	// 该 session 的 error 态，不建 store）。
+	it("reports a foreign-platform memoryDir as an error instead of mis-rooting it", () => {
+		const posixHost = resolveRowConfig({ memoryDir: "E:/shared/pi-memory" }, "linux");
+		expect(posixHost.error).toContain('"memoryDir"');
+		expect(posixHost.error).toContain("E:/shared/pi-memory");
+		expect(posixHost.error).toContain("plugin row config");
+		expect(posixHost.warnings).toEqual([]);
+		// 值原样保留：`/memory` 要把用户写的那个值显示出来
+		expect(posixHost.config.memoryDir).toBe("E:/shared/pi-memory");
+
+		const winHost = resolveRowConfig({ memoryDir: "/mnt/shared/pi-memory" }, "win32");
+		expect(winHost.error).toContain('"memoryDir"');
+		expect(winHost.error).toContain("/mnt/shared/pi-memory");
+
+		// 同平台写法照旧放行：这条守卫只挡「平台与值不匹配」
+		expect(resolveRowConfig({ memoryDir: "/mnt/shared/pi-memory" }, "linux").error).toBeNull();
+		expect(resolveRowConfig({ memoryDir: "E:/shared/pi-memory" }, "win32").error).toBeNull();
+	});
+
 	it("never mutates DEFAULT_CONFIG, even when merging a real overlay", () => {
 		const before = structuredClone(DEFAULT_CONFIG);
 		resolveRowConfig(undefined);

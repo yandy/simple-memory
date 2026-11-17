@@ -1,5 +1,6 @@
-import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, mergeConfig } from "@yandy0725/memory-core";
+import { DEFAULT_CONFIG, defaultMemoryRoot, expandTilde, mergeConfig, pathConfigErrors } from "@yandy0725/memory-core";
 import type { MemoryConfig } from "@yandy0725/memory-core";
+import { DSH_CONFIG_SOURCE } from "./sync.js";
 
 /**
  * dsh-memory 唯一的配置层。
@@ -144,5 +145,9 @@ export function resolveRowConfig(row: unknown, platform?: NodeJS.Platform): Reso
 
 	const config = mergeConfig({ ...DEFAULT_CONFIG, memoryDir: defaultMemoryRoot() }, overlay);
 	config.memoryDir = expandTilde(config.memoryDir, platform);
-	return { config, warnings, error: null };
+	// 路径守卫：另一个平台写法的绝对路径会被 `resolve()` 改写成「相对 cwd」的路径，于是记忆落进
+	// 一个新库。它比 warnings 严重（地址错了就没什么可用的），所以走 `error`：`prepare` 会因此
+	// 不建 store、将该 session 置为错误态。`config` 仍原样返回，好让 `/memory` 把用户写的值显示出来。
+	const pathErrors = pathConfigErrors(config, platform, { configSource: DSH_CONFIG_SOURCE });
+	return { config, warnings, error: pathErrors.length > 0 ? pathErrors.join("\n") : null };
 }

@@ -412,4 +412,49 @@ describe("index wiring — config errors", () => {
 		expect(notify.mock.calls[0][0]).not.toContain("misconfigured");
 		expect(tools).toHaveLength(1);
 	});
+
+	// issue #12：另一个平台写法的绝对 memoryDir 会被 `resolve()` 悄悄改写成「相对 cwd」的路径，
+	// 于是记忆落进 `E:` 这种目录、用户看到的是「记忆全丢了」。它必须是一条配置错误。
+	it.skipIf(process.platform === "win32")(
+		"reports a config error for a Windows memoryDir on POSIX and creates nothing",
+		async () => {
+			await s.writeConfig({ memoryDir: "E:/shared/pi-memory" });
+			const notify = vi.fn();
+			const ui = () => s.uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn().mockResolvedValue(true), setStatus: vi.fn() } });
+			const { pi, commands, handlers } = createFakePi();
+			memoryFactory(pi as any);
+
+			await handlers["session_start"][0]({}, ui());
+
+			expect(notify).toHaveBeenCalledTimes(1);
+			expect(notify.mock.calls[0][1]).toBe("error");
+			expect(notify.mock.calls[0][0].split("\n")[0]).toBe("pi-memory config error:");
+			expect(notify.mock.calls[0][0]).toContain('"memoryDir"');
+			expect(notify.mock.calls[0][0]).toContain("E:/shared/pi-memory");
+
+			// 关键断言：cwd 下不得出现 `E:` 目录 —— 那正是静默分叉的产物
+			expect(await readdir(s.cwd)).not.toContain("E:");
+
+			// store 没建：状态块报 misconfigured，且不沿用任何目录
+			await commands["memory"].handler("", ui());
+			expect(notify.mock.calls[1][0].split("\n")[0]).toBe("Memory: misconfigured");
+			expect(notify.mock.calls[1][0]).toContain('"memoryDir"');
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"reports a config error for a POSIX-rooted memoryDir on win32",
+		async () => {
+			await s.writeConfig({ memoryDir: "/mnt/shared/pi-memory" });
+			const notify = vi.fn();
+			const { pi, handlers } = createFakePi();
+			memoryFactory(pi as any);
+
+			await handlers["session_start"][0]({}, s.uiCtx({ hasUI: true, ui: { notify, confirm: vi.fn(), setStatus: vi.fn() } }));
+
+			expect(notify).toHaveBeenCalledTimes(1);
+			expect(notify.mock.calls[0][0]).toContain('"memoryDir"');
+			expect(notify.mock.calls[0][0]).toContain("/mnt/shared/pi-memory");
+		},
+	);
 });

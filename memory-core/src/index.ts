@@ -84,6 +84,7 @@ export {
 	expandTilde,
 	mergeConfig,
 	modelConfigErrors,
+	pathConfigErrors,
 	requiredModel,
 	requiredModels,
 	syncConfigErrors,
