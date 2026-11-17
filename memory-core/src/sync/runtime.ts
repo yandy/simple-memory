@@ -380,10 +380,15 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 	): SyncRuntimeOutcome<null> {
 		const cleanReason = syncErrorMessage(reason);
 		if (messages.formatRemoteChangeFailure === undefined) return { ok: false, reason: cleanReason };
-		return {
-			ok: false,
-			reason: syncErrorMessage(messages.formatRemoteChangeFailure({ remote, originChanged, stage, reason: cleanReason })),
-		};
+		try {
+			return {
+				ok: false,
+				reason: syncErrorMessage(messages.formatRemoteChangeFailure({ remote, originChanged, stage, reason: cleanReason })),
+			};
+		} catch {
+			// 宿主诊断自身失败时保留已脱敏的原 reason，绝不能越过 replacement 恢复收尾。
+			return { ok: false, reason: cleanReason };
+		}
 	}
 
 	/** 无论原结果成败都恢复写触发；恢复自己的错误追加在原诊断之后，而不是吞掉它。 */

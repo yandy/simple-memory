@@ -426,6 +426,58 @@ describe("changeRemote 诊断与恢复", () => {
 		expect(h.engines[1].noteWrites).toBe(1);
 	});
 
+	it("prepare 失败且 formatter 抛错时仍恢复一次，公开 outcome 不泄露原始 rejection", async () => {
+		const messages: SyncRuntimeOptions["messages"] = {
+			...HARNESS_MESSAGES,
+			formatRemoteChangeFailure() {
+				throw new Error("formatter failed for https://formatter-token@example.invalid/diagnostic.git");
+			},
+		};
+		const { h, runtime } = await harnessFor({ messages });
+		const oldEngine = await prepareOldEngine(h, runtime);
+		h.backend.initFailure = new Error("prepare failed for https://prepare-token@example.invalid/new.git");
+
+		const changed = await runtime.changeRemote(NEXT_REMOTE, 1000);
+
+		expect(changed).toEqual({
+			ok: false,
+			reason: "prepare failed for https://***@example.invalid/new.git",
+		});
+		expect(JSON.stringify(changed)).not.toContain("prepare-token");
+		expect(JSON.stringify(changed)).not.toContain("formatter-token");
+		expect(h.engines).toHaveLength(2);
+		expect(oldEngine.noteWrites).toBe(0);
+		expect(h.engines[1].noteWrites).toBe(1);
+		expect(runtime.engine).toBe(h.engines[1]);
+	});
+
+	it("operation 失败且 formatter 抛错时仍恢复一次，公开 outcome 不泄露原始 rejection", async () => {
+		const messages: SyncRuntimeOptions["messages"] = {
+			...HARNESS_MESSAGES,
+			formatRemoteChangeFailure() {
+				throw new Error("formatter failed for https://formatter-token@example.invalid/diagnostic.git");
+			},
+		};
+		const { h, runtime } = await harnessFor({ messages });
+		const oldEngine = await prepareOldEngine(h, runtime);
+		h.backend.initWarnings = ["baseline warning"];
+
+		const changed = await runtime.changeRemote(NEXT_REMOTE, 1000, () => {
+			throw new Error("warning callback failed for https://operation-token@example.invalid/new.git");
+		});
+
+		expect(changed).toEqual({
+			ok: false,
+			reason: "warning callback failed for https://***@example.invalid/new.git",
+		});
+		expect(JSON.stringify(changed)).not.toContain("operation-token");
+		expect(JSON.stringify(changed)).not.toContain("formatter-token");
+		expect(h.engines).toHaveLength(2);
+		expect(oldEngine.noteWrites).toBe(0);
+		expect(h.engines[1].noteWrites).toBe(1);
+		expect(runtime.engine).toBe(h.engines[1]);
+	});
+
 	it("恢复 noteWrite 自身失败时，错误追加到原失败 reason 且只尝试一次", async () => {
 		let created = 0;
 		const { h, runtime } = await harnessFor({
