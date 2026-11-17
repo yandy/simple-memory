@@ -179,6 +179,21 @@ session_shutdown
 - **退出兜底**：即使去抖还没到点也 flush 一次，这一轮的上限是 `sync.autoTimeoutMs`；在途等待的上限仍是既有写入用的 `lock.timeoutMs`。flush 失败只产生一条 `Memory sync flush failed: … local changes will be retried at the next session start.` —— 内容仍在本地，下一轮就会补推：下次会话启动（`pullOnStart` 默认开启）或下一次写入的去抖推送。若 `pushOnWrite` 与 `pullOnStart` 都关了，用 `/memory sync push`。
 - **录制索引（已知语义，不是 bug）**：`resume` / `fork` / `reload` 冻结 transcript 里录制的索引值。启动收敛照样跑、磁盘照样更新，但同步来的记忆**不会**出现在本会话的 `memory_index` 里，直到下一次 compaction（或下一个会话）。`/memory sync status` 的最后一行会说明这一点。
 
+### 编排在 core，pi 只留宿主策略
+
+会话级同步编排由 `@yandy0725/memory-core` 的 `createSyncRuntime` 提供：配置门禁、懒 engine、`prepare`、
+启动与手动轮次、严格 dry-run 的 `status`、`changeRemote` 的持久顺序、写触发与 `dispose`。pi 只注入自己的
+那一半：
+
+- **调度 `concurrent`**：启动与手动轮次在调用返回前就起跑并登记，与 pi 的其他会话级工作并发；`prepare`
+  是 single-flight，并发的准备共用同一次。
+- **注入原语**：backend、engine 与首份基线的 `writeManifest` 都从 core 公开出口传入，所以接线测试里的
+  包装工厂继续命中真实实现。
+- **文案与展示**：漂移指引（指向 `memory.json` 与 `/memory sync remote`）、报告尾部那行「索引只在本会话
+  内冻结」，以及 `pi-memory sync notice:` / `pi-memory sync error:` 的前缀与 notice/error 级别。
+- **宿主生命周期**：`session_start` 中 await `startup()` 且排在索引值选定之前、`session_shutdown` 的
+  `flush()` 与有界等待、`dispose()` 只收摊；命令解析与确认、错误/预告账本也都在这一侧。
+
 ### 命令
 
 ```

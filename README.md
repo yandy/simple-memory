@@ -39,9 +39,9 @@ in every harness, or sharing silently stops working.
 
 ## Cross-device sync
 
-Memory is local by default. `pi-memory` can push this project's memory to a git remote (off by default),
-so another machine working on the same repository lands on the same files; dsh does not wire sync up yet.
-See [pi-memory](./pi-memory) and the [reference](./docs/reference/pi-memory.md#cross-device-sync).
+Memory is local by default. Both adapters can push this project's memory to a git remote (off by default),
+so another machine working on the same repository lands on the same files. See [pi-memory](./pi-memory),
+[dsh-memory](./dsh-memory) and the [reference](./docs/reference/pi-memory.md#cross-device-sync).
 
 ## Docs
 

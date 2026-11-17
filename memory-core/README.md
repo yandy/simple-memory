@@ -3,8 +3,9 @@
 English | [中文](./README.zh.md)
 
 Harness-agnostic, file-system driven memory layer. One memory is one Markdown file, listed on a single
-line in `MEMORY.md`; the store, two-level locking, snapshot rollback, injection policy, and the LLM
-orchestration around them all live here. `src/**` imports only `node:*` and relative paths.
+line in `MEMORY.md`; the store, two-level locking, snapshot rollback, injection policy, the LLM
+orchestration around them, and session-level sync orchestration all live here. `src/**` imports only
+`node:*` and relative paths.
 
 Adapters own the host-specific half: when to inject, how to render, which model to call. This package
 owns the half that must be identical everywhere — which is why two harnesses on one machine share one
@@ -56,6 +57,7 @@ and `runTask` for autoSurfacing / extractMemories / dream.
 | Orchestration | the three task descriptors in `TASKS` and the `runTask` entry point, over `HeadlessAgentPort` / `HostTranscriptPort` |
 | Injection policy | index windowing, entry truncation, capacity reporting, `scanEntries`, `renderSurfacedBlock` — pure functions returning strings |
 | Tool contract | action sets, JSON Schema, model-facing text, `createMemoryActionHandler` |
+| Cross-device sync | `createSyncEngine` (one convergence round) + `createSyncRuntime` (session orchestration: config gate, lazy engine, startup/manual rounds, remote change, write trigger, dispose) + the `SyncBackend` port with its git implementation, manifests and report rendering; transport, engine and baseline writer are injected by the adapter |
 | Config | defaults, `mergeConfig`, `~` expansion, model validation, `defaultMemoryRoot()` — no file IO |
 
 No LLM call, no UI, no host API. `tests/neutrality.test.ts` enforces that, and it is the only reason a

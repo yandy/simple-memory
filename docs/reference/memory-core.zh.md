@@ -138,6 +138,38 @@ type HeadlessOutcome =
 「关掉 builtin、只留 `memory` 工具」必须用别的方式表达。pi 的方式是 `noTools: "builtin"`；
 在 pi 上传 `tools: []` 会把 `memory` 工具一起悄悄滤掉，于是 dream 一个原语都调不到却照样「成功」。
 
+### 跨设备同步的编排层
+
+同步分两层，分界与本包其余部分一致：
+
+- `createSyncEngine` 收敛**一轮**：远端快照 + 本地扫描 + 上次基线 → 三方差集、冲突收敛、快照、落盘、
+  重建索引、发布。
+- `createSyncRuntime` 把一轮变成**会话级 runtime**：配置门禁、懒 engine、`prepare`、`startup` / `run` /
+  `status` / `flush`、`changeRemote`、写触发与 `dispose`。
+
+runtime 自己什么都不装配：backend、engine 与首份基线的 writer（`writeManifest`）都由适配层从本包公开
+出口注入，另外注入自己的文案（`originDrift`、`uninitializedRemoteChange`，可选
+`formatRemoteChangeFailure`）。core 拥有它们的生命周期与调用顺序，但既不选传输实现，也不读配置文件。
+
+`scheduling` 是真实的会话行为选择，不是重构开关：
+
+| 模式 | 谁在用 | 行为 |
+|---|---|---|
+| `concurrent` | pi | `startup` / `run` / `status` / `flush` 在公开调用返回前就起跑并登记为活动；并发 `prepare` 共用一次 flight |
+| `serial` | dsh | `startup` / `run` / `status` / `flush` / `changeRemote` 排一条 FIFO；已排队的操作允许跑完，后来的等它 |
+
+两种模式共用同一条 `changeRemote` 持久顺序（关闸 → 排空 → dispose 旧 engine → 等它 `inFlight` 落定 →
+删本项目 manifest → `setRemote` → 按同一流程建新空基线 → 恰好一次 replacement `noteWrite()`）与同一个
+`dispose()` 契约：同步部分关闸、abort、dispose，返回的 promise 只 drain，**绝不** flush。
+
+共同报告格式也在本包：`renderSyncRound` / `renderSyncStatus` 拥有字段集合、排序去重、失败轮展开与
+revision 空/缺区分；`syncErrorMessage` 是全部同步错误文本唯一的归一化与脱敏出口，git backend 拼自己的
+错误文本时复用同一个 `redactCredentials` 实现。展示策略仍归适配层：漂移提示与尾部行由宿主注入，
+通知前缀与 notice/error 级别、错误账本留在宿主，宿主可在自己的出口再做配置词汇替换。
+
+仍留宿主的事：哪个宿主事件调用 `startup` / `flush` / `dispose`（长寿命宿主可以完全没有退出 flush）、
+命令解析与确认、通知与错误账本、索引的冻结/刷新策略，以及按会话保存的状态。
+
 ### 本包刻意不管的事
 
 | 关注点 | 为什么留在适配层 |
@@ -173,6 +205,7 @@ type HeadlessOutcome =
 | `memory` 工具 | `memoryToolSchema`、`MEMORY_TOOL_*`、`createMemoryActionHandler` | typebox + `ToolDefinition` + pi-tui 渲染 + `ctx.ui.notify` |
 | dream / extract 轮次 | `runTask(TASKS.dream, …)`、`runTask(TASKS.extractMemories, …)`、prompt 文本 | `createPiHeadlessAgent` 里的 `createAgentSession` |
 | 搜历史会话 | `HostTranscriptPort.searchSessions` | `SessionManager` |
+| 跨设备同步 | `createSyncRuntime`、`createSyncEngine`、`createGitSyncBackend`、`renderSyncRound`/`renderSyncStatus` | `createPiSyncRuntime`（`scheduling: "concurrent"`）+ `memory.json` 配置、宿主事件、命令与通知 |
 
 ## Windows
 
