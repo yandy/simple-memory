@@ -13,7 +13,7 @@ import {
 	type HarnessResult,
 	type SyncRuntimeHarness,
 } from "./helpers/sync-runtime.js";
-import { manifestPath, sameSyncRemote, syncTransport } from "../src/index.js";
+import { emptyManifest, manifestPath, sameSyncRemote, syncTransport, writeManifest } from "../src/index.js";
 import type { SyncEngine, SyncPrepareResult, SyncRuntime } from "../src/index.js";
 
 /**
@@ -149,6 +149,53 @@ describe("runtime 逃逸的错误文本", () => {
 		});
 		expect(JSON.stringify(prepared)).not.toContain("s3cr3t-token");
 	});
+
+	it("engine.push 拒绝：startup 返回脱敏的失败 outcome，不 reject 调用方", async () => {
+		const { h, runtime } = await harnessFor({
+			config: { autoTimeoutMs: 2000, pullOnStart: true },
+			engineSetup: (engine) => {
+				engine.pushFailure = new Error("push failed for https://s3cr3t-token@example.invalid/org/proj.git");
+			},
+		});
+
+		const outcome = await runtime.startup();
+
+		// 引擎/后端的异常是 runtime 的出口责任：必须变成失败 outcome，而不是把裸 rejection 抛给宿主
+		expect(outcome).toEqual({
+			ok: false,
+			reason: "push failed for https://***@example.invalid/org/proj.git",
+		});
+		expect(JSON.stringify(outcome)).not.toContain("s3cr3t-token");
+		expect(h.engines[0].pushTimeouts).toHaveLength(1);
+	});
+
+	it("engine.pull 拒绝：手动 run 返回脱敏的失败 outcome", async () => {
+		const { runtime } = await harnessFor({
+			config: { timeoutMs: 1000 },
+			engineSetup: (engine) => {
+				engine.pullFailure = new Error("fetch failed for https://s3cr3t-token@example.invalid/org/proj.git");
+			},
+		});
+
+		const outcome = await runtime.run("pull", 1000);
+
+		expect(outcome).toEqual({ ok: false, reason: "fetch failed for https://***@example.invalid/org/proj.git" });
+		expect(JSON.stringify(outcome)).not.toContain("s3cr3t-token");
+	});
+
+	it("engine.push 拒绝：手动 run 返回脱敏的失败 outcome", async () => {
+		const { runtime } = await harnessFor({
+			config: { timeoutMs: 1000 },
+			engineSetup: (engine) => {
+				engine.pushFailure = new Error("publish failed for https://s3cr3t-token@example.invalid/org/proj.git");
+			},
+		});
+
+		const outcome = await runtime.run("push", 1000);
+
+		expect(outcome).toEqual({ ok: false, reason: "publish failed for https://***@example.invalid/org/proj.git" });
+		expect(JSON.stringify(outcome)).not.toContain("s3cr3t-token");
+	});
 });
 
 describe("prepare 与懒 engine", () => {
@@ -276,6 +323,38 @@ describe("prepare 与懒 engine", () => {
 		expect(h.manifestWrites).toEqual([]);
 		expect(h.manifestExists()).toBe(false);
 		expect(runtime.engine).toBeNull();
+	});
+
+	it("ready+manifest 路径的 getRemote 期间 dispose：不建 device、不交付 engine", async () => {
+		const h = await createSyncRuntimeHarness();
+		harnesses.push(h);
+		const origin = "https://origin.example/org/proj.git";
+		h.backend.initialized = true;
+		h.backend.origin = origin;
+		// 配置 remote 留空：装配期的 origin 自省因此不发生，屏障留给 prepare 那次读取。
+		const runtime = mustRuntime(await h.create({ config: { remote: "" } }));
+		// 已有完整且 transport 匹配的基线：prepare 会走「快路径之前」的那次 getRemote。
+		const existing = emptyManifest(syncTransport(origin, "main"));
+		existing.base = { revision: "rev-existing", syncedAt: "2026-11-15T07:00:00.000Z" };
+		await writeManifest(manifestPath(h.syncRoot, h.projectKey), existing);
+		const started = deferred();
+		const gate = deferred();
+		h.backend.getRemoteStarted = started;
+		h.backend.getRemoteBarrier = gate;
+
+		const preparing = runtime.prepare(1200);
+		await started.promise;
+		const draining = runtime.dispose();
+		gate.resolve(undefined);
+		expect(await preparing).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		await draining;
+
+		// 收摊之后就不得再走到 buildEngine：迟到的 device.json 比一次失败更难收拾
+		expect(h.deviceCreated()).toBe(false);
+		expect(h.engineOptions).toEqual([]);
+		expect(h.engines).toEqual([]);
+		expect(runtime.engine).toBeNull();
+		expect(h.backend.initTimeouts).toEqual([]);
 	});
 
 	it("init 途中 dispose：abort、放行后不建 device、不写 manifest、不交付 engine", async () => {
@@ -408,6 +487,71 @@ describe("startup 与手动轮次", () => {
 		expect(warnings[0]).toContain("1 local entry");
 		expect(h.events.indexOf("warning")).toBeLessThan(h.events.indexOf("engine:push"));
 	});
+
+	it("warning 回调里同步 dispose：startup 不启动轮次，返回 disposed", async () => {
+		const { h, runtime } = await harnessFor({ config: { autoTimeoutMs: 2000, pullOnStart: true } });
+		h.backend.initWarnings = ["remote already had a baseline"];
+
+		const outcome = await runtime.startup(() => {
+			// 宿主在提示回调里收摊是合法时序：此后绝不能再碰那台已 dispose 的引擎
+			void runtime.dispose();
+		});
+
+		expect(outcome).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		expect(h.engines[0].pushTimeouts).toEqual([]);
+		expect(h.engines[0].pullTimeouts).toEqual([]);
+		expect(h.engines[0].disposeCalls).toBe(1);
+	});
+
+	it("warning 回调里同步 dispose：手动 run 不启动轮次，返回 disposed", async () => {
+		const { h, runtime } = await harnessFor({ config: { timeoutMs: 1000 } });
+		h.backend.initWarnings = ["remote already had a baseline"];
+
+		const outcome = await runtime.run("push", 1000, () => {
+			void runtime.dispose();
+		});
+
+		expect(outcome).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		expect(h.engines[0].pushTimeouts).toEqual([]);
+		expect(h.engines[0].disposeCalls).toBe(1);
+	});
+
+	it("并发 startup 共享 prepare：先到的那台在 warning 里 dispose，后到的也不开轮", async () => {
+		const { h, runtime } = await harnessFor({ config: { autoTimeoutMs: 2000, pullOnStart: true } });
+		h.backend.initWarnings = ["remote already had a baseline"];
+
+		// 后到的调用在 prepare 已 settle、自己还没恢复执行时被关闸：这是 await 之后那道守卫的地盘。
+		const first = runtime.startup(() => {
+			void runtime.dispose();
+		});
+		const secondWarnings: string[] = [];
+		const second = runtime.startup((warning) => secondWarnings.push(warning));
+
+		expect(await first).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		expect(await second).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		// 后到那台连预告回调都不该再收到，更不能在已收摊的引擎上 push
+		expect(secondWarnings).toEqual([]);
+		expect(h.engines[0].pushTimeouts).toEqual([]);
+		expect(h.engines[0].disposeCalls).toBe(1);
+	});
+
+	it("并发 run 共享 prepare：先到的那台在 warning 里 dispose，后到的也不开轮", async () => {
+		const { h, runtime } = await harnessFor({ config: { timeoutMs: 1000 } });
+		h.backend.initWarnings = ["remote already had a baseline"];
+
+		const first = runtime.run("push", 1000, () => {
+			void runtime.dispose();
+		});
+		const secondWarnings: string[] = [];
+		const second = runtime.run("pull", 1000, (warning) => secondWarnings.push(warning));
+
+		expect(await first).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		expect(await second).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		// 后到那台连预告回调都不该再收到，更不能在已收摊的引擎上 pull
+		expect(secondWarnings).toEqual([]);
+		expect(h.engines[0].pushTimeouts).toEqual([]);
+		expect(h.engines[0].pullTimeouts).toEqual([]);
+	});
 });
 
 describe("status 与 flush", () => {
@@ -454,6 +598,47 @@ describe("status 与 flush", () => {
 		expect(outcome).toEqual({ ok: true, value: STATUS_REPORT });
 		expect(h.engines[0].statusTimeouts).toEqual([4321]);
 		expect(h.backend.readyCalls).toBe(readyCallsBefore);
+	});
+
+	it("ready 之后 dispose：status 不再继续读 origin", async () => {
+		const h = await createSyncRuntimeHarness();
+		harnesses.push(h);
+		h.backend.initialized = true;
+		h.backend.origin = "https://origin.example/org/proj.git";
+		// 配置 remote 留空：装配期不读 origin，事件日志只反映 status 自己的 I/O
+		const runtime = mustRuntime(await h.create({ config: { remote: "" } }));
+		h.events.length = 0;
+		// 让 status 卡在 ready() 里，好在中途收摊
+		h.backend.readyDelayMs = 20;
+
+		const pending = runtime.status(900);
+		expect(h.events).toEqual(["backend:ready"]);
+		const draining = runtime.dispose();
+
+		expect(await pending).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		await draining;
+		// 关闸之后连一次只读 origin 都不该发生
+		expect(h.events).toEqual(["backend:ready"]);
+	});
+
+	it("getRemote 期间 dispose：status 返回 disposed，不把迟到 origin 当成功", async () => {
+		const h = await createSyncRuntimeHarness();
+		harnesses.push(h);
+		h.backend.initialized = true;
+		h.backend.origin = "https://origin.example/org/proj.git";
+		const runtime = mustRuntime(await h.create({ config: { remote: "" } }));
+		const started = deferred();
+		const gate = deferred();
+		h.backend.getRemoteStarted = started;
+		h.backend.getRemoteBarrier = gate;
+
+		const pending = runtime.status(900);
+		await started.promise;
+		const draining = runtime.dispose();
+		gate.resolve(undefined);
+
+		expect(await pending).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		await draining;
 	});
 
 	it("没有 engine 的 flush 返回 null，不建 engine、不联网", async () => {

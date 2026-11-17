@@ -240,6 +240,8 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 			let transport: SyncTransport | null = null;
 			if (ready && manifest !== null) {
 				const origin = await backend.getRemote();
+				// 收摊之后到写基线之间还有 buildEngine：迟到的 device.json 在这里就必须被拦住。
+				if (disposed) return { ok: false, reason: DISPOSED_REASON };
 				if (origin === null) throw new Error(`${NOT_INITIALIZED_ORIGIN}; no baseline was trusted`);
 				transport = syncTransport(origin, branch);
 			}
@@ -340,25 +342,33 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 			const autoTimeoutMs = sync.autoTimeoutMs;
 			const deadline = Date.now() + autoTimeoutMs;
 			return track(async () => {
-				if (disposed) return disposedOutcome<SyncRoundResult | null>();
-				const prepared = await prepare(autoTimeoutMs);
-				if (!prepared.ok) return prepared;
-				// 首次基线的冲突副本预告必须先于任何可能产生/发布副本的轮次。
-				if (prepared.warning !== undefined) onWarning?.(prepared.warning);
-				if (sync.pullOnStart !== true) return okOutcome<SyncRoundResult | null>(null, prepared.warning);
-				const remaining = deadline - Date.now();
-				if (remaining <= 0) {
-					return okOutcome<SyncRoundResult | null>(
-						null,
-						joinWarning(
-							prepared.warning,
-							`the automatic startup budget of ${autoTimeoutMs}ms was exhausted during preparation; ` +
-								"startup push was skipped and will run on the next round",
-						),
-					);
+				try {
+					if (disposed) return disposedOutcome<SyncRoundResult | null>();
+					const prepared = await prepare(autoTimeoutMs);
+					if (!prepared.ok) return prepared;
+					if (disposed) return disposedOutcome<SyncRoundResult | null>();
+					// 首次基线的冲突副本预告必须先于任何可能产生/发布副本的轮次。
+					if (prepared.warning !== undefined) onWarning?.(prepared.warning);
+					// 回调里同步 dispose 是合法时序：此后绝不可以在已收摊的引擎上开轮。
+					if (disposed) return disposedOutcome<SyncRoundResult | null>();
+					if (sync.pullOnStart !== true) return okOutcome<SyncRoundResult | null>(null, prepared.warning);
+					const remaining = deadline - Date.now();
+					if (remaining <= 0) {
+						return okOutcome<SyncRoundResult | null>(
+							null,
+							joinWarning(
+								prepared.warning,
+								`the automatic startup budget of ${autoTimeoutMs}ms was exhausted during preparation; ` +
+									"startup push was skipped and will run on the next round",
+							),
+						);
+					}
+					const round = await prepared.engine.push(remaining);
+					return okOutcome<SyncRoundResult | null>(round, prepared.warning);
+				} catch (error) {
+					// 引擎/后端异常同样要过出口脱敏：裸 rejection 会把 URL 里的 token 直接送给宿主日志。
+					return disposed ? disposedOutcome<SyncRoundResult | null>() : { ok: false, reason: syncErrorMessage(error) };
 				}
-				const round = await prepared.engine.push(remaining);
-				return okOutcome<SyncRoundResult | null>(round, prepared.warning);
 			});
 		},
 
@@ -369,14 +379,21 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 		): Promise<SyncRuntimeOutcome<SyncRoundResult>> {
 			if (disposed) return Promise.resolve(disposedOutcome());
 			return track(async () => {
-				if (disposed) return disposedOutcome<SyncRoundResult>();
-				const prepared = await prepare(timeoutMs);
-				if (!prepared.ok) return prepared;
-				// 手动恢复初始化时，预告同样要先于会产生/发布副本的那一轮。
-				if (prepared.warning !== undefined) onWarning?.(prepared.warning);
-				// 手动轮次拿调用方给的完整预算：prepare 用掉的时长不从里面扣。
-				const round = await prepared.engine[kind](timeoutMs);
-				return okOutcome(round, prepared.warning);
+				try {
+					if (disposed) return disposedOutcome<SyncRoundResult>();
+					const prepared = await prepare(timeoutMs);
+					if (!prepared.ok) return prepared;
+					if (disposed) return disposedOutcome<SyncRoundResult>();
+					// 手动恢复初始化时，预告同样要先于会产生/发布副本的那一轮。
+					if (prepared.warning !== undefined) onWarning?.(prepared.warning);
+					if (disposed) return disposedOutcome<SyncRoundResult>();
+					// 手动轮次拿调用方给的完整预算：prepare 用掉的时长不从里面扣。
+					const round = await prepared.engine[kind](timeoutMs);
+					return okOutcome(round, prepared.warning);
+				} catch (error) {
+					// 同 startup：端口异常变成已脱敏的失败 outcome，不让调用方拿到裸 rejection。
+					return disposed ? disposedOutcome<SyncRoundResult>() : { ok: false, reason: syncErrorMessage(error) };
+				}
 			});
 		},
 
@@ -389,8 +406,12 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 					if (engine !== null) return { ok: true, value: await engine.status(timeoutMs) };
 					// 严格 dry-run：只问本地那点状态，绝不 prepare/init、创建设备或写 manifest。
 					const ready = await backend.ready();
+					if (disposed) return disposedOutcome<SyncRuntimeStatus>();
 					if (!ready) return { ok: true, value: { initialized: false, origin: null } };
-					return { ok: true, value: { initialized: true, origin: await backend.getRemote() } };
+					const origin = await backend.getRemote();
+					// 关闸之后连一次只读 origin 都不该再发出去。
+					if (disposed) return disposedOutcome<SyncRuntimeStatus>();
+					return { ok: true, value: { initialized: true, origin } };
 				} catch (error) {
 					return { ok: false, reason: syncErrorMessage(error) };
 				}

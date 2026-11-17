@@ -249,6 +249,10 @@ export interface FakeEngine extends SyncEngine {
 	pushBarrier: Deferred<void> | null;
 	/** `push` 一进来就 resolve。 */
 	pushStarted: Deferred<void> | null;
+	/** 非 null 时 `pull` 抛出它：端口异常不该让调用方的 promise reject。 */
+	pullFailure: Error | null;
+	/** 非 null 时 `push` 抛出它（在屏障之后抛，时序用例仍可用）。 */
+	pushFailure: Error | null;
 	rounds: { pull: SyncRoundResult; push: SyncRoundResult };
 	flushRound: SyncRoundResult | null;
 	statusReport: SyncStatusReport;
@@ -265,6 +269,8 @@ export function createFakeEngine(events: string[]): FakeEngine {
 		flushTimeouts: [],
 		pushBarrier: null,
 		pushStarted: null,
+		pullFailure: null,
+		pushFailure: null,
 		rounds: { pull: PULL_ROUND, push: PUSH_ROUND },
 		flushRound: FLUSH_ROUND,
 		statusReport: STATUS_REPORT,
@@ -273,6 +279,7 @@ export function createFakeEngine(events: string[]): FakeEngine {
 		async pull(timeoutMs?: number): Promise<SyncRoundResult> {
 			events.push("engine:pull");
 			engine.pullTimeouts.push(timeoutMs as number);
+			if (engine.pullFailure !== null) throw engine.pullFailure;
 			return engine.rounds.pull;
 		},
 		async push(timeoutMs?: number): Promise<SyncRoundResult> {
@@ -280,6 +287,7 @@ export function createFakeEngine(events: string[]): FakeEngine {
 			engine.pushTimeouts.push(timeoutMs as number);
 			engine.pushStarted?.resolve(undefined);
 			if (engine.pushBarrier !== null) await engine.pushBarrier.promise;
+			if (engine.pushFailure !== null) throw engine.pushFailure;
 			events.push("engine:push:done");
 			return engine.rounds.push;
 		},
