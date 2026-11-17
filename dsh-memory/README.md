@@ -84,7 +84,7 @@ repository shares them:
   (one `push()` that both converges remote changes and retries anything left over) or by the next
   debounced write-trigger push (`sync.pushOnWrite`, default on).
 
-Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.md#cross-device-sync).
+Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.zh.md#跨设备同步).
 
 ## Real differences from pi
 
@@ -107,7 +107,7 @@ Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/
 
 ## Docs
 
-- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.md): full configuration, cross-device sync, models, verification status, implementation limits
+- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/dsh-memory.zh.md) (in Chinese): full configuration, cross-device sync, models, verification status, implementation limits
 - [Architecture and hard constraints](https://github.com/yandy/simple-memory/blob/main/docs/guides/architecture.md)
 - [Dependency management](https://github.com/yandy/simple-memory/blob/main/docs/guides/dependencies.md)
 

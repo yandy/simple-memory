@@ -68,10 +68,10 @@ cd /tmp/e2e-project-a && git init -q . && pi
 
 ## 4. 回写 Verification status
 
-- **pi**：`docs/reference/pi-memory.md` / `.zh.md` 的「跨设备同步」小节末尾有一个
+- **pi**：`docs/reference/pi-memory.zh.md` 的「跨设备同步」小节末尾有一个
   `### Verification status` / `### 验证状态` —— 照实际走过的条目更新它。
-- **dsh**：`docs/reference/dsh-memory.md` / `.zh.md` 的 `## Verification status` 里，把
-  「Cross-device sync is **not** covered by a real-host run」那段替换成实测记录。
+- **dsh**：`docs/reference/dsh-memory.zh.md` 的 `## 验证状态` 里，把
+  「跨设备同步**没有**真机验收记录」那段替换成实测记录。
 
 dsh 的模板：
 
