@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
+import { HOST_CONFIG_SOURCE } from "../config.js";
 import { withLock } from "../store/fs-lock.js";
 import {
 	NonFastForwardError,
@@ -319,6 +320,11 @@ export interface GitSyncBackendOptions {
 	remote: string;
 	/** 远端分支名。 */
 	branch: string;
+	/**
+	 * 可选：错误文案里点名的配置来源（例如 `memory.json`）。不传时用中立的 `HOST_CONFIG_SOURCE` ——
+	 * core 不认识任何宿主的配置文件。
+	 */
+	configSource?: string;
 }
 
 export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBackend {
@@ -329,6 +335,8 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 	const memoryRoot = resolve(options.memoryRoot);
 	const { remote, branch } = options;
 	const repoDir = join(syncRoot, "repo");
+	/** 错误文案里点名的配置来源：宿主的叫法由它注入，core 不内置 `memory.json` 这类宿主词汇。 */
+	const configSource = options.configSource ?? HOST_CONFIG_SOURCE;
 
 	/** 在指定暂存仓库里跑 git；init 的 staging 与已发布 repo 共用同一组命令助手。 */
 	const inRepo = (o: SyncRunOptions, directory = repoDir): RunOptions => ({ ...o, cwd: directory });
@@ -607,7 +615,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 				redactCredentials(
 					`refusing to initialise sync: the memory root ${memoryRoot} is already a git repository whose ` +
 						`remote "${clash.name}" points at the same remote (${clash.url}) — two writers pushing the same ` +
-						'remote is how memory gets lost; point "sync.remote" in memory.json at a different repository ' +
+						`remote is how memory gets lost; point "sync.remote" in ${configSource} at a different repository ` +
 						`(or remove that remote from ${memoryRoot})`,
 				),
 			);
@@ -693,7 +701,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 		if (!(await ready())) {
 			// 未初始化而手上根本没地址：给一句指回配置的错误，而不是 git 那句 “You must specify a repository”。
 			if (remote.trim() === "") {
-				throw new Error('cannot initialise sync: no remote is configured (set "sync.remote" in memory.json)');
+				throw new Error(`cannot initialise sync: no remote is configured (set "sync.remote" in ${configSource})`);
 			}
 			// 共存检查必须先于 syncRoot/锁文件等任何写入；same-remote 拒绝保持无 clone、无 device、无 .sync。
 			warnings = await memoryRootWarnings(o);
@@ -710,7 +718,7 @@ export function createGitSyncBackend(options: GitSyncBackendOptions): SyncBacken
 			if (warnings === null) {
 				// 锁外看到的是 ready、锁内却被外部删除的罕见恢复路径，仍按首次初始化完整校验。
 				if (remote.trim() === "") {
-					throw new Error('cannot initialise sync: no remote is configured (set "sync.remote" in memory.json)');
+					throw new Error(`cannot initialise sync: no remote is configured (set "sync.remote" in ${configSource})`);
 				}
 				warnings = await memoryRootWarnings(o);
 			}

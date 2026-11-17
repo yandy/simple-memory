@@ -49,6 +49,63 @@ FIFO，已排队的操作允许跑完）。core 拥有它们的生命周期与�
 `renderSyncStatus`）与统一的凭据脱敏出口（`syncErrorMessage`，git backend 复用同一
 `redactCredentials`）在 core；宿主只注入漂移提示与尾部行，并在自己的出口做配置词汇替换。
 
+### `.sync/` 布局
+
+同步状态全在**记忆根**下的 `.sync/`，与 `git/`、`local/` 同级。项目记忆目录保持干净（同步不往里放
+`.git`），所有扫描都跳过点开头的目录：
+
+```
+<memoryRoot>/
+  .sync/
+    device.json                 { id, hostname, createdAt }：本机身份，永不同步；publish 的作者来自它
+    repo/                       唯一的暂存 clone（工作树 + .git），全部传输通道都跑在这里
+    state/<project-key>.json    manifest v2 基线：文件指纹 + transport{ remoteHash, branch }
+    sync.lock                   根级跨进程锁
+  git/<project>/                记忆本体（这里不加 .git，也不写别的东西）
+```
+
+- `transport.remoteHash` 存 `sha256(actualOrigin)`，**不存 URL 也不存凭据**，branch 一并绑定。基线只对
+  「同一 origin + 同一 branch」成立：v1 manifest、损坏的 JSON、origin 或 branch 不匹配一律退化成空
+  base —— 「绝不能在新传输端按旧 base 删除本地」这条约定就是靠它执行的。
+- `sync.lock` 按段持有（传输段一次 `fetch` + origin 读取，发布段一次 `push`），绝不整轮持有；`init` /
+  `setRemote` 在同一把锁上做有界等待，且不嵌套在轮次锁内。它与记忆目录里的 `.lock` 是**两把不同的锁**。
+- 被遗弃的 `sync.lock` 会让此后每一轮同步失败并给出可操作的错误；`/memory sync unlock` 是唯一被认可的
+  清除入口（否则用户得手工去删一个隐藏目录里的文件）。
+
+### 端口契约
+
+引擎只认 `SyncBackend` 端口（`memory-core/src/sync/backend.ts`），既不认字符串 id，也不出现「clone」
+「commit」这类 git 专属概念 —— 端口形状是从「将来要接 S3」倒推的。
+
+- `RemoteView.list()` 交出的 hash **恒为 `sha256(bytes)` 的十六进制小写**：差集与 manifest 直接拿它比较。
+  backend 若原生只有别的标识（git blob sha1、S3 的 ETag/MD5），换算由 backend 自己负责。
+- `list()` 的路径相对 `scope.prefix`（因此是单层 entry 文件名），`scope.prefix` 恒为 POSIX 形态 ——
+  远端布局是数据，不跟宿主平台走，否则同一个仓库在两台设备上会算出两个目录。
+- `outOfScope` 的判据是**「异常」而不是「不在本 scope 内」**。远端按设计镜像整个记忆根，而一次会话只
+  同步当前项目，所以兄弟项目的 `git/<other-key>/*.md` 是每一轮的常态；把它们报进来会让报告条数与正常
+  数据同量级，真正那条信号被永久埋掉。只有不该出现在那儿的路径（仓库根 `MEMORY.md`、`local/...`、
+  本前缀底下的嵌套目录）才进清单。
+- `publish()` 用 `base.revision` 做乐观并发，并在任何远端 mutation 之前复核 `base.remote`（`fetch` 同一把
+  根锁内读到的实际 origin）—— 不一致就抛 `NonFastForward`，防止旧进程把 stale delta 写进新 origin。
+- `SyncRunOptions.timeoutMs` 是**这次调用的总预算**，不是单次往返的上限：backend 内部的多个 git 子进程
+  共享它（`budgeted()` 每跑一个子进程现算剩余量），引擎一轮在多段 backend 调用之间交下去的也是剩余量。
+  `signal` 由宿主在退出 / 切会话时接上，让在途的远端操作尽快收尾。
+
+### 规模与复杂度
+
+一轮同步的本地开销是 **O(远端总字节)**，不是 O(变更量)：git backend 每轮 `fetch` 之后用一次
+`cat-file --batch` 读出范围内**全部** blob 并逐个算 sha256（`ls-tree` 给的是 blob sha1，与端口契约的
+sha256 不同源），`read()` 复用这次批量读的缓存。
+
+参考量级（300 条 CJK 记忆、本机、本地 bare 远端）：`init` 约 39ms、首次 push 约 183ms、**空转 pull
+72–77ms**、`status` 约 78ms —— 空转并不便宜，它的成本就是「把远端全部内容读一遍」。
+
+**上万条时该换成 oid 缓存**：把 blob 的 sha1 与内容 sha256 的对应关系缓存在 manifest 里，只对变更的
+路径读内容。触发条件是远端总量而不是变更量；在那之前不要拿「只改了一条」去解释或优化这条路径。
+
+自动化测试只跑本地 bare 仓库（无网络、无凭据）。真实托管远端（GitHub / GitLab）上的手动验收清单见
+[sync-e2e.md](./sync-e2e.md)。
+
 ## 用户契约
 
 磁盘格式、prompt 文本、`memory` 工具的 action 语义不得顺手改。它们对用户是契约，改动要有独立的

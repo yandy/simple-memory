@@ -40,6 +40,7 @@ import { readDreamMeta, shouldNudge, writeDreamMeta } from "./src/nudge";
 import { searchSessions } from "./src/session-search";
 import {
 	createPiSyncRuntime,
+	PI_CONFIG_SOURCE,
 	type PiSyncRuntime,
 	renderSyncRound,
 	renderSyncStatus,
@@ -512,7 +513,14 @@ export default function (pi: ExtensionAPI) {
 			// 启动校验（spec §2.3）：模型键缺失 / 不可解析 → 本会话**完全不初始化**
 			//（不解析目录、不建 store、不注册工具），错误态由 `/memory` 重复显示。
 			// 校验本身抛错（registry 不合契约）也走同一个 catch：failConfig 自己会复位运行时。
-			const errors = modelConfigErrors(loaded.config, (value) => resolveModel(value, modelRegistry) !== undefined);
+			const errors = modelConfigErrors(
+				loaded.config,
+				(value) => resolveModel(value, modelRegistry) !== undefined,
+				undefined,
+				{
+					configSource: PI_CONFIG_SOURCE,
+				},
+			);
 			if (errors.length > 0) {
 				failConfig(errors, syncUi);
 				return;

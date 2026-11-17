@@ -16,7 +16,7 @@ import { createMemoryCommand, renderStatus } from "../src/commands.js";
 import type { CommandDeps } from "../src/commands.js";
 import { createDshSyncRuntime } from "../src/sync.js";
 import type { DshSyncRuntime, DshSyncSession } from "../src/sync.js";
-import { SYNC_REMOTE_DRIFT_ERROR } from "../src/sync.js";
+import { DSH_CONFIG_SOURCE, SYNC_REMOTE_DRIFT_ERROR } from "../src/sync.js";
 import { renderSyncRound, renderSyncStatus, renderSyncSummary } from "../src/sync-view.js";
 import type { SessionMemoryRuntime } from "../src/store-registry.js";
 
@@ -206,15 +206,10 @@ describe("sync rendering", () => {
 	});
 
 	it("renders a failed round reason in the row config vocabulary, not memory.json", () => {
-		const text = renderSyncRound(
-			round({
-				ok: false,
-				skipped: {
-					reason:
-						'the sync backend is not initialized: set "sync.remote" in memory.json so the host can initialize it',
-				},
-			}),
-		);
+		// core 用装配时注入的 `configSource` 生成这句（dsh 传的是 `DSH_CONFIG_SOURCE`）；
+		// 渲染层原样透传，不再做出口替换。
+		const reason = `the sync backend is not initialized: set "sync.remote" in ${DSH_CONFIG_SOURCE} so the host can initialize it`;
+		const text = renderSyncRound(round({ ok: false, skipped: { reason } }));
 
 		expect(text).toContain("Result: failed");
 		expect(text).toContain('set "sync.remote" in plugin row config so the host can initialize it');
@@ -237,7 +232,7 @@ describe("sync rendering", () => {
 			rejected: [],
 			unparsableLocal: [],
 			outOfScopeRemote: [],
-			errors: ['sync is not configured: set "sync.enabled" and "sync.remote" in memory.json'],
+			errors: [`sync is not configured: set "sync.enabled" and "sync.remote" in ${DSH_CONFIG_SOURCE}`],
 		};
 		const text = renderSyncStatus(report, "");
 

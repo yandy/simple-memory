@@ -239,7 +239,8 @@ describe("loadConfig", () => {
 		const sync: SyncConfig = { ...cfg.sync, enabled: true, remote: "" };
 		const withBadSync = { ...cfg, defaults: { model: "test/model" }, sync };
 
-		expect(syncConfigErrors(withBadSync)).toEqual([
+		// core 不内置宿主的文件名：pi 把它注入进去（生产路径见 `createPiSyncRuntime`）
+		expect(syncConfigErrors(withBadSync, { configSource: "memory.json" })).toEqual([
 			'sync is enabled but "sync.remote" is empty — set "sync.remote" in memory.json or unset "sync.enabled"',
 		]);
 		expect(modelConfigErrors(withBadSync, () => true)).toEqual([]);

@@ -1,6 +1,6 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, type SyncConfig } from "../config.js";
+import { DEFAULT_CONFIG, HOST_CONFIG_SOURCE, type SyncConfig } from "../config.js";
 import { type ParsedEntryFile, parseEntryFile } from "../store/entry-file.js";
 import { isEntryFileNameForWrite } from "../store/filename.js";
 import { tryWithLock } from "../store/fs-lock.js";
@@ -68,6 +68,11 @@ export interface SyncEngineOptions {
 	backend: SyncBackend;
 	device: DeviceIdentity;
 	config: SyncConfig;
+	/**
+	 * 可选：错误文案里点名的配置来源（例如 `memory.json` / `plugin row config`）。
+	 * 不传时用中立的 `HOST_CONFIG_SOURCE` —— core 不认识任何宿主的配置文件。
+	 */
+	configSource?: string;
 	/** 只为测试可固定：基线的 `syncedAt` 与快照目录名都用它。 */
 	now?: () => Date;
 }
@@ -440,6 +445,7 @@ interface ApplyPlan {
 export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	const { syncRoot, projectDir, projectKey, store, backend, device, config } = options;
 	const now = options.now ?? ((): Date => new Date());
+	const configSource = options.configSource ?? HOST_CONFIG_SOURCE;
 	const platform = store.cfg.platform ?? process.platform;
 	/**
 	 * 本地的一切读写都以 store 配置的目录为准，而不是 `options.projectDir`。
@@ -453,9 +459,8 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 	const manifestFile = manifestPath(syncRoot, projectKey);
 	const scope: SyncScope = { prefix: remotePrefixFromKey(projectKey) };
 
-	const NOT_CONFIGURED = 'sync is not configured: set "sync.enabled" and "sync.remote" in memory.json';
-	const NOT_INITIALIZED =
-		'the sync backend is not initialized: set "sync.remote" in memory.json so the host can initialize it';
+	const NOT_CONFIGURED = `sync is not configured: set "sync.enabled" and "sync.remote" in ${configSource}`;
+	const NOT_INITIALIZED = `the sync backend is not initialized: set "sync.remote" in ${configSource} so the host can initialize it`;
 	const DISPOSED = "the sync engine is disposed; no new backend I/O will be started";
 	const ROOT_LOCK_BUSY = "another sync round holds the root sync lock, so this round was skipped";
 	const MEMORY_LOCK_BUSY = "the memory lock for this project is busy, so this round was skipped";

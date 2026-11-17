@@ -35,6 +35,9 @@ import {
 export const SYNC_REMOTE_DRIFT_ERROR =
 	'sync.remote differs from the initialized origin; continuing to use origin (use "/memory sync remote <url>" to change it)';
 
+/** 错误文案里点名的配置来源：dsh 的行 config（core 不内置这个名字）。 */
+export const DSH_CONFIG_SOURCE = "plugin row config";
+
 /** 尚未初始化却请求换远端：dsh 的配置来源叫行 config，不是 memory.json。 */
 const UNINITIALIZED_REMOTE_CHANGE = 'sync is not initialized: set "sync.remote" in the plugin row config instead';
 
@@ -50,9 +53,9 @@ export interface DshSyncSession {
 	persistentErrors?: string[];
 }
 
-/** core 已脱敏；这里再把配置入口换成 dsh 的叫法，不把 JSON 文件名词带进提示。 */
+/** core 已脱敏，配置来源的名字也由 `configSource` 注入；这里只保留宿主出口，不再改写文案。 */
 export function syncErrorMessage(error: unknown): string {
-	return coreSyncErrorMessage(error).replaceAll("memory.json", "plugin row config");
+	return coreSyncErrorMessage(error);
 }
 
 /**
@@ -94,12 +97,15 @@ export async function createDshSyncRuntime(options: {
 		projectDir: options.projectDir,
 		identity: options.identity,
 		scheduling: "serial",
-		createBackend: options.createBackend ?? ((context) => createGitSyncBackend(context)),
-		createEngine: options.createEngine ?? ((engineOptions) => createSyncEngine(engineOptions)),
+		createBackend:
+			options.createBackend ?? ((context) => createGitSyncBackend({ ...context, configSource: DSH_CONFIG_SOURCE })),
+		createEngine:
+			options.createEngine ?? ((engineOptions) => createSyncEngine({ ...engineOptions, configSource: DSH_CONFIG_SOURCE })),
 		writeManifest,
 		messages: {
 			originDrift: SYNC_REMOTE_DRIFT_ERROR,
 			uninitializedRemoteChange: UNINITIALIZED_REMOTE_CHANGE,
+			configSource: DSH_CONFIG_SOURCE,
 			formatRemoteChangeFailure,
 		},
 		now: options.now,
