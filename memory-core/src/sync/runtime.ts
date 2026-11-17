@@ -490,10 +490,11 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 		startup(onWarning?: (warning: string) => void): Promise<SyncRuntimeOutcome<SyncRoundResult | null>> {
 			if (disposed) return Promise.resolve(disposedOutcome());
 			if (remoteChangeActive) return Promise.resolve(busyOutcome());
-			// 自动预算只算一次：prepare 与启动轮次共享同一份 deadline，谁也别各自重新满格。
-			const autoTimeoutMs = sync.autoTimeoutMs;
-			const deadline = Date.now() + autoTimeoutMs;
 			return coordinate(async () => {
+				// 自动预算只算一次：prepare 与启动轮次共享同一份 deadline，谁也别各自重新满格。
+				// 计时点是**出队之后**的这里，不是公开调用时：serial 排队等待不该消耗宿主的启动预算。
+				const autoTimeoutMs = sync.autoTimeoutMs;
+				const deadline = Date.now() + autoTimeoutMs;
 				try {
 					if (disposed) return disposedOutcome<SyncRoundResult | null>();
 					const prepared = await prepareInternal(autoTimeoutMs);

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	FLUSH_ROUND,
 	HARNESS_MESSAGES,
@@ -551,6 +551,51 @@ describe("startup 与手动轮次", () => {
 		expect(secondWarnings).toEqual([]);
 		expect(h.engines[0].pushTimeouts).toEqual([]);
 		expect(h.engines[0].pullTimeouts).toEqual([]);
+	});
+
+	it("serial startup：排队等待不计入自动预算，出队之后才起算 deadline", async () => {
+		const pushGate = deferred();
+		const pushStarted = deferred();
+		const { h, runtime } = await harnessFor({
+			scheduling: "serial",
+			config: { autoTimeoutMs: 2000, pullOnStart: true },
+			engineSetup: (engine) => {
+				engine.pushStarted = pushStarted;
+				engine.pushBarrier = pushGate;
+			},
+		});
+		h.backend.initRevision = "rev-initial";
+
+		// 前序 serial 活动占住 FIFO：startup 只能在 tail 上排队。
+		const manual = runtime.run("push", 5000);
+		await pushStarted.promise;
+
+		// 只在 Date.now 上做时钟平移：真盘与真定时器都不受影响。
+		let clockOffsetMs = 0;
+		const realNow = Date.now;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
+		try {
+			const warnings: string[] = [];
+			const startup = runtime.startup((warning) => warnings.push(warning));
+			// 排队期间墙上时钟越过 autoTimeoutMs —— 按「公开调用时定 deadline」，出队时预算已是负数。
+			clockOffsetMs = 10_000;
+
+			// 出队之前放开前序活动，startup 自己的 push 不再被同一道闸卡住。
+			h.engines[0].pushBarrier = null;
+			pushGate.resolve(undefined);
+
+			expect(await manual).toEqual({ ok: true, value: PUSH_ROUND });
+			const outcome = await startup;
+
+			// 预算在出队时起算：startup 必须真的推送，而不是被判「等待把预算耗尽」。
+			expect(warnings).toEqual([]);
+			expect(outcome).toEqual({ ok: true, value: PUSH_ROUND });
+			expect(h.engines[0].pushTimeouts).toHaveLength(2);
+			expect(h.engines[0].pushTimeouts[1]).toBeGreaterThan(0);
+			expect(h.engines[0].pushTimeouts[1]).toBeLessThanOrEqual(2000);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 });
 
