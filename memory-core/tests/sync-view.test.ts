@@ -201,6 +201,24 @@ describe("renderSyncStatus", () => {
 		expect(text).not.toContain(drift);
 	});
 
+	it("没有漂移时尾部行照样按原序追加在 `Errors: none` 之后", () => {
+		// 尾行和漂移**无关**：它报的是跨宿主一致的报告尾巴（例如本轮之外的补充行），
+		// 不该被「这一轮有没有漂移」分成两种行为。
+		const drift = "should not appear";
+		const text = renderSyncStatus(status(), "https://origin.example.invalid/org/memory.git", {
+			originDriftMessage: drift,
+			trailingLines: ["first trailing line", "second trailing line"],
+		});
+
+		expect(text).not.toContain(drift);
+		// 顺序断言用相对关系：三条行必须按「Errors → 第一条尾行 → 第二条尾行」真实出现
+		const errorsIndex = text.indexOf("Errors: none");
+		expect(errorsIndex).toBeGreaterThan(-1);
+		expect(errorsIndex).toBeLessThan(text.indexOf("first trailing line"));
+		expect(text.indexOf("first trailing line")).toBeLessThan(text.indexOf("second trailing line"));
+		expect(text.endsWith("second trailing line")).toBe(true);
+	});
+
 	it("origin 或配置为空时既不算漂移，也照实打印 `(not set)` / `none`", () => {
 		const drift = "should not appear";
 		// 已配置但还没初始化：没有 origin 可比，不构成漂移

@@ -9,7 +9,7 @@ import { sameSyncRemote } from "./paths.js";
  * 空/缺区分，以及出口处那一次统一的凭据脱敏。**展示策略留在宿主**：
  *
  * - 漂移提示由宿主注入（`originDriftMessage`）：core 不含任何 slash 命令，也不猜宿主的配置入口叫
- *   什么 —— pi 让人改 `memory.json`，dsh 让人改插件行，把那两句塞进 core 就等于让 core 认识宿主。
+ *   什么 —— 各宿主都有一句自己的「该去改哪里」，把那两句塞进 core 就等于让 core 认识宿主。
  * - 尾部扩展行同样由宿主注入（`trailingLines`），只放确实跨宿主一致的报告尾巴，不是通知通道；
  *   通知前缀、notice/error 级别、去重都在宿主那一侧。
  */
