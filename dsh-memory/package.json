@@ -49,7 +49,7 @@
 		"format": "biome format --write ."
 	},
 	"dependencies": {
-		"@yandy0725/memory-core": "^2.2.0"
+		"@yandy0725/memory-core": "^2.3.0"
 	},
 	"peerDependencies": {
 		"@deepseek-ai/cordis": "~4.1.0",
