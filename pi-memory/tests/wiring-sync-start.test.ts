@@ -509,7 +509,9 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 	});
 
 	it("records only the exhausted startup budget after an earlier first-baseline preview", async () => {
-		const config = memoryConfig({ pullOnStart: true, autoTimeoutMs: 300 });
+		// autoTimeoutMs 同时是首次 init 的真实子进程总预算；Windows 上 git init/clone 可能远超 300ms。
+		// 这里给足时间，只用注入时钟把 deadline 推过去 —— 预算断言不该依赖文件系统或 git 的速度。
+		const config = memoryConfig({ pullOnStart: true, autoTimeoutMs: 30_000 });
 		const store = new MemoryStore({
 			memoryDir: s.dir,
 			indexMaxLines: config.memIndexMaxLines,
@@ -517,9 +519,9 @@ describe.skipIf(!GIT)("index wiring — sync startup", { timeout: 60_000 }, () =
 			lock: config.lock,
 		});
 		await store.addEntry({ name: "Existing local memory", description: "local before first sync", body: "keep me" });
-		await enableSync({ pullOnStart: true, autoTimeoutMs: 300 });
+		await enableSync({ pullOnStart: true, autoTimeoutMs: 30_000 });
 		const start = 1_700_000_000_000;
-		const clock = vi.spyOn(Date, "now").mockReturnValueOnce(start).mockReturnValue(start + 400);
+		const clock = vi.spyOn(Date, "now").mockReturnValueOnce(start).mockReturnValue(start + 60_000);
 		const notify = vi.fn();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
