@@ -69,7 +69,7 @@ repository shares them:
   it does not repeat for that baseline.
 - Manual convergence: `/memory sync pull` / `push` / `status` (strict dry-run) / `remote <url>`.
 
-Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.md#cross-device-sync).
+Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.zh.md#跨设备同步).
 
 ## Commands
 
@@ -80,7 +80,7 @@ Full semantics: [cross-device sync](https://github.com/yandy/simple-memory/blob/
 | `/memory sync [status\|pull\|push\|remote <url>\|unlock]` | Sync status and manual convergence |
 | `/dream` | Tidy the memory (confirms first, then snapshots the whole directory) |
 
-Full tool and argument reference: [tool reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.md#tool-reference).
+Full tool and argument reference: [tool reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.zh.md#工具参考).
 
 ## Where memory lives
 
@@ -99,7 +99,7 @@ write happened.
 
 ## Docs
 
-- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.md): full configuration, cross-device sync, internals, tool and command reference
+- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/pi-memory.zh.md) (in Chinese): full configuration, cross-device sync, internals, tool and command reference
 - [Repository](https://github.com/yandy/simple-memory): `memory-core` / `dsh-memory` and how to develop
 
 MIT

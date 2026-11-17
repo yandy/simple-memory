@@ -301,31 +301,14 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
 
 ## 验证状态
 
-单元测试全绿（dsh-memory `321 passed`），并且已在**真实 dsh `0.2.2-rc.1`** 上端到端跑通（隔离
-`DSH_HOME` + `file:` 装包）—— 下面就是这次的验收记录。
+真机（隔离 `DSH_HOME` + `file:` 装包的 web profile）确认过：插件会激活；`memory_index` 段与 `memory` 工具
+出现且写入落盘；extract 与 `/dream` 端到端可用（子会话工具面分别是 5 / 7 个 action）；`/memory` 与
+`/dream` 注册成功。
 
-真机确认（web profile，长寿命宿主）：
+跨设备同步目前**只有单元测试**覆盖（本地 bare 仓库、无网络无凭据）。真实托管远端的手动验收清单见
+[sync-e2e.md](../guides/sync-e2e.md)；走完之前，dsh 上的同步按**未验证**对待。
 
-- 插件**真的会激活**（见上面那条 `logger` 注意事项 —— 那是真 bug：单测全绿、真机上插件完全没生效）。
-- `memory_index` 段与 `memory` 工具在真会话里出现，模型主动 `add` 的记忆落盘正确。
-- **extract 端到端可用**：父会话被要求「不要调用任何工具」，仅 1 轮 1 步；`MEMORY.md` 仍出现两条
-  记忆，来自 extract 的子会话 —— 该子会话 `request/header` 里工具面只有 `["memory"]`，调用序列是
-  `memory list` → `memory add` ×2，`turn/end: completed`。
-- **`/dream` 端到端可用**：在预置 4 条（含两条互相冲突的「锁文件」记忆）的目录上执行 `/dream`，
-  子会话工具面是 `["memory"]`（7 个 action）、调用序列 `list → search ×2 → rebuild_index`，
-  `turn/end: completed`；结果是**真的合并了**两条冲突记忆（旧文件已删除）、改写了另一条的
-  description、并把索引重建为 3 行。同时在 `<memoryDir>/.backups/` 留下了整目录快照（回滚点）。
-- `/memory`、`/dream` 两个命令注册成功（空 `input.hint` 会让宿主拒绝注册并回滚整个 bundle）。
-
-跨设备同步**没有**真机验收记录：它由单元测试覆盖（`dsh-memory/tests/sync.test.ts`、
-`sync-commands.test.ts`、`sync-wiring.test.ts`），这些测试用**本地 bare 仓库**（不联网、不涉及凭据）
-驱动真实的 `memory-core` 引擎与 git backend，走的是与本套件其余部分相同的 `apply()` 入口和假 cordis
-上下文。这覆盖了初始化/基线语义、「origin 是真相来源」规则、「启动同步先于第一次索引刷新」的时序、
-主工具与两个 worker 工具的写触发、换远端、以及 dispose/恢复 —— 但没有覆盖一个真实的 `dsh` 进程对着
-真实托管 git 远端（GitHub/GitLab，SSH 或 HTTPS）说话的场景。在有人对着真实远端跑一遍之前，请把真机
-上的同步当作**未验证**。
-
-### 子会话为什么是「常驻 worker」
+## 子会话为什么是「常驻 worker」
 
 `AgentRegistry.create()` 用 `this.ctx` 作为子 agent 的 owner，而 cordis 的 traceable 机制把它解析成
 「访问服务时的调用方作用域」。在 `agent/turn-stopping` / `agent/status` 的派发里创建子会话会抛
@@ -339,7 +322,7 @@ CI 用 `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 守这条（`.
   worker。默认（两者都没开）**零额外子会话**。
 - 建了 worker 的会话会多出一条**空的**子会话记录（只有 followup 之后才会有轮次内容）。
 
-### 一次性宿主里的限制
+## 一次性宿主里的限制
 
 `dsh headless` 是「答一轮就退出」的宿主：父轮结束即退出进程，后台在途的抽取会被 `aborted/disposed`
 打断（真机实测）。适配层在卸载/`agent/disposed` 时会 `drain()` 在途的抽取（最多 5s），但进程退出

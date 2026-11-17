@@ -74,7 +74,7 @@ npm run build     # tsc -p tsconfig.build.json → dist/ (ESM + .d.ts)
 
 ## Docs
 
-- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/memory-core.md): disk format, capacity, locking, ports for a new harness, Windows
+- [Reference](https://github.com/yandy/simple-memory/blob/main/docs/reference/memory-core.zh.md) (in Chinese): disk format, capacity, locking, ports for a new harness, Windows
 - [Architecture and hard constraints](https://github.com/yandy/simple-memory/blob/main/docs/guides/architecture.md)
 - [Dependency management](https://github.com/yandy/simple-memory/blob/main/docs/guides/dependencies.md)
 

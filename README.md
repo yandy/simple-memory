@@ -41,16 +41,16 @@ in every harness, or sharing silently stops working.
 
 Memory is local by default. Both adapters can push this project's memory to a git remote (off by default),
 so another machine working on the same repository lands on the same files. See [pi-memory](./pi-memory),
-[dsh-memory](./dsh-memory) and the [reference](./docs/reference/pi-memory.md#cross-device-sync).
+[dsh-memory](./dsh-memory) and the [reference](./docs/reference/pi-memory.zh.md#跨设备同步).
 
 One known behaviour: on `resume` / `fork` / `reload` pi keeps the index recorded in the transcript (changing
 it would break the prompt cache), so startup convergence still runs and the disk still updates, but **this
 session's `memory_index` will not show the memories that just synced in** until the next compaction or the
-next session. See [why the index is frozen](./docs/reference/pi-memory.md#why-the-index-is-frozen).
+next session. See [why the index is frozen](./docs/reference/pi-memory.zh.md#为什么索引要冻结).
 
 ## Docs
 
-- Reference: [memory-core](./docs/reference/memory-core.md) · [pi-memory](./docs/reference/pi-memory.md) · [dsh-memory](./docs/reference/dsh-memory.md)
+- Reference (written in Chinese): [memory-core](./docs/reference/memory-core.zh.md) · [pi-memory](./docs/reference/pi-memory.zh.md) · [dsh-memory](./docs/reference/dsh-memory.zh.md)
 - Development: [architecture](./docs/guides/architecture.md) · [dependencies](./docs/guides/dependencies.md) · [testing](./docs/guides/testing.md) · [release](./docs/guides/release.md)
 
 ## Development
