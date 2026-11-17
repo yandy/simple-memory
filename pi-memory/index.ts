@@ -93,6 +93,18 @@ function countInjectedBlocks(content: string): number {
 	return Math.max(0, content.split("\n## ").length - 1);
 }
 
+/**
+ * `startup` 的 `outcome.warning` 是「prepare 预告 + 可能追加的启动预算用尽行」的拼接，而预告已经
+ * 由 `onWarning` 通道即时通知过。这里只取尚未通知的尾部，避免同一条预告在账本里记两次。
+ */
+function unwarnedStartupTail(delivered: string | undefined, warning: string | undefined): string {
+	if (warning === undefined || warning === "") return "";
+	if (delivered === undefined || delivered === "") return warning;
+	if (warning === delivered) return "";
+	// core 用 `joinWarning` 以换行追加；只剥一层分隔符，不改写内容。
+	return warning.startsWith(`${delivered}\n`) ? warning.slice(delivered.length + 1) : warning;
+}
+
 export const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
 
 /**
@@ -226,7 +238,9 @@ export default function (pi: ExtensionAPI) {
 	/** 每次 session_start 先收掉旧 runtime；init 阶段 engine 仍为空，也必须 abort。 */
 	function disposeSyncRuntime(target: PiSyncRuntime | null = syncRuntime): void {
 		try {
-			target?.dispose();
+			// core 的 dispose 已经同步关闸/abort/dispose，返回的 promise 只负责 drain 且永不 reject。
+			// 退出路径不 await 它：无界 drain 不能变成 shutdown 的等待上限。
+			void target?.dispose();
 		} catch {
 			/* 同步收摊不得影响新会话 */
 		} finally {
@@ -324,7 +338,8 @@ export default function (pi: ExtensionAPI) {
 			...spec,
 			onWrite: (info) => {
 				spec.onWrite?.(info);
-				syncRuntime?.engine?.noteWrite();
+				// 写入必须经 runtime 入口：收摊或换远端关闸期间它会拒绝触碰旧 engine。
+				syncRuntime?.noteWrite();
 			},
 		});
 	}
@@ -391,7 +406,7 @@ export default function (pi: ExtensionAPI) {
 			if (!isCurrent()) return;
 			const assembled = await createPiSyncRuntime({ config: cfg, store: activeStore, projectDir: dir, identity });
 			if (!isCurrent()) {
-				assembled.runtime?.dispose();
+				void assembled.runtime?.dispose();
 				return;
 			}
 			syncRuntime = assembled.runtime;
@@ -404,32 +419,27 @@ export default function (pi: ExtensionAPI) {
 			}
 			const activeRuntime = assembled.runtime;
 			if (activeRuntime) {
-				// 自动初始化与启动收敛共用一份预算；prepare 之外绝不再造一份完整网络预算。
-				const startupDeadline = Date.now() + cfg.sync.autoTimeoutMs;
-				const prepared = await activeRuntime.prepare(cfg.sync.autoTimeoutMs);
+				// 自动预算、prepare 与启动轮次全在 core 的一次 startup 里共享同一个 deadline；宿主的
+				// 职责是保留两套通道：预告即时通知（必须在 push 之前），失败进错误账。
+				let preparedWarning: string | undefined;
+				const startup = await activeRuntime.startup((warning) => {
+					// 已换代（新 session_start 已经换掉了这一代的账本与 runtime）：预告不得再写进新会话。
+					if (!isCurrent()) return;
+					preparedWarning = warning;
+					syncNotices.push(warning);
+					// 首次本地记忆的冲突预告必须发生在任何启动 push 之前，不能等副本已经落盘才说。
+					notifyPendingSyncNotices();
+				});
 				if (!isCurrent()) return;
-				if (!prepared.ok) {
-					syncErrors.push(prepared.reason);
+				if (!startup.ok) {
+					syncErrors.push(startup.reason);
 				} else {
-					if (prepared.warning) {
-						syncNotices.push(prepared.warning);
-						// 首次本地记忆的冲突预告必须发生在任何启动 push 之前，不能等副本已经落盘才说。
-						notifyPendingSyncNotices();
-					}
-					// 一轮 push = 收敛 + 补推；pullOnStart false 仍 prepare，但绝不 fetch/pull/push。
-					if (cfg.sync.pullOnStart === true) {
-						const remaining = startupDeadline - Date.now();
-						if (remaining <= 0) {
-							// 预算用尽是「本轮跳过、下一轮再推」，不是失败：走预告通道，别染红启动日志。
-							syncNotices.push(
-								`the automatic startup budget of ${cfg.sync.autoTimeoutMs}ms was exhausted during preparation; ` +
-									"startup push was skipped and will run on the next round",
-							);
-						} else {
-							const round = await activeRuntime.runActivity(() => prepared.engine.push(remaining));
-							if (!isCurrent()) return;
-							if (!round.ok) syncErrors.push(round.skipped?.reason ?? "memory sync startup round failed");
-						}
+					// 预算用尽是「本轮跳过、下一轮再推」，不是失败：它在 outcome.warning 尾部追加，
+					// 而 prepare 的预告已经由回调通知过，这里只补新增的那一段。
+					const pendingNotice = unwarnedStartupTail(preparedWarning, startup.warning);
+					if (pendingNotice !== "") syncNotices.push(pendingNotice);
+					if (startup.value !== null && !startup.value.ok) {
+						syncErrors.push(startup.value.skipped?.reason ?? "memory sync startup round failed");
 					}
 				}
 			}
@@ -656,9 +666,10 @@ export default function (pi: ExtensionAPI) {
 			flushWarningShown = true;
 			notifySync(ui, `Memory sync flush failed: ${reason}; local changes will be retried at the next session start.`);
 		};
-		if (engine && cfg && runtime) {
+		if (runtime && cfg) {
+			// core 的 flush 在没有已准备 engine 时返回 null（并已登记到活动账）：outcome 成败仍由 round 自己表达。
 			try {
-				flushPromise = runtime.runActivity(() => engine.flush(cfg.sync.autoTimeoutMs));
+				flushPromise = runtime.flush(cfg.sync.autoTimeoutMs);
 			} catch (error) {
 				flushPromise = Promise.reject(error);
 			}
@@ -794,35 +805,35 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
-			await activeRuntime.runActivity(async () => {
-				const engine = activeRuntime.engine;
-				if (!engine) {
-					const initialized = await activeRuntime.backend.ready();
-					if (!initialized) {
-						notifySync(
-							ui,
-							'Memory sync is not initialized: set "sync.remote" in memory.json; initialization runs at session start, or use /memory sync pull to retry.',
-							"info",
-						);
-						return;
-					}
-					const origin = await activeRuntime.backend.getRemote();
-					notifySync(
-						ui,
-						syncErrorMessage(
-							[
-								"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
-								`Origin: ${origin ?? "(not set)"}`,
-								`Configured remote: ${typeof cfg.sync.remote === "string" && cfg.sync.remote.trim() !== "" ? cfg.sync.remote : "(not set)"}`,
-							].join("\n"),
-						),
-						"info",
-					);
-					return;
-				}
-				const report = await engine.status(cfg.sync.timeoutMs);
-				notifySync(ui, renderSyncStatus(report, typeof cfg.sync.remote === "string" ? cfg.sync.remote : ""), "info");
-			});
+			// 严格 dry-run 由 core 保证：engine 尚未准备时只读 ready/origin，绝不 prepare/init。
+			const status = await activeRuntime.status(cfg.sync.timeoutMs);
+			if (!status.ok) {
+				notifySync(ui, `Memory sync status failed: ${syncErrorMessage(status.reason)}`);
+				return;
+			}
+			if (!("origin" in status.value)) {
+				notifySync(ui, renderSyncStatus(status.value, typeof cfg.sync.remote === "string" ? cfg.sync.remote : ""), "info");
+				return;
+			}
+			if (!status.value.initialized) {
+				notifySync(
+					ui,
+					'Memory sync is not initialized: set "sync.remote" in memory.json; initialization runs at session start, or use /memory sync pull to retry.',
+					"info",
+				);
+				return;
+			}
+			notifySync(
+				ui,
+				syncErrorMessage(
+					[
+						"Memory sync is initialized but not ready; run /memory sync pull or push to finish preparation.",
+						`Origin: ${status.value.origin ?? "(not set)"}`,
+						`Configured remote: ${typeof cfg.sync.remote === "string" && cfg.sync.remote.trim() !== "" ? cfg.sync.remote : "(not set)"}`,
+					].join("\n"),
+				),
+				"info",
+			);
 		} catch (error) {
 			notifySync(ui, `Memory sync status failed: ${syncErrorMessage(error)}`);
 		}
@@ -837,32 +848,32 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
-			await activeRuntime.runActivity(async () => {
-				const prepared = await activeRuntime.prepare(cfg.sync.timeoutMs);
-				if (!prepared.ok) {
-					setSyncError([...syncPersistentErrors, prepared.reason]);
-					notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(prepared.reason)}`);
-					return;
-				}
-				if (prepared.warning) {
-					// 手动恢复也必须先让人看到预告，再执行会产生/发布副本的那一轮。
-					notifySync(ui, `Memory sync ${kind} preparation:\n${syncErrorMessage(prepared.warning)}`, "info");
-				}
-				const round = await prepared.engine[kind](cfg.sync.timeoutMs);
-				const errors = [...syncPersistentErrors];
-				if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
-				setSyncError(errors);
-				setSyncNotice(prepared.warning ? [prepared.warning] : []);
-				const rendered = renderSyncRound(round);
-				if (!round.ok) {
-					notifySync(
-						ui,
-						`Memory sync ${kind} failed: ${syncErrorMessage(round.skipped?.reason ?? "unknown sync failure")}\n${rendered}`,
-					);
-					return;
-				}
-				notifySync(ui, `Memory sync ${kind}:\n${rendered}`, "info");
+			let preparedWarning: string | undefined;
+			const outcome = await activeRuntime.run(kind, cfg.sync.timeoutMs, (warning) => {
+				preparedWarning = warning;
+				// 手动恢复也必须先让人看到预告，再执行会产生/发布副本的那一轮。
+				notifySync(ui, `Memory sync ${kind} preparation:\n${syncErrorMessage(warning)}`, "info");
 			});
+			if (!outcome.ok) {
+				setSyncError([...syncPersistentErrors, outcome.reason]);
+				notifySync(ui, `Memory sync ${kind} failed: ${syncErrorMessage(outcome.reason)}`);
+				return;
+			}
+			const round = outcome.value;
+			const preparationWarning = outcome.warning ?? preparedWarning;
+			const errors = [...syncPersistentErrors];
+			if (!round.ok) errors.push(round.skipped?.reason ?? `unknown sync ${kind} failure`);
+			setSyncError(errors);
+			setSyncNotice(preparationWarning ? [preparationWarning] : []);
+			const rendered = renderSyncRound(round);
+			if (!round.ok) {
+				notifySync(
+					ui,
+					`Memory sync ${kind} failed: ${syncErrorMessage(round.skipped?.reason ?? "unknown sync failure")}\n${rendered}`,
+				);
+				return;
+			}
+			notifySync(ui, `Memory sync ${kind}:\n${rendered}`, "info");
 		} catch (error) {
 			const reason = syncErrorMessage(error);
 			setSyncError([...syncPersistentErrors, reason]);
@@ -879,17 +890,17 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
-			const prepared = await activeRuntime.changeRemote(remote, cfg.sync.timeoutMs);
+			// core 在公开调用时就关闸；预告经回调即时通知，才能先于 replacement 写触发到达用户。
+			const changed = await activeRuntime.changeRemote(remote, cfg.sync.timeoutMs, (warning) => {
+				notifySync(ui, `Memory sync remote preparation:\n${syncErrorMessage(warning)}`, "info");
+			});
 			const errors = [...syncPersistentErrors];
-			if (!prepared.ok) errors.push(prepared.reason);
+			if (!changed.ok) errors.push(changed.reason);
 			setSyncError(errors);
-			setSyncNotice(prepared.ok && prepared.warning ? [prepared.warning] : []);
-			if (!prepared.ok) {
-				notifySync(ui, `Memory sync remote failed: ${syncErrorMessage(prepared.reason)}`);
+			setSyncNotice(changed.ok && changed.warning ? [changed.warning] : []);
+			if (!changed.ok) {
+				notifySync(ui, `Memory sync remote failed: ${syncErrorMessage(changed.reason)}`);
 				return;
-			}
-			if (prepared.warning) {
-				notifySync(ui, `Memory sync remote preparation:\n${syncErrorMessage(prepared.warning)}`, "info");
 			}
 			notifySync(
 				ui,
