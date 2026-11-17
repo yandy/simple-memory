@@ -2,123 +2,67 @@
 
 ## 宿主提供的包必须写进 `peerDependencies`
 
-宿主提供的包（`@earendil-works/*`、`typebox`）不得写进 `dependencies`：pi 在加载扩展时会扫描并
-告警，安装的副本还会旁路扩展加载器的模块映射，造成重复运行时模块。
+宿主提供的包（`@earendil-works/*`、`@deepseek-ai/*`、`typebox`）不得写进 `dependencies`：pi 加载扩展时
+会扫描并告警，装下来的副本还会旁路扩展加载器的模块映射，造成重复运行时模块。
 
-执行点是 `npm run check:host-deps`（`scripts/check-host-deps.mjs`），CI 的 `test` job 会跑。
-规则：
+执行点是 `npm run check:host-deps`（CI 的 `test` job）：
 
-- 源码里 import 了宿主提供包，就必须在 `peerDependencies` 里声明；
-- `typebox` 系（`typebox` / `@sinclair/typebox`）按宿主约定用 `*` 范围；
-- `@earendil-works/*` 的范围由本仓自定，当前是 `>=1.5.0`（下限就是 devDependency 的精确版本），脚本只要求声明存在。
+- 源码 import 了宿主包，就必须在 `peerDependencies` 声明；
+- `typebox` 系按宿主约定用 `*`；
+- `@earendil-works/*` / `@deepseek-ai/*` 的范围由本仓自定，脚本只要求声明存在；
+- `dsh-memory` 的九个 `@deepseek-ai/*` peer 全部 `optional: true`：某个 profile 缺其中一个时插件保持
+  inactive（fiber pending），而不是让整个安装失败。
 
-## pi 宿主包的版本
+## 宿主包版本：peer 写下限，dev 钉精确
 
-`pi-memory` 的 `devDependencies` 把 `@earendil-works/pi-ai` / `pi-coding-agent` / `pi-tui`
-**钉死在 `1.5.0`**（精确版本，不带范围），`peerDependencies` 声明 `>=1.5.0`。devDependency 取的就是
-peer 下限：CI 跑在冒烟也会跑的那一档上，不给「声明支持、实际没测」留缝。
+两个适配层的 devDependencies 都用**精确版本**（不带 `~`/`^`）钉住宿主包，peer 只写下限；dev 取的正是
+peer 下限，CI 跑在冒烟也会跑的那一档上，不给「声明支持、实际没测」留缝。具体版本以各包 `package.json`
+为准，本文不复制。
 
-钉精确版本不是疏忽：宿主 API 会破坏性变更，而代码是照着某一个版本写的。下限 `1.5.0` 是刻意选的策略值
-（只支持这一档起的宿主），而代码真正**依赖**的 API 边界比它更早，认清楚这两件事才能判断下次能不能随手
-抬：
+钉精确不是疏忽：宿主 API 会破坏性变更，而代码是照着某一档写的。两条硬约束：
 
-- `before_agent_start` 变成 `BeforeAgentStartUserEvent | BeforeAgentStartCustomEvent` 是 **1.2.0**
-  （1.1.0 / 1.0.0 / 0.99.2 都还是单一事件，只有 `prompt`，没有 `messageType`）。`pi-memory` 的自动浮现
-  按 `event.messageType === "user"` 取用户输入，装在 <1.2.0 的宿主上该字段不存在，浮现会静默不触发。
-- `CreateAgentSessionOptions` 只收 `modelRuntime`：`modelRegistry` 在 0.80.2 之后、0.99.2 之前就被移除
-  （不是 1.5.0 才改的）。扩展拿不到 runtime（`ExtensionContext.modelRegistry` 是同步门面，没有取回
-  runtime 的公开途径），所以默认由宿主自建 runtime；**有运行时注册的 provider 时**
-  `src/agent-runner.ts` 自己造一个并把它们搬过去（`replayRegisteredProviders`），否则那些模型会
-  「启动校验解析成功、headless 执行时 Unknown provider」。搬不动的只有运行时虚拟模型（registry 没有读取
-  virtual definition 的途径），那种情况在 `runHeadlessAgent` 里变成一条显式错误。
-- `sections`（`systemPromptOptions.sections`）自 0.99.2 起是**必填字段**，不是可选能力：代码直接按必填
-  契约写入，没有降级分支（缺了就是宿主违约，不该在每轮注入里静默咽成整段替换 system prompt）。
-- 1.2.0 → 1.5.0 之间的差异是纯增量（`KeybindingHints`、`projectContextEntry`、
-  `MarkdownTransformerOptions` 等），没有再破坏源码 —— 所以这次抬到 1.5.0 只改声明，1.2.0 那一版留下的
-  适配代码原样成立。
+- **代码真正依赖的 API 边界可能早于策略下限**：升级前按源码里的 import 与类型收窄逐项核对，别只看
+  peer 范围。
+- **升级必然连带改代码与测试**（`createAgentSession` 的选项、事件形状、按旧形状写的 fake 事件），所以
+  升级是一次独立变更；dependabot 对宿主包整包忽略。
 
-推论：升级这三个 devDependency 必然连带改代码（0.80.2 → 1.5.0 这次就改了 `index.ts` 里 `event.prompt` 的
-收窄、`src/agent-runner.ts` 里 `createAgentSession` 的选项，以及按 0.80.2 事件形状写的 fake 事件与测试），
-必须当成一次独立变更来做，不能让 dependabot 的自动 PR 越过它。
-
-## dsh 宿主包
-
-`dsh-memory` 的宿主包是 `@deepseek-ai/*`（九个），处理规则比 pi 系更严格：
-
-- **只能出现在 `peerDependencies` 与 `devDependencies`**。九个 peer 全部在 `peerDependenciesMeta` 里标
-  `optional: true`：某个 profile 缺其中一个时，插件保持 inactive（fiber pending）而不是让整个安装失败。
-  它们绝不能进 `dependencies`（`npm run check:host-deps` 会拦）。
-- **devDependencies 钉精确版本**：`0.2.2-rc.1`，`@deepseek-ai/cordis` 例外为 `4.1.0`。这不是疏忽 ——
-  宿主 `0.2.0-rc.2` → `0.2.2-rc.1` 一个跨度就破坏了三处本仓已经对着宿主源码改正的接口
-  （见 `docs/superpowers/specs/2026-11-09-dsh-memory-adapter-design.md` §2.3），升级必须是一次
-  deliberate 的变更，与本仓对 `@earendil-works/*` 钉死的理由相同。
-- **运行时零宿主 import**：out-of-tree 插件无法静态解析宿主包，所以 `src/` 里 `@deepseek-ai/*` 只出现在
-  `src/host-types.ts`、且只以 `import type` 出现（tsc 擦除）。执行点是
-  `grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 必须零命中（`.d.ts` 里命中是合法的，不算失败）。
-- **不导出 schemastery `Config`**：导出它需要运行时 import `@deepseek-ai/schemastery`，与零宿主 import
-  冲突。代价是没有宿主的 Settings-UI 页面，行 config 由插件自己校验（`src/row-config.ts`）。
-
-**`@deepseek-ai/dsh-session` 看似可以删，实际不行**：`src/` 里没有一行按名字 import 它，但它参与了
-typecheck。`src/host-types.ts` 从 `@deepseek-ai/dsh-agent` 取 `Agent`，而 `Agent` 的 `session` 属性是宿主用
-模块增广补上的（`dsh-agent/lib/types/runtime-types.d.ts:164-168`），类型为 `dsh-session` 的 `Session`，
-`Session.header` 又是 `SessionHeader`。适配层正是读 `agent.session.id` 与 `agent.session.header`（会话键、
-根/子 agent 门禁），所以这些类型经 `dsh-agent` 间接到达，而不是直接 import。九个 peer 全 `optional: true`，
-声明它零成本。
-
-这九条精确版本各有一条 `.github/dependabot.yml` 的 `ignore`（与 `@earendil-works/*` 同样处理）：升级只能
-走一次独立变更，不能让自动 PR 越过它。
+`dsh-memory` 另有一条更硬的规则：**运行时零宿主 import** —— out-of-tree 插件无法静态解析宿主包，所以
+`@deepseek-ai/*` 只出现在 `src/host-types.ts` 且只以 `import type` 出现。执行点是
+`grep -rn "@deepseek-ai" dsh-memory/dist --include="*.js"` 零命中（`.d.ts` 命中不算）。因此也不导出
+schemastery `Config`（那需要运行时 import），行 config 由 `src/row-config.ts` 自己校验。
 
 ## `@yandy0725/memory-core`：开发走仓内源码，运行走 registry
 
-适配层（`pi-memory` / `dsh-memory`）对 core 有两条互斥的解析路径，必须同时成立：
+适配层对 core 有两条互斥的解析路径，必须同时成立：
 
 | 时机 | 解析到 | 由什么保证 |
 |------|--------|-----------|
-| 开发（`npm test` / `npm run typecheck`） | `../memory-core/src/index.ts` | `vitest.config.ts` 的 `resolve.alias` + `tsconfig.json` 的 `compilerOptions.paths` |
-| 构建（`npm run build`） | 包 `exports` → `node_modules/@yandy0725/memory-core/dist` | `tsconfig.build.json` 里的 `"paths": {}`（清掉源码别名） |
-| 运行时（用户机器上装包后） | registry 上的 `@yandy0725/memory-core` | `dependencies` 里的 caret 范围 |
+| 开发（`npm test` / `typecheck`） | `../memory-core/src/index.ts` | `vitest.config.ts` 的 `resolve.alias` + `tsconfig.json` 的 `paths` |
+| 构建 / 运行时 | 包 `exports` → `dist` → registry 上的版本 | `tsconfig.build.json` 清空 `paths` + `dependencies` 的 caret 范围 |
 
 推论：
 
-- core **只写进 `dependencies`**，不写进 `devDependencies`：workspace 已经会把它链接进
-  `node_modules`，重复声明只会制造第二份副本，让上面两条路径悄悄漂移。
-- 范围写 `^x.y.z`，不写 `file:` / `workspace:` / `*` / `latest`：发布出去后用户机器上解析不到。
-- 构建配置不得继承源码别名：否则产物可能对着**比 registry 上更新**的源码编出来，而用户拿到的
-  core 没有那些 API。
+- core **只写进 `dependencies`**，不写进 `devDependencies`（workspace 已经会链接，重复声明只会制造第二份
+  副本，让两条路径悄悄漂移）。
+- 范围写 `^x.y.z`，不写 `file:` / `workspace:` / `*` / `latest`。
+- 构建配置不得继承源码别名，否则产物会对着比 registry 更新的源码编出来。
+- **适配层 import 的每个 core 导出都必须存在于声明的范围里**：core 新增导出时先发 core、再抬范围。
 
-单宿主策略键不进 core 的配置契约：像 pi 的 `dream.nudgeAfterSessions` / `dream.nudgeAfterHours` 这类
-「只服务一个宿主」的键，只属于那个宿主的配置（pi 侧的 `PiHostConfig`），不得进 `MemoryConfig`。core 的
-配置契约只收两个宿主共有的语义。
+单宿主策略键不进 core 的配置契约：像 `dream.nudgeAfterSessions` 只属于 pi 的配置；`sync.pushDebounceMs`
+因为在两个宿主上都有消费者（写入后去抖发布）才能进 `MemoryConfig`，而退出兜底的推送不设键。
 
-反过来，`sync.pushDebounceMs` 正因为它**在两个宿主上都有消费者**（「写入后去抖一次发布」是 pi 与 dsh
-同一语义，去抖本身由 core 的写触发 scheduler 实现）才能落在 `MemoryConfig` 的 `sync` 子树里；而退出
-兜底的那一轮推送**不设键** —— 那是 pi 自己的接线细节，dsh 没有可靠的退出事件，配了也不会生效。
-判定标准是「有没有第二个消费者」，不是「听起来像不像全局选项」。
+执行点：
 
-执行点三条：
+- `npm run check:memory-core-deps`（`test` job）—— 静态检查上面几条。
+- `npm run smoke:workspace`（`workspace-smoke` job）—— core 与适配层的仓内 tarball 在干净目录同时安装。
+- `npm run smoke:registry`（`registry-smoke` job，只在 main 跑）—— 适配层 tarball 装进干净目录、依赖只从
+  registry 拉，断言解析到的 core 在目录内、版本满足范围、能真读写。未发布的适配层在找不到满足范围的
+  core 时只打 notice 跳过；去掉 `private` 后同一条件变成失败。
 
-- `npm run check:memory-core-deps`（`scripts/check-memory-core-deps.mjs`，CI 的 `test` job）—— 静态检查
-  上面三条，`package.json` / `vitest.config.ts` / `tsconfig*.json` 各有一类错误文案。
-- `npm run smoke:workspace`（同一脚本带 `--workspace-core`，CI 的 `workspace-smoke` job）—— core 与适配层
-  都取仓内 tarball，在干净目录同时安装，验证仓内发布形态的实际解析；输出明确说 registry 路径未验证。
-- `npm run smoke:registry`（`scripts/registry-smoke.mjs`，CI 的 `registry-smoke` job，只在 main 上跑）——
-  把适配层打成 tarball 装进干净目录（依赖只从 registry 拉），断言解析到的 core 落在该目录内、版本满足
-  声明的范围、并能真读写。需要先 `npm run build -w memory-core -w dsh-memory`。未发布的适配层
-  （`private: true`）在 registry 上找不到满足范围的 core 时只打 notice 跳过；去掉 `private` 后同一条件
-  变成失败。
-
-CI 的 `test-dist` job 覆盖仓内 dist：`MEMORY_CORE_FROM_DIST=1` 关掉 alias，让同一套测试打到
-`memory-core/dist`。`workspace-smoke` 覆盖仓内 tarball 的安装解析，`registry-smoke` 再补用户从 registry
-装到 core 的最后一段；三者不互相冒充。
+三者互不冒充；`test-dist` 另用 `MEMORY_CORE_FROM_DIST=1` 覆盖仓内 dist。
 
 ## 依赖自动更新
 
-`.github/dependabot.yml` 的骨架与 `yandy/pi-packages` 保持一致（周更、限 5 个 PR、dev 依赖
-minor/patch 成组）。唯一刻意的差异是 `ignore`：
-
-- `@earendil-works/*` 三个宿主包精度钉死 1.5.0（见上节）；
-- `@deepseek-ai/*` 九个 dsh 宿主包同样钉死精确版本（见上节「dsh 宿主包」）；
-- `@yandy0725/memory-core` 是 workspace 内依赖 —— 自动更新只会产出必然红 CI 的 PR 或绕开发布
-  顺序。
-
-要动这些版本，走独立变更；顺手删 `ignore` 条目不算。
+`.github/dependabot.yml` 周更、限 5 个 PR、dev 依赖 minor/patch 成组；刻意的 `ignore` 只有三类：
+`@earendil-works/*`、`@deepseek-ai/*`（都钉精确版本，见上）与 `@yandy0725/memory-core`（workspace 内依赖，
+自动更新只会产出必然红 CI 的 PR 或绕开发布顺序）。要动这些版本走独立变更，顺手删 `ignore` 条目不算。
