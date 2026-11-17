@@ -90,12 +90,20 @@ export interface FakeBackend extends SyncBackend {
 	initFailure: Error | null;
 	/** `ready()` 之前的人为延迟，用来让 prepare 吃掉启动预算。 */
 	readyDelayMs: number;
+	/** 非 null 时 `ready()` 等到它放行才返回。 */
+	readyBarrier: Deferred<void> | null;
+	/** `ready()` 一进来就 resolve。 */
+	readyStarted: Deferred<void> | null;
 	/** 非 null 时 `init()` 等到它放行才返回。 */
 	initBarrier: Deferred<void> | null;
 	/** 非 null 时 `getRemote()` 等到它放行才返回。 */
 	getRemoteBarrier: Deferred<void> | null;
 	/** `getRemote()` 一进来就 resolve。 */
 	getRemoteStarted: Deferred<void> | null;
+	/** 非 null 时 `setRemote()` 等到它放行才返回。 */
+	setRemoteBarrier: Deferred<void> | null;
+	/** `setRemote()` 一进来就 resolve。 */
+	setRemoteStarted: Deferred<void> | null;
 	/** `init()` 一进来就 resolve：测试据此在「init 途中」做别的事。 */
 	initStarted: Deferred<void> | null;
 	/** 每次 `init()` 收到的 abort 信号。 */
@@ -114,10 +122,14 @@ export function createFakeBackend(events: string[]): FakeBackend {
 		initWarnings: [],
 		initFailure: null,
 		readyDelayMs: 0,
+		readyBarrier: null,
+		readyStarted: null,
 		initBarrier: null,
 		initStarted: null,
 		getRemoteBarrier: null,
 		getRemoteStarted: null,
+		setRemoteBarrier: null,
+		setRemoteStarted: null,
 		initSignals: [],
 		initTimeouts: [],
 		readyCalls: 0,
@@ -126,7 +138,9 @@ export function createFakeBackend(events: string[]): FakeBackend {
 		async ready(): Promise<boolean> {
 			backend.readyCalls += 1;
 			events.push("backend:ready");
+			backend.readyStarted?.resolve(undefined);
 			if (backend.readyDelayMs > 0) await sleep(backend.readyDelayMs);
+			if (backend.readyBarrier !== null) await backend.readyBarrier.promise;
 			return backend.initialized;
 		},
 		async init(opts: SyncRunOptions): Promise<SyncInitResult> {
@@ -154,6 +168,8 @@ export function createFakeBackend(events: string[]): FakeBackend {
 		async setRemote(remote: string, _opts: SyncRunOptions): Promise<void> {
 			events.push("backend:setRemote");
 			backend.setRemoteCalls.push(remote);
+			backend.setRemoteStarted?.resolve(undefined);
+			if (backend.setRemoteBarrier !== null) await backend.setRemoteBarrier.promise;
 			// 端口口径：未初始化时什么都不改；空地址 fail-closed。
 			if (!backend.initialized) return;
 			if (remote.trim() === "") throw new Error("refusing to set an empty sync remote");
@@ -253,6 +269,16 @@ export interface FakeEngine extends SyncEngine {
 	pullFailure: Error | null;
 	/** 非 null 时 `push` 抛出它（在屏障之后抛，时序用例仍可用）。 */
 	pushFailure: Error | null;
+	/** 非 null 时 `status()` 等到它放行才返回。 */
+	statusBarrier: Deferred<void> | null;
+	/** `status()` 一进来就 resolve。 */
+	statusStarted: Deferred<void> | null;
+	/** 非 null 时 `flush()` 抛出它，runtime 必须保留 rejection 形状并脱敏。 */
+	flushFailure: Error | null;
+	/** 非 null 时 `noteWrite()` 记录这次尝试之后抛出。 */
+	noteWriteFailure: Error | null;
+	/** `dispose()` 一进来就 resolve。 */
+	disposeStarted: Deferred<void> | null;
 	rounds: { pull: SyncRoundResult; push: SyncRoundResult };
 	flushRound: SyncRoundResult | null;
 	statusReport: SyncStatusReport;
@@ -271,6 +297,11 @@ export function createFakeEngine(events: string[]): FakeEngine {
 		pushStarted: null,
 		pullFailure: null,
 		pushFailure: null,
+		statusBarrier: null,
+		statusStarted: null,
+		flushFailure: null,
+		noteWriteFailure: null,
+		disposeStarted: null,
 		rounds: { pull: PULL_ROUND, push: PUSH_ROUND },
 		flushRound: FLUSH_ROUND,
 		statusReport: STATUS_REPORT,
@@ -294,20 +325,25 @@ export function createFakeEngine(events: string[]): FakeEngine {
 		async status(timeoutMs?: number): Promise<SyncStatusReport> {
 			events.push("engine:status");
 			engine.statusTimeouts.push(timeoutMs as number);
+			engine.statusStarted?.resolve(undefined);
+			if (engine.statusBarrier !== null) await engine.statusBarrier.promise;
 			return engine.statusReport;
 		},
 		noteWrite(): void {
 			events.push("engine:noteWrite");
 			engine.noteWrites += 1;
+			if (engine.noteWriteFailure !== null) throw engine.noteWriteFailure;
 		},
 		async flush(timeoutMs?: number): Promise<SyncRoundResult | null> {
 			events.push("engine:flush");
 			engine.flushTimeouts.push(timeoutMs as number);
+			if (engine.flushFailure !== null) throw engine.flushFailure;
 			return engine.flushRound;
 		},
 		dispose(): void {
 			events.push("engine:dispose");
 			engine.disposeCalls += 1;
+			engine.disposeStarted?.resolve(undefined);
 		},
 	};
 	return engine;

@@ -1,5 +1,7 @@
+import { unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import { DEFAULT_CONFIG, type MemoryConfig, syncConfigErrors } from "../config.js";
+import { withFsRetry } from "../store/fs-retry.js";
 import type { MemoryStore } from "../store/memory-store.js";
 import type { ProjectIdentity } from "../store/paths.js";
 import type { SyncBackend } from "./backend.js";
@@ -104,7 +106,7 @@ export interface SyncRuntime {
 
 const DISPOSED_REASON = "sync runtime is disposed";
 const BUDGET_REASON = "sync initialization requires a finite positive timeout budget";
-const REMOTE_CHANGE_UNAVAILABLE = "changing the sync remote is not implemented by this runtime yet";
+const BUSY_REASON = "sync remote change is already in progress; retry the operation afterwards";
 const NOT_INITIALIZED_ORIGIN = "the initialized sync origin is unavailable";
 
 /** 有限正预算：`NaN` / `0` / `Infinity` 传到子进程 timeout 或定时器上都会变成「无限等」。 */
@@ -179,13 +181,21 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 	let pendingEngine: SyncEngine | null = null;
 	let initController: AbortController | null = null;
 	let prepareInFlight: Promise<SyncPrepareResult> | null = null;
+	let remoteChangeInFlight: Promise<SyncRuntimeOutcome<null>> | null = null;
 	let disposeFlight: Promise<void> | null = null;
 	let disposed = false;
-	/** 最小活动账本：两种协调模式共用一本，串行 tail 与换远端闸都接在它上面。 */
+	let remoteChangeActive = false;
+	/** serial 的 FIFO 只编排高层活动；engine 自己的自动轮仍由 engine.inFlight 单独登记。 */
+	let tail: Promise<unknown> = Promise.resolve();
+	/** 两种协调模式共用一本活动账，换远端与 dispose 都从它 drain。 */
 	const activities = new Set<Promise<unknown>>();
 
 	function disposedOutcome<T>(): SyncRuntimeOutcome<T> {
 		return { ok: false, reason: DISPOSED_REASON };
+	}
+
+	function busyOutcome<T>(): SyncRuntimeOutcome<T> {
+		return { ok: false, reason: BUSY_REASON };
 	}
 
 	function okOutcome<T>(value: T, warning: string | undefined): SyncRuntimeOutcome<T> {
@@ -218,9 +228,36 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 		return flight;
 	}
 
+	/** 手动活动与换远端共用一条 tail；tail 自身永不 reject，后续活动不会被前一次失败截断。 */
+	function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+		const flight = tail.then(operation, operation);
+		tail = flight.then(
+			() => undefined,
+			() => undefined,
+		);
+		return flight;
+	}
+
+	function coordinate<T>(operation: () => Promise<T>): Promise<T> {
+		// serial 只在真正出队时登记，避免把尚未开始的操作误算成正在执行的 engine I/O。
+		return options.scheduling === "serial" ? enqueue(() => track(operation)) : track(operation);
+	}
+
 	async function buildEngine(): Promise<SyncEngine> {
 		const device = await loadOrCreateDevice(syncRoot, now);
 		return options.createEngine({ syncRoot, projectDir, projectKey, store, backend, device, config: sync, now });
+	}
+
+	/** 失败恢复也留一台 engine 接住旧 dirty 与关闸期间的写入；缺失 manifest 仍是安全空基线。 */
+	async function ensureRuntimeEngine(): Promise<SyncEngine | null> {
+		if (currentEngine !== null) return currentEngine;
+		const engine = await buildEngine();
+		if (disposed) {
+			engine.dispose();
+			return null;
+		}
+		currentEngine = engine;
+		return engine;
 	}
 
 	/**
@@ -316,7 +353,7 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 	 * concurrent 模式下并发的 prepare 共用一个 flight 并返回同一 engine（两条启动路径不该各自 init
 	 * 一次）；serial 模式的高层操作同样走这里，所以排到后面的调用也不会重复 init。
 	 */
-	function prepare(timeoutMs: number): Promise<SyncPrepareResult> {
+	function prepareInternal(timeoutMs: number): Promise<SyncPrepareResult> {
 		if (disposed) return Promise.resolve({ ok: false, reason: DISPOSED_REASON });
 		if (!positiveBudget(timeoutMs)) return Promise.resolve({ ok: false, reason: BUDGET_REASON });
 		if (prepareInFlight !== null) return prepareInFlight;
@@ -329,6 +366,115 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 		return tracked;
 	}
 
+	function prepare(timeoutMs: number): Promise<SyncPrepareResult> {
+		if (disposed) return Promise.resolve({ ok: false, reason: DISPOSED_REASON });
+		if (remoteChangeActive) return Promise.resolve({ ok: false, reason: BUSY_REASON });
+		return prepareInternal(timeoutMs);
+	}
+
+	function remoteChangeFailure(
+		remote: string,
+		originChanged: boolean,
+		stage: "prepare" | "operation",
+		reason: string,
+	): SyncRuntimeOutcome<null> {
+		const cleanReason = syncErrorMessage(reason);
+		if (messages.formatRemoteChangeFailure === undefined) return { ok: false, reason: cleanReason };
+		return {
+			ok: false,
+			reason: syncErrorMessage(messages.formatRemoteChangeFailure({ remote, originChanged, stage, reason: cleanReason })),
+		};
+	}
+
+	/** 无论原结果成败都恢复写触发；恢复自己的错误追加在原诊断之后，而不是吞掉它。 */
+	async function finishRemoteChange(result: SyncRuntimeOutcome<null>): Promise<SyncRuntimeOutcome<null>> {
+		if (disposed) return disposedOutcome();
+		try {
+			const replacement = await ensureRuntimeEngine();
+			if (disposed || replacement === null) return disposedOutcome();
+			// 不猜 flush(null)：旧 dirty 与关闸期间的写入统一转成一次新 engine 触发。
+			replacement.noteWrite();
+		} catch (error) {
+			const recovery = `failed to restore the sync write trigger: ${syncErrorMessage(error)}`;
+			return result.ok ? { ok: false, reason: recovery } : { ok: false, reason: `${result.reason}\n${recovery}` };
+		}
+		return result;
+	}
+
+	/** 关闸后新活动进不来，因此这里只需等待调用时已经登记的旧活动、prepare 与 serial 前序 tail。 */
+	async function drainRemoteChange(previousTail: Promise<unknown> | null): Promise<void> {
+		const draining: Array<Promise<unknown>> = [...activities];
+		if (prepareInFlight !== null) draining.push(prepareInFlight);
+		if (previousTail !== null) draining.push(previousTail);
+		await Promise.allSettled(draining);
+		// serial 前序活动可能在快照之后才进入 prepare；tail 已等它完成，这里再复核一次账本。
+		const preparing = prepareInFlight;
+		if (preparing !== null && !draining.includes(preparing)) await Promise.allSettled([preparing]);
+	}
+
+	/** 两种调度模式共用同一份持久切换顺序；formatter 只包诊断，不参与任何持久决策。 */
+	async function runRemoteChange(
+		remote: string,
+		timeoutMs: number,
+		onWarning: ((warning: string) => void) | undefined,
+		previousTail: Promise<unknown> | null,
+	): Promise<SyncRuntimeOutcome<null>> {
+		let originChanged = false;
+		let result: SyncRuntimeOutcome<null>;
+		try {
+			await drainRemoteChange(previousTail);
+			if (disposed) return disposedOutcome();
+			const ready = await backend.ready();
+			if (disposed) return disposedOutcome();
+			if (!ready) {
+				// 尚未开始的切换没有旧状态可恢复，也不能借收尾偷偷初始化 device。
+				return { ok: false, reason: syncErrorMessage(messages.uninitializedRemoteChange) };
+			}
+
+			const previous = currentEngine;
+			const previousRound = previous?.inFlight ?? null;
+			currentEngine = null;
+			previous?.dispose();
+			// abort/dispose 不等于 settled：旧自动轮未结束前不能删除它还可能写回的旧基线。
+			if (previousRound !== null) await Promise.allSettled([previousRound]);
+			if (disposed) return disposedOutcome();
+
+			try {
+				await withFsRetry(() => unlink(projectManifest));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (disposed) return disposedOutcome();
+			const controller = new AbortController();
+			initController = controller;
+			try {
+				await backend.setRemote(remote, { timeoutMs, signal: controller.signal });
+				originChanged = true;
+			} finally {
+				if (initController === controller) initController = null;
+			}
+			if (disposed) return disposedOutcome();
+
+			const prepared = await prepareInternal(timeoutMs);
+			if (disposed) return disposedOutcome();
+			if (!prepared.ok) {
+				result = remoteChangeFailure(remote, originChanged, "prepare", prepared.reason);
+			} else {
+				// 预告必须先于 replacement noteWrite；回调异常则属于 origin 已切换后的 operation 失败。
+				if (prepared.warning !== undefined) onWarning?.(prepared.warning);
+				if (disposed) return disposedOutcome();
+				result = okOutcome(null, prepared.warning);
+			}
+		} catch (error) {
+			pendingEngine?.dispose();
+			pendingEngine = null;
+			result = disposed
+				? disposedOutcome()
+				: remoteChangeFailure(remote, originChanged, "operation", syncErrorMessage(error));
+		}
+		return finishRemoteChange(result);
+	}
+
 	const runtime: SyncRuntime = {
 		get engine(): SyncEngine | null {
 			return currentEngine;
@@ -338,13 +484,14 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 
 		startup(onWarning?: (warning: string) => void): Promise<SyncRuntimeOutcome<SyncRoundResult | null>> {
 			if (disposed) return Promise.resolve(disposedOutcome());
+			if (remoteChangeActive) return Promise.resolve(busyOutcome());
 			// 自动预算只算一次：prepare 与启动轮次共享同一份 deadline，谁也别各自重新满格。
 			const autoTimeoutMs = sync.autoTimeoutMs;
 			const deadline = Date.now() + autoTimeoutMs;
-			return track(async () => {
+			return coordinate(async () => {
 				try {
 					if (disposed) return disposedOutcome<SyncRoundResult | null>();
-					const prepared = await prepare(autoTimeoutMs);
+					const prepared = await prepareInternal(autoTimeoutMs);
 					if (!prepared.ok) return prepared;
 					if (disposed) return disposedOutcome<SyncRoundResult | null>();
 					// 首次基线的冲突副本预告必须先于任何可能产生/发布副本的轮次。
@@ -378,10 +525,11 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 			onWarning?: (warning: string) => void,
 		): Promise<SyncRuntimeOutcome<SyncRoundResult>> {
 			if (disposed) return Promise.resolve(disposedOutcome());
-			return track(async () => {
+			if (remoteChangeActive) return Promise.resolve(busyOutcome());
+			return coordinate(async () => {
 				try {
 					if (disposed) return disposedOutcome<SyncRoundResult>();
-					const prepared = await prepare(timeoutMs);
+					const prepared = await prepareInternal(timeoutMs);
 					if (!prepared.ok) return prepared;
 					if (disposed) return disposedOutcome<SyncRoundResult>();
 					// 手动恢复初始化时，预告同样要先于会产生/发布副本的那一轮。
@@ -399,11 +547,15 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 
 		status(timeoutMs: number): Promise<SyncRuntimeOutcome<SyncRuntimeStatus>> {
 			if (disposed) return Promise.resolve(disposedOutcome());
-			return track(async () => {
+			if (remoteChangeActive) return Promise.resolve(busyOutcome());
+			return coordinate(async () => {
 				if (disposed) return disposedOutcome<SyncRuntimeStatus>();
 				try {
 					const engine = currentEngine;
-					if (engine !== null) return { ok: true, value: await engine.status(timeoutMs) };
+					if (engine !== null) {
+						const report = await engine.status(timeoutMs);
+						return disposed ? disposedOutcome<SyncRuntimeStatus>() : { ok: true, value: report };
+					}
 					// 严格 dry-run：只问本地那点状态，绝不 prepare/init、创建设备或写 manifest。
 					const ready = await backend.ready();
 					if (disposed) return disposedOutcome<SyncRuntimeStatus>();
@@ -418,33 +570,51 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 			});
 		},
 
-		/**
-		 * 换远端的持久顺序（关闸、排空、失效旧基线、`setRemote`、重建空基线、恢复写触发）与两种
-		 * 协调模式的闸门由后续实现补齐；在此之前 fail-closed —— 半途改变 origin 比拒绝更糟。
-		 */
 		changeRemote(
-			_remote: string,
-			_timeoutMs: number,
-			_onWarning?: (warning: string) => void,
+			remote: string,
+			timeoutMs: number,
+			onWarning?: (warning: string) => void,
 		): Promise<SyncRuntimeOutcome<null>> {
 			if (disposed) return Promise.resolve(disposedOutcome());
-			return Promise.resolve({ ok: false, reason: REMOTE_CHANGE_UNAVAILABLE });
+			if (remoteChangeActive) return Promise.resolve(busyOutcome());
+			if (!positiveBudget(timeoutMs)) return Promise.resolve({ ok: false, reason: BUDGET_REASON });
+
+			// 必须在公开调用时同步关闸：serial 中排在前面的活动允许完成，之后的活动立即 busy。
+			remoteChangeActive = true;
+			const previousTail = options.scheduling === "serial" ? tail : null;
+			const flight =
+				options.scheduling === "serial"
+					? enqueue(() => runRemoteChange(remote, timeoutMs, onWarning, previousTail))
+					: runRemoteChange(remote, timeoutMs, onWarning, null);
+			const tracked = flight.finally(() => {
+				if (remoteChangeInFlight === tracked) {
+					remoteChangeInFlight = null;
+					remoteChangeActive = false;
+				}
+			});
+			remoteChangeInFlight = tracked;
+			return tracked;
 		},
 
 		flush(timeoutMs: number): Promise<SyncRoundResult | null> {
 			if (disposed) return Promise.resolve(null);
-			return track(async () => {
+			if (remoteChangeActive) return Promise.reject(new Error(BUSY_REASON));
+			return coordinate(async () => {
 				if (disposed) return null;
 				const engine = currentEngine;
 				if (engine === null) return null;
-				// `null` 不表示成功：成败仍由返回的 round 自己表达。
-				return engine.flush(timeoutMs);
+				// `null` 不表示成功：成败仍由返回的 round 自己表达；rejection 形状保留，但文本必须脱敏。
+				try {
+					return await engine.flush(timeoutMs);
+				} catch (error) {
+					throw new Error(syncErrorMessage(error));
+				}
 			});
 		},
 
 		noteWrite(): void {
-			// 收摊之后不得再触碰旧 engine：它已经 dispose，触发只会跑一次死轮。
-			if (disposed) return;
+			// 收摊或换远端关闸期间不得触碰旧 engine；replacement trigger 会接住这段空档的写入。
+			if (disposed || remoteChangeActive) return;
 			currentEngine?.noteWrite();
 		},
 
@@ -468,6 +638,9 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 			const draining: Array<Promise<unknown>> = [...activities];
 			if (prepareInFlight !== null) draining.push(prepareInFlight);
 			if (automaticRound !== null) draining.push(automaticRound);
+			if (remoteChangeInFlight !== null) draining.push(remoteChangeInFlight);
+			// serial 的 tail 覆盖调用时尚未出队的活动；concurrent 的换远端则由上面那本 flight 账覆盖。
+			draining.push(tail);
 			// drain 绝不启动新 I/O；promise 不 reject，宿主可以安全地 `void` 它。
 			disposeFlight = Promise.allSettled(draining).then(() => undefined);
 			return disposeFlight;
