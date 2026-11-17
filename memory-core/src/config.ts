@@ -339,6 +339,70 @@ export function requiredModel(cfg: MemoryConfig, task: ModelTask): string {
 	return value;
 }
 
+/** Windows 盘符绝对路径（`C:\…` / `C:/…`）。 */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+/** Windows UNC 路径（`\\server\share`），也覆盖 `\\?\` 扩展长度写法。 */
+const WINDOWS_UNC_PATH = /^\\\\/;
+
+/**
+ * 路径类配置的校验出口：**空数组 = 通过**。
+ *
+ * 存在理由：`resolveMemoryDir()` 对 `memoryDir` 只做 `resolve()`，于是**另一个平台**写法的
+ * 绝对路径会被静默改写成「相对当前工作目录」的路径：
+ *
+ * - POSIX 上 `"E:/shared/pi-memory"` → `<cwd>/E:/shared/pi-memory`；
+ * - win32 上 `"/mnt/shared/pi-memory"` → `<当前盘>:\mnt\shared\pi-memory`
+ *   （`win32.isAbsolute("/mnt/…")` 恰为 `true`，所以它不会被当成相对路径而报错）。
+ *
+ * 这不是可读失败而是**悄悄分叉出一个新记忆库** —— 用户看到的现象是「记忆全丢了」。所以它必须
+ * 在会话启动时成为一条配置错误，而不是在半年后靠翻磁盘发现。
+ *
+ * 形态刻意与 `syncConfigErrors` / `modelConfigErrors` 不同：后者校验的是可选特性与模型，本函数
+ * 只报「记忆会落到错的地方」这类**地址**错误，由适配层当致命错误处理（不建 store、不注册工具）。
+ *
+ * 注意本函数**只做字符串判断**、不做任何文件 IO（core 的 `config.ts` 不碰文件系统）：
+ * 「根不可用」（存在但不是目录、悬空符号链接）属于解析期错误，由 `resolveMemoryDir()` 报出。
+ *
+ * `options.configSource` 同 `modelConfigErrors`：文案里点名的配置来源由适配层传入（默认见
+ * `HOST_CONFIG_SOURCE`），core 不写宿主的文件名。
+ */
+export function pathConfigErrors(
+	cfg: Pick<MemoryConfig, "memoryDir">,
+	platform: NodeJS.Platform = process.platform,
+	options: { configSource?: string } = {},
+): string[] {
+	const configSource = options.configSource ?? HOST_CONFIG_SOURCE;
+	const value: unknown = cfg.memoryDir;
+	if (typeof value !== "string") {
+		// `mergeConfig` 不校验类型，手写的配置里 `"memoryDir": 5` 会一路传到 `resolve()` 才抛
+		// TypeError。这里先把它变成一条点名键的错误。
+		return [`"memoryDir" must be a string (got ${value === null ? "null" : typeof value})`];
+	}
+	if (value.trim() === "") {
+		// 空串不是「没配」：`resolve("")` 是当前工作目录，记忆会写进**启动目录**里。
+		return [`"memoryDir" is empty in ${configSource} — set a path (an empty value resolves to the working directory)`];
+	}
+	if (platform !== "win32") {
+		if (WINDOWS_DRIVE_PATH.test(value) || WINDOWS_UNC_PATH.test(value)) {
+			return [
+				`"memoryDir" is a Windows path (${value}) but this is ${platform}: resolve() would turn it into a directory ` +
+					`under the current working directory; set a path for this platform in ${configSource} ` +
+					'(prefix it with "./" if you really mean a relative directory named like a drive)',
+			];
+		}
+		return [];
+	}
+	// UNC 是合法的 Windows 绝对路径，必须先放行，再判断「以分隔符开头 = 盘符相对」。
+	if (WINDOWS_UNC_PATH.test(value)) return [];
+	if (value.startsWith("/") || value.startsWith("\\")) {
+		return [
+			`"memoryDir" is rooted at "${value[0]}" but this is win32: resolve() would place it on the current drive ` +
+				`(${value}); set a drive-letter or UNC path in ${configSource}`,
+		];
+	}
+	return [];
+}
+
 export function expandTilde(p: string, platform: NodeJS.Platform = process.platform): string {
 	if (p === "~") return homedir();
 	if (p.startsWith("~/")) return join(homedir(), p.slice(2));

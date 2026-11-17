@@ -26,6 +26,7 @@ export {
 	defaultMemoryRoot,
 	expandTilde,
 	modelConfigErrors,
+	pathConfigErrors,
 	requiredModels,
 	syncConfigErrors,
 } from "@yandy0725/memory-core";

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
@@ -89,6 +89,24 @@ describe("resolveMemoryDir", () => {
 		expect(await resolveMemoryDir({ memoryDir: "/custom/root" }, dir)).toBe(
 			join(resolve("/custom/root"), "git", "github.com__yandy__pi-packages"),
 		);
+	});
+
+	// 根**不可用**必须在解析期就说清楚：`mkdir` 在悬空链接上抛的是裸 `ENOTDIR`，而那正是
+	// 「共享盘链接没建好」这类最需要一句人话的场景（issue #12）。根**不存在**不算错 —— 写入路径
+	// 会 `mkdir -p`。
+	it("rejects a memory root that exists but is not a directory", async () => {
+		const notADir = join(dir, "mem-root-is-a-file");
+		await writeFile(notADir, "", "utf8");
+		await expect(resolveMemoryDir({ memoryDir: notADir }, dir)).rejects.toThrow(/is not a directory/);
+		await expect(resolveMemoryDir({ memoryDir: notADir }, dir)).rejects.toThrow(notADir);
+	});
+
+	it.skipIf(process.platform === "win32")("rejects a dangling symbolic-link memory root", async () => {
+		const dangling = join(dir, "mem-root-link");
+		// 目标目录刻意不建：`stat` 会 ENOENT，只有 `lstat` 能看出它是个链接。
+		await symlink(join(dir, "missing-target"), dangling);
+		await expect(resolveMemoryDir({ memoryDir: dangling }, dir)).rejects.toThrow(/does not exist/);
+		await expect(resolveMemoryDir({ memoryDir: dangling }, dir)).rejects.toThrow(dangling);
 	});
 });
 
