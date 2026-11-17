@@ -526,6 +526,77 @@ describe("changeRemote 诊断与恢复", () => {
 });
 
 describe("flush 与 dispose 边界", () => {
+	it("changeRemote 已启动的新基线 writer 会在 dispose drain 内完成，且不恢复 replacement", async () => {
+		const writerStarted = deferred();
+		const writerGate = deferred();
+		const { h, runtime } = await harnessFor({
+			manifestWriteHook: async (write, invocation) => {
+				if (invocation === 2) {
+					writerStarted.resolve(undefined);
+					await writerGate.promise;
+				}
+				await write();
+			},
+		});
+		h.backend.origin = "https://old.example/org/proj.git";
+		const oldEngine = await prepareOldEngine(h, runtime);
+		h.backend.initRevision = "rev-new-in-flight";
+
+		const changing = runtime.changeRemote(NEXT_REMOTE, 1000);
+		void changing.then(() => h.events.push("change:done"));
+		await writerStarted.promise;
+		// 第二次写入属于 changeRemote 的新空基线，并且在 dispose 之前已经启动。
+		expect(h.manifestWrites).toHaveLength(2);
+		expect(h.engines).toHaveLength(2);
+		const pendingReplacement = h.engines[1];
+		expect(runtime.engine).toBeNull();
+
+		let drainSettled = false;
+		const draining = runtime.dispose();
+		void draining.then(() => {
+			drainSettled = true;
+			h.events.push("dispose:done");
+		});
+		expect(runtime.engine).toBeNull();
+		expect(pendingReplacement.disposeCalls).toBe(1);
+		await sleep(0);
+		expect(drainSettled).toBe(false);
+
+		writerGate.resolve(undefined);
+		expect(await changing).toEqual({ ok: false, reason: DISPOSED_REASON });
+		await draining;
+
+		expect(await h.manifest()).toEqual({
+			version: 2,
+			transport: syncTransport(NEXT_REMOTE, "main"),
+			base: { revision: "rev-new-in-flight", syncedAt: "2026-11-15T08:00:00.000Z" },
+			files: {},
+		});
+		const secondWriteDone = h.events.indexOf("manifest:write:done", h.events.indexOf("manifest:write:done") + 1);
+		expect(secondWriteDone).toBeGreaterThanOrEqual(0);
+		expect(secondWriteDone).toBeLessThan(h.events.indexOf("dispose:done"));
+		expect(h.events.indexOf("change:done")).toBeLessThan(h.events.indexOf("dispose:done"));
+		expect(runtime.engine).toBeNull();
+		expect(h.engines).toHaveLength(2);
+		expect(oldEngine.noteWrites).toBe(0);
+		expect(pendingReplacement.noteWrites).toBe(0);
+
+		// changeRemote 与 prepare 都已排空；后续公开调用和写触发不会再启动 writer/backend/engine I/O。
+		const eventsAfterDrain = [...h.events];
+		runtime.noteWrite();
+		expect(await runtime.prepare(1000)).toEqual({ ok: false, reason: DISPOSED_REASON });
+		expect(await runtime.changeRemote("https://after-dispose.example/org/proj.git", 1000)).toEqual({
+			ok: false,
+			reason: DISPOSED_REASON,
+		});
+		await sleep(0);
+		expect(h.events).toEqual(eventsAfterDrain);
+		expect(h.manifestWrites).toHaveLength(2);
+		expect(h.engines).toHaveLength(2);
+		expect(oldEngine.noteWrites).toBe(0);
+		expect(pendingReplacement.noteWrites).toBe(0);
+	});
+
 	it("engine.flush rejection 保持 rejection 形状，但重新抛出的文本不泄露 URL 凭据", async () => {
 		const { runtime } = await harnessFor({
 			engineSetup(engine) {

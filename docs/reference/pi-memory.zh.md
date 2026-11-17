@@ -189,8 +189,9 @@ session_shutdown
   是 single-flight，并发的准备共用同一次。
 - **注入原语**：backend、engine 与首份基线的 `writeManifest` 都从 core 公开出口传入，所以接线测试里的
   包装工厂继续命中真实实现。
-- **文案与展示**：漂移指引（指向 `memory.json` 与 `/memory sync remote`）、报告尾部那行「索引只在本会话
-  内冻结」，以及 `pi-memory sync notice:` / `pi-memory sync error:` 的前缀与 notice/error 级别。
+- **文案与展示**：漂移指引只指向 `/memory sync remote`；未初始化时换远端的另一条指引才指向
+  `memory.json` 里的 `sync.remote`。报告尾部那行「索引只在本会话内冻结」，以及 `pi-memory sync notice:` /
+  `pi-memory sync error:` 的前缀与 notice/error 级别也留在 pi。
 - **宿主生命周期**：`session_start` 中 await `startup()` 且排在索引值选定之前、`session_shutdown` 的
   `flush()` 与有界等待、`dispose()` 只收摊；命令解析与确认、错误/预告账本也都在这一侧。
 

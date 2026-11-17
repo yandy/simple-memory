@@ -255,8 +255,13 @@ formatter，保持当前文案。恢复写触发自身的失败仍追加到最�
 ### 6.6 dispose 与 drain
 
 `dispose()` 的同步部分立即：关闭入口、abort init、将 engine/pending 置空并 dispose 两者、取消 scheduler。
-随后返回一个幂等 promise，drain 当前 tail、活动集合、prepare flight 与旧 engine 的 `inFlight`；绝不调用
-flush，也绝不因 drain 启动新 I/O。
+随后返回一个幂等 promise，drain 当前 tail、活动集合、prepare/changeRemote flight 与旧 engine 的
+`inFlight`；绝不调用 flush，drain 自身也不发起新操作。
+
+drain 是等待已接纳工作，不是取消已经启动的原子写：dispose 前 prepare/changeRemote 已经调用的
+`writeManifest` 可以在 drain 内完成，且 dispose 必须等它完成。因此收摊后盘上可以留下一份绑定实际或新
+origin 的一致空 v2 基线，但 `runtime.engine` 仍为 `null`，也不会补发 replacement `noteWrite()`。dispose
+调用后不得再启动新的 manifest 写入；drain resolve 后不得残留写入或 I/O，也不得再启动新的写入或 I/O。
 
 - dsh `await dispose()`，保持现有 abort + drain。
 - pi 调用后仍使用自己的 `track` + 有界 shutdown 等待，不把无界 drain 直接 await 在退出路径上；core 返回的
@@ -335,7 +340,8 @@ renderSyncStatus(
 7. changeRemote 的完整持久顺序、旧 inFlight drain、manifest 删除失败不改 origin、成功/失败都恰好一次
    replacement noteWrite、warning 先于 replacement trigger。
 8. dsh formatter 与默认原始 reason 两种诊断；恢复 trigger 失败仍追加。
-9. dispose 幂等、同步 abort/dispose、drain 不 flush；serial tail 与 automatic inFlight 都被等待。
+9. dispose 幂等、同步 abort/dispose、drain 不 flush；serial tail、automatic inFlight 与已启动的 manifest
+   writer 都被等待，writer 可在 drain 内完成，但 dispose 后不启动新写、不交付 engine、不补 replacement trigger。
 10. `withFsRetry` 的删除重试不改变最终 fail-closed 语义。
 
 公开出口测试补充 `createSyncRuntime`、`syncErrorMessage` 和两个共同 renderer；中立性测试继续零例外。

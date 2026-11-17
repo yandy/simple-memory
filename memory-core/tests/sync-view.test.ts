@@ -193,6 +193,16 @@ describe("renderSyncStatus", () => {
 		expect(text.indexOf("first trailing line")).toBeLessThan(text.indexOf("second trailing line"));
 	});
 
+	it("漂移提示为空串时不追加空行，尾部行仍紧跟共同字段", () => {
+		const text = renderSyncStatus(status(), "https://configured.example.invalid/org/other.git", {
+			originDriftMessage: "",
+			trailingLines: ["first trailing line"],
+		});
+
+		expect(text.endsWith("Errors: none\nfirst trailing line")).toBe(true);
+		expect(text).not.toContain("Errors: none\n\nfirst trailing line");
+	});
+
 	it("没有漂移时不追加注入的提示", () => {
 		const drift = "should not appear";
 		const text = renderSyncStatus(status(), "https://origin.example.invalid/org/memory.git", {

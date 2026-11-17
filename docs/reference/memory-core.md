@@ -161,14 +161,17 @@ order, but it neither picks a transport implementation nor reads a config file.
 
 | Mode | Used by | Behaviour |
 |---|---|---|
-| `concurrent` | pi | `startup` / `run` / `status` / `flush` start before the public call returns and are registered as activities; concurrent `prepare` calls share one flight |
-| `serial` | dsh | `startup` / `run` / `status` / `flush` / `changeRemote` queue on one FIFO; an already-queued operation is allowed to finish and later ones wait |
+| `concurrent` | pi | `startup` / `run` / `status` / `flush` start before the public call returns and are registered as activities; concurrent `prepare` calls share one flight. `changeRemote` closes its gate at call time and lets already-admitted work finish; operations called after the gate reject busy rather than wait |
+| `serial` | dsh | `startup` / `run` / `status` / `flush` / `changeRemote` queue on one FIFO. Work admitted or queued before the `changeRemote` gate may finish; operations called after the gate reject busy immediately rather than queue and wait |
 
 Both modes share one `changeRemote` persistent ordering (close the gate → drain → dispose the old engine
 → wait for its `inFlight` to settle → delete this project's manifest → `setRemote` → prepare a new empty
 baseline the same way → exactly one replacement `noteWrite()`), and one `dispose()` contract: the
 synchronous part closes the gate, aborts and disposes, and the returned promise only drains — it never
-flushes.
+flushes. An atomic manifest write already started before `dispose()` may finish inside that drain and is
+awaited, leaving a consistent empty v2 baseline without delivering an engine or firing a replacement
+trigger. No new manifest write starts after disposal, and no write or I/O remains or starts after the drain
+resolves.
 
 The common report format lives here too: `renderSyncRound` / `renderSyncStatus` own the field set,
 ordering, dedupe, failed-round expansion and the empty/missing revision distinction; `syncErrorMessage`

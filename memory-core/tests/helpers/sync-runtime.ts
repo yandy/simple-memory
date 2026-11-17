@@ -380,6 +380,8 @@ export interface HarnessOptions {
 	now?: () => Date;
 	/** 每个假 engine 造出来之后的钩子（挂屏障、换 round、记 `inFlight`）。 */
 	engineSetup?: (engine: FakeEngine) => void;
+	/** 包装真实原子 writer 的测试屏障；invocation 从 1 开始，默认直接写。 */
+	manifestWriteHook?: (write: () => Promise<void>, invocation: number) => Promise<void>;
 }
 
 export interface HarnessResult {
@@ -472,10 +474,16 @@ export async function createSyncRuntimeHarness(): Promise<SyncRuntimeHarness> {
 					return engine;
 				},
 				// 注入的 writer：先记账，再走真实原子写 —— 于是「runtime 绕开注入直接调包内同名函数」
-				// 会让 `manifestWrites` 空着，而盘上却有文件，两处断言同时能抓到。
+				// 会让 `manifestWrites` 空着，而盘上却有文件，两处断言同时能抓到。屏障只包住这一次在途调用。
 				writeManifest: async (path, manifest) => {
+					events.push("manifest:write:start");
 					manifestWrites.push({ path, manifest });
-					await writeManifest(path, manifest);
+					const write = async (): Promise<void> => {
+						await writeManifest(path, manifest);
+						events.push("manifest:write:done");
+					};
+					if (over.manifestWriteHook !== undefined) await over.manifestWriteHook(write, manifestWrites.length);
+					else await write();
 				},
 				now: over.now ?? HARNESS_NOW,
 			});

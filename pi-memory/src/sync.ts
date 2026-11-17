@@ -21,8 +21,8 @@ import type { MemoryConfig } from "./config";
  * 收摊）全部在 core 的 `createSyncRuntime` 里；这里保留的每一行都属于宿主策略：
  *
  * - 调度固定 `concurrent`：pi 的活动在公开调用返回前就开始并登记，与其他会话级工作并发。
- * - 漂移提示与「未初始化却要换远端」的指引必须指向 pi 自己的配置来源 `memory.json` 与
- *   `/memory sync remote` —— core 不认宿主的斜杠命令。
+ * - 漂移提示只指向 `/memory sync remote`；「未初始化却要换远端」的指引另指向 pi 的配置来源
+ *   `memory.json` —— core 不认宿主的斜杠命令。
  * - 报告的尾部行（索引只在会话开始冻结）同样是 pi 的展示策略。
  * - backend/engine/manifest writer 原样注入**公开** core 出口：接线测试的包装工厂与
  *   `writeManifest` 故障注入因此继续命中真实现，而不是被 core 内部的相对 import 绕开。

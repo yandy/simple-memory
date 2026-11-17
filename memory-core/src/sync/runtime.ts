@@ -57,7 +57,13 @@ export interface SyncRuntimeOptions {
 		originDrift: string;
 		/** 未初始化却请求换远端时，指向宿主自己的配置来源。 */
 		uninitializedRemoteChange: string;
-		/** 可选：保留宿主对「origin 已改但后续失败」的既有措辞。 */
+		/**
+		 * 可选：保留宿主对「origin 已改但后续失败」的既有措辞。
+		 *
+		 * `remote` 是原始输入，可能含 URL userinfo，不得未脱敏就写日志；`reason` 已脱敏，formatter
+		 * 返回的完整文本也会再次脱敏。formatter 抛错时退回不带包装但已脱敏的原 reason，正常的
+		 * replacement engine 恢复与写触发仍会继续。
+		 */
 		formatRemoteChangeFailure?(failure: {
 			remote: string;
 			originChanged: boolean;
@@ -100,7 +106,11 @@ export interface SyncRuntime {
 	/** 无已准备 engine 时返回 `null`；其余语义与 `SyncEngine.flush` 相同。 */
 	flush(timeoutMs: number): Promise<SyncRoundResult | null>;
 	noteWrite(): void;
-	/** 调用时同步关闭入口并 abort/dispose；返回的 promise 只负责 drain，不发起 flush。 */
+	/**
+	 * 调用时同步关闭入口并 abort/dispose；返回的 promise 只负责 drain，不发起 flush。
+	 * dispose 前已启动的 manifest writer 可在 drain 内完成且必须被等待；之后不得新起写入，
+	 * drain 完成后不得残留写入/I/O，也不交付 engine 或补发 replacement noteWrite。
+	 */
 	dispose(): Promise<void>;
 }
 
@@ -265,7 +275,8 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 	 *
 	 * 顺序是安全边界，不是风格：init 的共存检查通过之前不建 device；init 之后重新读**实际** origin
 	 * 才写基线（配置里那个值可能早就与 origin 漂移，也可能为空）；预告读完之后才把 engine 从
-	 * pending 账本交出去。任一 await 之后都要重新检查 disposed —— 收摊期间的晚写比失败更糟。
+	 * pending 账本交出去。任一 await 之后都要重新检查 disposed，避免收摊后新起写入；已经启动的
+	 * writer 则由 prepare flight 纳入 dispose drain，允许完成且必须等它完成。
 	 */
 	async function runPrepare(timeoutMs: number): Promise<SyncPrepareResult> {
 		try {
@@ -312,7 +323,8 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 				// init 之后的真实 origin 才是基线身份：配置漂移或跨进程旧写入都不能换掉它。
 				const origin = await backend.getRemote();
 				if (origin === null) throw new Error(`${NOT_INITIALIZED_ORIGIN}; no baseline was written`);
-				// 读 origin 是写基线前的最后一个 await：这中间被收摊的话，一个字节都不该落盘。
+				// 读 origin 是启动 writer 前的最后一个 await：这里收摊就必须拦住新写；writer 一旦启动，
+				// 这次原子写可在 dispose drain 内完成，但 engine 不会再交付。
 				if (disposed) return { ok: false, reason: DISPOSED_REASON };
 				const baseline = emptyManifest(syncTransport(origin, branch));
 				baseline.base = { revision: initializedNow.revision, syncedAt: now().toISOString() };
@@ -647,7 +659,8 @@ export async function createSyncRuntime(options: SyncRuntimeOptions): Promise<{
 			if (remoteChangeInFlight !== null) draining.push(remoteChangeInFlight);
 			// serial 的 tail 覆盖调用时尚未出队的活动；concurrent 的换远端则由上面那本 flight 账覆盖。
 			draining.push(tail);
-			// drain 绝不启动新 I/O；promise 不 reject，宿主可以安全地 `void` 它。
+			// drain 只等待已登记工作，不发起 flush 或新操作；已启动的 writer 可在等待期间完成。
+			// promise 不 reject，宿主可以安全地 `void` 它。
 			disposeFlight = Promise.allSettled(draining).then(() => undefined);
 			return disposeFlight;
 		},

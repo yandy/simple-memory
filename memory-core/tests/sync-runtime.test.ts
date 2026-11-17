@@ -9,6 +9,7 @@ import {
 	createSyncRuntimeHarness,
 	deferred,
 	mustRuntime,
+	sleep,
 	type HarnessOptions,
 	type HarnessResult,
 	type SyncRuntimeHarness,
@@ -23,7 +24,7 @@ import type { SyncEngine, SyncPrepareResult, SyncRuntime } from "../src/index.js
  * 可挂屏障的假实现 —— 被测的 runtime 一行都没有被替换。
  *
  * 每条用例都能说出它抓的 bug：门禁顺序错、device 早建、基线绑了配置 remote 而不是实际 origin、
- * prepare 没 single-flight、dispose 之后还晚写、启动预算没共享、手动轮次被扣预算、
+ * prepare 没 single-flight、dispose 后新起写或漏等在途 writer、启动预算没共享、手动轮次被扣预算、
  * status 偷偷 prepare、flush 在没 engine 时去建 engine。
  */
 
@@ -323,6 +324,68 @@ describe("prepare 与懒 engine", () => {
 		expect(h.manifestWrites).toEqual([]);
 		expect(h.manifestExists()).toBe(false);
 		expect(runtime.engine).toBeNull();
+	});
+
+	it("首次 prepare 已启动的 manifest writer 会在 dispose drain 内完成", async () => {
+		const writerStarted = deferred();
+		const writerGate = deferred();
+		const { h, runtime } = await harnessFor({
+			manifestWriteHook: async (write, invocation) => {
+				expect(invocation).toBe(1);
+				writerStarted.resolve(undefined);
+				await writerGate.promise;
+				await write();
+			},
+		});
+		h.backend.initRevision = "rev-in-flight";
+		h.backend.origin = "https://actual.example/org/proj.git";
+
+		const preparing = runtime.prepare(5000);
+		void preparing.then(() => h.events.push("prepare:done"));
+		await writerStarted.promise;
+		// writer 在 dispose 之前已经启动；pending engine 已创建，但从未交付。
+		expect(h.manifestWrites).toHaveLength(1);
+		expect(h.engines).toHaveLength(1);
+		const pendingEngine = h.engines[0];
+
+		let drainSettled = false;
+		const draining = runtime.dispose();
+		void draining.then(() => {
+			drainSettled = true;
+			h.events.push("dispose:done");
+		});
+		expect(runtime.engine).toBeNull();
+		expect(pendingEngine.disposeCalls).toBe(1);
+		await sleep(0);
+		expect(drainSettled).toBe(false);
+
+		writerGate.resolve(undefined);
+		expect(await preparing).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		await draining;
+
+		// 已开始的原子写允许在 drain 内完成；完成的是与实际 origin 绑定的一致空 v2 基线。
+		expect(await h.manifest()).toEqual({
+			version: 2,
+			transport: syncTransport("https://actual.example/org/proj.git", "main"),
+			base: { revision: "rev-in-flight", syncedAt: "2026-11-15T08:00:00.000Z" },
+			files: {},
+		});
+		expect(h.events.indexOf("manifest:write:start")).toBeLessThan(h.events.indexOf("engine:dispose"));
+		expect(h.events.indexOf("manifest:write:done")).toBeLessThan(h.events.indexOf("dispose:done"));
+		expect(h.events.indexOf("prepare:done")).toBeLessThan(h.events.indexOf("dispose:done"));
+		expect(runtime.engine).toBeNull();
+		expect(h.engines).toHaveLength(1);
+		expect(pendingEngine.noteWrites).toBe(0);
+
+		// drain 之后既没有残余 continuation，也不会由 noteWrite/新 prepare 再启动任何 I/O。
+		const eventsAfterDrain = [...h.events];
+		runtime.noteWrite();
+		expect(await runtime.prepare(1000)).toEqual({ ok: false, reason: "sync runtime is disposed" });
+		await sleep(0);
+		expect(h.events).toEqual(eventsAfterDrain);
+		expect(h.manifestWrites).toHaveLength(1);
+		expect(h.engines).toHaveLength(1);
+		expect(pendingEngine.noteWrites).toBe(0);
 	});
 
 	it("ready+manifest 路径的 getRemote 期间 dispose：不建 device、不交付 engine", async () => {

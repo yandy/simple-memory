@@ -155,12 +155,14 @@ runtime 自己什么都不装配：backend、engine 与首份基线的 writer（
 
 | 模式 | 谁在用 | 行为 |
 |---|---|---|
-| `concurrent` | pi | `startup` / `run` / `status` / `flush` 在公开调用返回前就起跑并登记为活动；并发 `prepare` 共用一次 flight |
-| `serial` | dsh | `startup` / `run` / `status` / `flush` / `changeRemote` 排一条 FIFO；已排队的操作允许跑完，后来的等它 |
+| `concurrent` | pi | `startup` / `run` / `status` / `flush` 在公开调用返回前就起跑并登记为活动；并发 `prepare` 共用一次 flight。`changeRemote` 调用即关闸，已接纳的工作允许完成；关闸后的新操作直接拒绝 busy，不等待 |
+| `serial` | dsh | `startup` / `run` / `status` / `flush` / `changeRemote` 排一条 FIFO；`changeRemote` 关闸前已接纳或排队的操作允许完成，关闸后的新操作直接拒绝 busy，不入队等待 |
 
 两种模式共用同一条 `changeRemote` 持久顺序（关闸 → 排空 → dispose 旧 engine → 等它 `inFlight` 落定 →
 删本项目 manifest → `setRemote` → 按同一流程建新空基线 → 恰好一次 replacement `noteWrite()`）与同一个
-`dispose()` 契约：同步部分关闸、abort、dispose，返回的 promise 只 drain，**绝不** flush。
+`dispose()` 契约：同步部分关闸、abort、dispose，返回的 promise 只 drain，**绝不** flush。dispose 前已经启动的
+原子 manifest 写入可以在 drain 内完成，且会被等待；盘上因此可以留下一致的空 v2 基线，但不交付 engine，
+也不补发 replacement trigger。dispose 后不新起 manifest 写入，drain resolve 后无残留或新启动的写入/I/O。
 
 共同报告格式也在本包：`renderSyncRound` / `renderSyncStatus` 拥有字段集合、排序去重、失败轮展开与
 revision 空/缺区分；`syncErrorMessage` 是全部同步错误文本唯一的归一化与脱敏出口，git backend 拼自己的

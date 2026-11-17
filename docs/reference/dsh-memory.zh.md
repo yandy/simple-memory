@@ -184,7 +184,8 @@ agent/disposed
   因为一个长寿命宿主进程要服务很多会话（与 store registry、index cache 按 session 分键是同一个理由）。
   同一个 `sessionId` 重建 agent（宿主 `clear` / `compact`）时，`agent/created` 会先 await 上一代
   runtime 的 dispose 再准备新一代，所以陈旧的自动轮次绝不会跨代写远端。`apply` 自己的 disposer
-  也会同样排空剩下每个会话的 runtime。
+  只对剩余会话逐个 `void disposeSyncSession(sessionId)` 启动清理；它不会 await 这些 promise，也不会在返回前
+  排空所有会话。
 
 ### 编排在 core，dsh 只留宿主策略
 

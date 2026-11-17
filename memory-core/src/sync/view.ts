@@ -110,7 +110,7 @@ export function renderSyncStatus(
 	);
 	const drift =
 		configuredRemote.trim() !== "" && report.remote.trim() !== "" && !sameSyncRemote(configuredRemote, report.remote);
-	if (drift && options?.originDriftMessage !== undefined) lines.push(options.originDriftMessage);
+	if (drift && options?.originDriftMessage) lines.push(options.originDriftMessage);
 	if (options?.trailingLines !== undefined) lines.push(...options.trailingLines);
 	return syncErrorMessage(lines.join("\n"));
 }

@@ -210,7 +210,8 @@ agent/disposed
   store registry and index cache are keyed by session). Re-creating an agent with the same `sessionId`
   (host `clear` / `compact`) awaits the previous generation's disposal in `agent/created` before the new
   runtime is prepared, so a stale automatic round can never write to the remote across generations.
-  `apply`'s own disposer drains every remaining session's runtime the same way.
+  `apply`'s own disposer only starts cleanup for each remaining session with `void disposeSyncSession(sessionId)`;
+  it does not await those promises or drain every session before returning.
 
 ### Orchestration lives in core; dsh keeps host policy
 
