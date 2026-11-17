@@ -249,3 +249,14 @@ export type { SyncFileInfo, SyncFileSet } from "./sync/types.js";
 // 漂移提示与尾部行由宿主注入（`SyncViewOptions`）：core 不含 slash 命令，也不猜配置入口叫什么。
 export { renderSyncRound, renderSyncStatus } from "./sync/view.js";
 export type { SyncViewOptions } from "./sync/view.js";
+
+// 会话级同步编排：门禁、懒 engine、prepare、startup/run/status/flush 与收摊只有这一份实现。
+// backend、engine 与首份基线的 writer 都由宿主注入 —— 这里没有默认装配，也不认识任何宿主。
+export { createSyncRuntime } from "./sync/runtime.js";
+export type {
+	SyncPrepareResult,
+	SyncRuntime,
+	SyncRuntimeOptions,
+	SyncRuntimeOutcome,
+	SyncRuntimeStatus,
+} from "./sync/runtime.js";
