@@ -66,21 +66,7 @@ cd /tmp/e2e-project-a && git init -q . && pi
 - 凭据、仓库地址、token 不要贴进 PR 或 issue；地址用 `<owner>/<repo>` 形式脱敏。
 - 失败时保留 `pi-memory sync error:` / 报告原文与 `.sync/` 下的 `state/*.json`（后者不含凭据）。
 
-## 4. 回写 Verification status
+## 4. 更新参考文档的验证状态
 
-- **pi**：`docs/reference/pi-memory.zh.md` 的「跨设备同步」小节末尾有一个
-  `### Verification status` / `### 验证状态` —— 照实际走过的条目更新它。
-- **dsh**：`docs/reference/dsh-memory.zh.md` 的 `## 验证状态` 里，把
-  「跨设备同步**没有**真机验收记录」那段替换成实测记录。
-
-dsh 的模板：
-
-```md
-Cross-device sync **is** covered by a real-host run (<日期>, dsh `<version>`, <平台> over <协议>,
-branch `main`): init on an empty remote, pull on a second device, write-triggered debounced push for the
-main tool / extract / dream, remote change with a reset baseline, and `unlock --force` after a hand-made
-stale root lock. Conflicts resolved to content-derived copies and converged.
-```
-
-只走了子集时**把没走的条目显式写进「Not covered」**，补测通过后再把那一段删掉（pi 的记录就是这样
-从「两项未覆盖」变成「P1–P10 全通」的）。记录里只写做过什么、在什么环境下，不写迁移史。
+跑完把 `docs/reference/pi-memory.zh.md` / `dsh-memory.zh.md` 的「验证状态」一节改成**现状**：做过哪些、
+还差哪些。不写日期、测试数量与逐条过程 —— 那些属于 PR 与 spec，不属于文档。
