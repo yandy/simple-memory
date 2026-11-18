@@ -49,6 +49,12 @@ export interface MemoryToolOptions {
 	skipSnapshot?: boolean;
 	/** 每次成功写 action 之后回调；index.ts 用它给 extract 统计本轮写入条数。 */
 	onWrite?: (info: { action: MemoryAction; name?: string }) => void;
+	/**
+	 * 模型经工具**见过正文**之后回调（`add` / `replace` 成功，或 memory-scope `search` 命中）。
+	 * index.ts 的主 session 注册用它把文件计入召回去重；headless 子会话**不传** —— 它们读到的
+	 * 正文只进了子会话，主模型没见过。
+	 */
+	onContentSeen?: (info: { action: MemoryAction; files: string[] }) => void;
 }
 
 /** 把 core 的 JSON Schema 转成 pi 的 `TSchema`。 */

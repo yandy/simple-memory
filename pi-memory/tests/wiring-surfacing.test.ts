@@ -3,7 +3,8 @@
  *
  * harness 必须排在本文件其他 import 之前：它注册了 `vi.mock`，顺序错了 mock 不生效。
  */
-import { readFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakePi, customTriggerEvent, DISK_INDEX, disposableCtx, flush, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, setupSession, uiCtx, uiWith } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
@@ -156,6 +157,48 @@ describe("index wiring — auto-surfacing", () => {
 		expect(injectedAtCall).toHaveLength(2);
 		expect(injectedAtCall[0]).toEqual(new Set());
 		expect(injectedAtCall[1]).toEqual(new Set(["ssh.md"]));
+	});
+
+	it("counts files the main session tool read as already seen", async () => {
+		const { pi, handlers, tools } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		// 模型在会话里用 `memory` 工具读到了 ssh.md 的正文。
+		await writeFile(
+			join(s.dir, "ssh.md"),
+			[
+				"---",
+				"name: SSH",
+				"description: staging ssh",
+				"type: project",
+				"created: 2026-01-01",
+				"modified: 2026-01-01",
+				"---",
+				"",
+				"staging 的 SSH 用 2222 端口",
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		const read = await tools[0].execute("read-1", { action: "search", query: "SSH" }, undefined, undefined, s.uiCtx());
+		expect(read.content[0].text).toContain("staging 的 SSH 用 2222 端口");
+
+		scanEntriesMock.mockResolvedValue([
+			{ file: "ssh.md", name: "SSH", description: "d", type: "project", modified: "2026-01-01T00:00:00.000Z" },
+		]);
+		// `injectedFiles` 是活 Set：断言必须在调用瞬间快照，否则「已包含 ssh.md」会拿断言时的
+		// 集合比它自己（surfacing 自己刚加进去的那一条），永远成立。
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: "<relevant_memories>x</relevant_memories>" };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), s.uiCtx());
+
+		// surfacing 的输入里已经包含它：core 的 candidates() 会把这个文件过滤掉。
+		expect(injectedAtCall).toEqual([new Set(["ssh.md"])]);
 	});
 
 	it("skips auto-surfacing for subagents", async () => {

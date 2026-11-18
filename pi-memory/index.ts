@@ -355,6 +355,8 @@ export default function (pi: ExtensionAPI) {
 	const headlessFor = (modelRegistry: ExtensionContext["modelRegistry"]) =>
 		createPiHeadlessAgent({
 			modelRegistry,
+			// headless（dream / extract）的 `memory` 工具规格来自 core，**不带** `onContentSeen`：
+			// 它们读到的正文只进了子会话，主模型没见过 —— 标成「已见过」会把本该浮现的条目吞掉。
 			buildMemoryTool,
 		});
 
@@ -477,7 +479,12 @@ export default function (pi: ExtensionAPI) {
 		if (!toolRegistered) {
 			pi.registerTool(
 				// biome-ignore lint/suspicious/noExplicitAny: pi registerTool type cast
-				buildMemoryTool() as any,
+				buildMemoryTool({
+					// 主 session 才计入召回去重：工具把正文交给了主模型，下一轮 surfaced 不该重复。
+					onContentSeen: ({ files }) => {
+						for (const f of files) injectedFiles.add(f);
+					},
+				}) as any,
 			);
 			toolRegistered = true;
 		}
