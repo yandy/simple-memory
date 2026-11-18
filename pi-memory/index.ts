@@ -1,7 +1,7 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
-	BeforeAgentStartEventResult,
+	BoundaryContextPreview,
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionUIContext,
@@ -102,6 +102,70 @@ function countInjectedBlocks(content: string): number {
 }
 
 /**
+ * 取边界上「最后一条真实用户消息」的文本与带图信息（`turn_end` 的归属校验用）。
+ *
+ * 取 `event.context.contextMessages` 而不是 `ctx.sessionManager.getBranch()`：
+ * - 它就是宿主为这个边界合成、下一个请求要用的那份会话上下文（`_buildBoundaryContext`），
+ *   所以「真实用户消息」= 真的会进入上下文的 `role: "user"` 消息。我们自己的
+ *   `memory-auto-surfacing` 与其它扩展的 custom_message 投影成 `role: "custom"`，
+ *   compaction / branch summary 有各自的 role，bash 执行是 `bashExecution` —— 全被排除；
+ * - 排队但尚未 drain 的 follow-up / steering 在宿主的 `pendingMessages` 里，不在
+ *   `contextMessages`：它们还没进消息流，这个边界仍属于原 prompt；
+ * - 纯事件字段，同步读取，不会在 session dispose 后回读失效的 `ctx` 代理。
+ *
+ * 用户消息的 content 是字符串或块数组（宿主 `_prepareRun` 总是给 `[text, ...images]`），
+ * 所以这里同时带回「有没有 image block」：带图那一轮的文本不是纯 prompt，见 `boundaryOwnsRecall`。
+ */
+interface BoundaryUserMessage {
+	text: string;
+	/** 该消息的 content 里是否有 image block（宿主只在真的带图时才追加图片）。 */
+	hasImages: boolean;
+}
+
+function lastUserMessage(context: BoundaryContextPreview | undefined): BoundaryUserMessage | undefined {
+	const messages = context?.contextMessages;
+	if (!Array.isArray(messages)) return undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "user") continue;
+		const content = message.content;
+		if (typeof content === "string") return { text: content, hasImages: false };
+		return {
+			text: content
+				.filter((block) => block.type === "text")
+				.map((block) => (block.type === "text" ? block.text : ""))
+				.join(""),
+			hasImages: content.some((block) => block.type === "image"),
+		};
+	}
+	return undefined;
+}
+
+/**
+ * 这个边界是否仍属于启动本轮检索的那个 user run。两道判据，缺一不可（下面的注释解释为什么
+ * 前缀匹配必须被「两边都带图」这一条钉死）。
+ *
+ * 1. **严格相等**：同文本重复 prompt 视为同一轮 —— 检索 query 相同，召回内容对新 prompt 同样
+ *    适用，误判无害；无图 prompt 的用户消息文本就是 prompt 原文（宿主 `_prepareRun` 只在有
+ *    提示时才拼接），所以无图轮走到这里就结束。
+ * 2. **带图的前缀形态**：宿主把图片归一化提示以 `prompt + "\n\n" + hints` 追加到用户文本后
+ *    （`agent-session.js` `_prepareRun`），同一轮的文本因此带一个后缀。但「文本以
+ *    `prompt + "\n\n"` 开头」本身不能证明是同一条用户消息 —— 用 `A` 的召回去记 `B` 的
+ *    多行 prompt（`A` + 换行 + 更多内容）会把召回记到别人的头上，还会错误标记去重。所以前缀
+ *    分支额外要求：启动检索时 pending 确实带图，且边界上的这条用户消息也确实含 image block。
+ *    无图的后缀文本一律作废。
+ *
+ * 残留的极端情形：pending 带图 + 不同 prompt 恰好以 `prompt + "\n\n"` 开头 + 新 prompt 也
+ * 带图。此时文本前缀相同，语义上高度相关，召回仍适用（与同文本重复 prompt 同性质），可接受。
+ */
+function boundaryOwnsRecall(last: BoundaryUserMessage | undefined, pending: PendingRecall): boolean {
+	if (last === undefined) return false;
+	if (last.text === pending.prompt) return true;
+	if (pending.imageCount === 0 || !last.hasImages) return false;
+	return last.text.startsWith(`${pending.prompt}\n\n`);
+}
+
+/**
  * `startup` 的 `outcome.warning` 是「prepare 预告 + 可能追加的启动预算用尽行」的拼接，而预告已经
  * 由 `onWarning` 通道即时通知过。这里只取尚未通知的尾部，避免同一条预告在账本里记两次。
  */
@@ -111,6 +175,36 @@ function unwarnedStartupTail(delivered: string | undefined, warning: string | un
 	if (warning === delivered) return "";
 	// core 用 `joinWarning` 以换行追加；只剥一层分隔符，不改写内容。
 	return warning.startsWith(`${delivered}\n`) ? warning.slice(delivered.length + 1) : warning;
+}
+
+/**
+ * prefetch 的结果槽：`settled` 之前 `content` 一律不可信（消费点必须先看它）。
+ *
+ * 归属有两道闸，缺一不可：
+ * 1. `before_agent_start` 一到就无条件作废旧 pending（新 run 取代旧 run）；
+ * 2. 消费点（`turn_end`）比对 `prompt` 与边界上「最后一条真实用户消息」—— 宿主允许在
+ *    `before_agent_start` handlers 未完成时收到并排队输入（`_startRun` 先把 `_isAgentRunActive`
+ *    置为 true），因此「B 的 queued 输入 → A 的 before_agent_start 建 pending」这一时序里第 1 道闸
+ *    是哑的，只有消费点按当前上下文校验才能把结果扣在正确的 prompt 上。
+ *
+ * 另外还有两道**同步门**（spec Finding 1）：侧查询在飞时主 agent 可能在同轮用 `memory` 工具
+ * 改 store（`remove` / `replace`）或读到其中某个文件的正文（`search`）。两种情况下这份 recall
+ * 都已经过时 —— 持久化它会让同一份正文在工具结果和召回块里各出现一次，或者把已被删除 / 改写的
+ * 正文写进会话。所以消费前比对 `generation`（store 写入代数）与去重集合交集，任何一项变化就整份
+ * 作废（不持久化、不标去重、下一轮按新 prompt / 新内容重新检索）。
+ */
+interface PendingRecall {
+	settled: boolean;
+	/** 启动这一轮检索的 user run 的 prompt（`BeforeAgentStartUserEvent.prompt`，已展开）。 */
+	prompt: string;
+	/** 启动时这条 prompt 附带的图片数（`BeforeAgentStartUserEvent.images`）：0 = 无图轮。 */
+	imageCount: number;
+	/** 启动这一轮检索的那个 store。会话被重建 / 收掉时它是第二道「同一份 store」的证据。 */
+	store: MemoryStore;
+	/** 启动时的 `store.generation`：消费前变了 = 同轮里有写入落盘，这份结果过时。 */
+	generation: number;
+	files: string[];
+	content: string;
 }
 
 export const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
@@ -234,6 +328,17 @@ export default function (pi: ExtensionAPI) {
 	let currentCwd = "";
 	/** 本 session 已注入过的 entry **文件名**（spec §9.3）。session_compact 会清空它。 */
 	const injectedFiles = new Set<string>();
+	/**
+	 * 本轮 `before_agent_start` 启动的侧查询（spec §5.2）。`before_agent_start` 不 await 它，
+	 * 只在结果就绪、本轮还有后续请求、且边界仍属于同一个 prompt 时由 `turn_end` 持久化一次。
+	 */
+	let pendingRecall: PendingRecall | undefined;
+	/**
+	 * 当前**拥有** `surfacing` 状态行的那一份 pending。收尾时必须持有它才能清 —— 被新一轮取代的
+	 * prefetch 若无条件清，会把新一轮已经亮出来的状态行擦掉；反之（被作废且没有新检索）则必须由
+	 * 它自己清，否则状态行就永久挂着。
+	 */
+	let surfacingStatusFor: PendingRecall | undefined;
 	let lastSystemPrompt = "";
 	/** extract 失败通知的限流（spec §14：同一 session 最多 1 次）。session_start 重置。 */
 	let extractErrorNotified = false;
@@ -355,6 +460,8 @@ export default function (pi: ExtensionAPI) {
 	const headlessFor = (modelRegistry: ExtensionContext["modelRegistry"]) =>
 		createPiHeadlessAgent({
 			modelRegistry,
+			// headless（dream / extract）的 `memory` 工具规格来自 core，**不带** `onContentSeen`：
+			// 它们读到的正文只进了子会话，主模型没见过 —— 标成「已见过」会把本该浮现的条目吞掉。
 			buildMemoryTool,
 		});
 
@@ -475,9 +582,15 @@ export default function (pi: ExtensionAPI) {
 
 		// register memory tool once
 		if (!toolRegistered) {
+			const tool = buildMemoryTool({
+				// 主 session 才计入召回去重：工具把正文交给了主模型，下一轮 surfaced 不该重复。
+				onContentSeen: ({ files }) => {
+					for (const f of files) injectedFiles.add(f);
+				},
+			});
 			pi.registerTool(
 				// biome-ignore lint/suspicious/noExplicitAny: pi registerTool type cast
-				buildMemoryTool() as any,
+				tool as any,
 			);
 			toolRegistered = true;
 		}
@@ -601,15 +714,16 @@ export default function (pi: ExtensionAPI) {
 		lastSystemPrompt = event.systemPrompt;
 		// 先拷到 const：`store` 是工厂作用域的 let，在异步回调里 TS 不会保留它的外层收窄。
 		const activeStore = store;
-		if (!config || !memoryDir || !activeStore) return;
-		const headless = headlessFor(ctx.modelRegistry);
+		// 任何 run（含 custom）都先作废旧 pending：它属于被这一轮取代的那个 prompt
+		//（spec §5.1「新用户轮启动时旧 pending 一律作废」）。
+		pendingRecall = undefined;
+		if (!config || !memoryDir || !activeStore) return {};
 
 		// 索引 section：**每一轮无条件**写入冻结值（含 resume / fork / reload）。
 		// 省略这个键 = pi 的 diffSystemPromptSections 生成 { memory_index: null } = 把索引从
 		// system prompt 里静默删掉（spec §9.1 的 null 陷阱）。「不想改」只能靠喂回同一个值。
-		// 必须在 auto-surfacing **之前**：surfacing 的 `finally` 在 await 之后读 `ctx.hasUI`，
-		// session 在途中 dispose 会让 handler 从那里抛出（R49）——那时 section 已经被跳过，
-		// 这一轮就从「喂回冻结值」变成了「删段」。
+		// 它必须在**任何 await 之前**：handler 一旦在写 section 之前让出，session 途中 dispose
+		// 就能让这一轮从「喂回冻结值」变成「删段」（R49）。
 		applyIndexSection(event.systemPromptOptions, indexSnapshot);
 		const autoSurfacing = config.autoSurfacing;
 		// Skip auto-surfacing in subagent sessions: pi-subagents injects an
@@ -621,35 +735,122 @@ export default function (pi: ExtensionAPI) {
 		// `messageType: "custom"`（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）带 `message`。
 		// 自动浮现按用户输入检索，custom run 没有用户输入可检索，跳过（不是降级）。
 		const promptText = event.messageType === "user" ? event.prompt : undefined;
-		let injectedMessage: BeforeAgentStartEventResult["message"];
+		// 带图轮的归属判据（见 `boundaryOwnsRecall`）：只有 user run 才可能带图。
+		const imageCount = event.messageType === "user" ? (event.images?.length ?? 0) : 0;
 		if (autoSurfacing?.enabled && promptText && !isSubagent) {
-			try {
-				if (ctx.hasUI) ctx.ui.setStatus("surfacing", "Searching relevant memories…");
-				const manifest = await scanEntries(activeStore);
-				if (manifest.length > 0) {
+			// prefetch 与主循环并行：**同步段**把宿主值与本轮输入抓成局部量，异步链此后不再回读
+			// `ctx`（pi 的 ExtensionContext 是代理，session dispose 之后 `hasUI` / `ui` 直接抛错）。
+			const ui = ctx.hasUI ? ctx.ui : undefined;
+			const cfg = config;
+			const dir = memoryDir;
+			const headless = headlessFor(ctx.modelRegistry);
+			const pending: PendingRecall = {
+				settled: false,
+				prompt: promptText,
+				imageCount,
+				store: activeStore,
+				// 写入代数的基线：取**启动这一刻**的值（不等到 scanEntries 之后），所以侧查询在飞期间
+				// 的任何写入都不会被它自己「提前」吞掉。
+				generation: activeStore.generation,
+				files: [],
+				content: "",
+			};
+			pendingRecall = pending;
+			if (ui) {
+				surfacingStatusFor = pending;
+				try {
+					ui.setStatus("surfacing", "Searching relevant memories…");
+				} catch {
+					/* UI 拒绝画状态行不影响检索 */
+				}
+			}
+			const prefetch = (async () => {
+				try {
+					const manifest = await scanEntries(activeStore);
+					if (manifest.length === 0) return;
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
-						{ userPrompt: promptText.slice(0, 4000), injectedFiles, manifest },
-						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless } },
+						// 去重集合递**快照**（spec §5.2.1）：侧查询在飞的时候 `turn_end` 可能已经把
+						// 本轮召回的文件标进活 Set，传引用会让「查询输入」随之后写而变。
+						{ userPrompt: promptText.slice(0, 4000), injectedFiles: new Set(injectedFiles), manifest },
+						{ cfg, cwd: dir, store: activeStore, ports: { headless } },
 					);
-					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
-					if (content !== "") {
-						for (const f of files) injectedFiles.add(f);
-						injectedMessage = { customType: "memory-auto-surfacing", content, display: false };
-						// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知。
-						if (ctx.hasUI) {
-							ctx.ui.notify(`Recalled: ${countInjectedBlocks(content)} entries`, "info");
+					// 期间有新一轮 run 启动（这一份 pending 已被作废）：结果随轮作废，不写回。
+					if (pendingRecall !== pending) return;
+					pending.files = files;
+					pending.content = content;
+				} catch {
+					/* silently skip auto-surfacing on error */
+				} finally {
+					pending.settled = true;
+					// 只有仍是状态行的持有者才收：新一轮已在搜的话，它的 finally 负责收尾。
+					if (surfacingStatusFor === pending) {
+						surfacingStatusFor = undefined;
+						try {
+							ui?.setStatus("surfacing", undefined);
+						} catch {
+							/* session 在途中 dispose：UI 已失效 */
 						}
 					}
 				}
-			} catch {
-				/* silently skip auto-surfacing on error */
-			} finally {
-				if (ctx.hasUI) ctx.ui.setStatus("surfacing", undefined);
-			}
+			})();
+			// 未处理 rejection 在 pi 里没有全局 handler（Node 会直接杀进程）：链内已全 catch，
+			// 这里再兜一层，保证 prefetch 永不影响宿主。
+			void prefetch.catch(() => undefined);
 		}
 
-		return injectedMessage ? { message: injectedMessage } : {};
+		return {};
+	});
+
+	/**
+	 * prefetch 的消费点（spec §5.2）：只有「本轮还有后续请求」且「这个边界仍属于启动检索的 prompt」
+	 * 的 turn 边界才持久化。
+	 *
+	 * - 零工具调用的 turn（含单请求轮）= 本轮之后再没有请求：召回作废，不落 session、不标去重；
+	 * - 归属校验（`boundaryOwnsRecall`）：`event.context` 里最后一条真实用户消息不是下一个 run
+	 *   的 prompt 时，这个边界已经属于别的输入（例如排队中的 follow-up 已被 drain），旧 pending
+	 *   作废而不是记到新输入头上；
+	 * - `custom_message` entries 只能追加在边界，所以持久块位置固定、只出现一次（prefix cache）；
+	 * - 不 `continue`：工具结果本身就会引发下一请求，额外请求只会重算前缀。
+	 */
+	pi.on("turn_end", (event, ctx) => {
+		const pending = pendingRecall;
+		if (!pending?.settled || pending.content === "") return;
+		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
+		// 消费点归属校验：无论结果要不要，这个边界上的 pending 都只能消费一次。
+		pendingRecall = undefined;
+		if (!boundaryOwnsRecall(lastUserMessage(event.context), pending)) return;
+		// 同步门 1：store 在这份结果在飞期间被写过（主工具 / worker / 同步写入都算）→ 整份作废。
+		// 典型情形：同轮 `memory remove` 删掉了选中的条目，或 `replace` 改掉了它的正文 ——
+		// 持久化会把已删 / 已改的正文写进会话。store 换了（会话重建）也算作废（代数不可比）。
+		const activeStore = store;
+		if (activeStore === null || activeStore !== pending.store || activeStore.generation !== pending.generation) return;
+		// 同步门 2：选中的文件里已经有任何一个进了去重集合（同轮 `search` 把它的完整正文交给了模型，
+		// 或者同轮另一个召回已经持久化了它）→ 整份作废。不重组、不部分标记：保守做法是下一轮重新检索。
+		if (pending.files.some((file) => injectedFiles.has(file))) return;
+		// 渲染成功才算注入（content 非空）；持久化保证它最迟在下一请求进入上下文。
+		for (const f of pending.files) injectedFiles.add(f);
+		// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知；ctx 只在同步段读一次。
+		try {
+			if (ctx.hasUI) ctx.ui.notify(`Recalled: ${countInjectedBlocks(pending.content)} entries`, "info");
+		} catch {
+			/* session 在边界上 dispose：通知丢了，召回本身仍然有效 */
+		}
+		return {
+			entries: [
+				...event.entries,
+				{ type: "custom_message" as const, customType: "memory-auto-surfacing", content: pending.content, display: false },
+			],
+		};
+	});
+
+	// pending 的销账点：run 彻底结束（不再有自动重试 / compaction / 排队续轮）之后。
+	// 零工具轮、取消、未就绪都不在 `turn_end` 清 pending（那些边界只是「本轮这个请求不带」，下一轮
+	// 还会重检），所以没有这一道，一份没赶上的结果会一直驻留到本进程退出，或被某个不相干的边界消费。
+	// 它不回滚已提交的 entries：`turn_end` 持久化之后 run 直接结束（工具结果全要求 terminate /
+	// `finishTurn` 返回 end）时，召回仍在历史里 —— 刻意语义，见 `docs/reference/pi-memory.zh.md`。
+	pi.on("agent_settled", () => {
+		pendingRecall = undefined;
 	});
 
 	// D14：compaction 是**唯一**的会话内刷新点。compaction 已经重写了对话中段，头部再变一次

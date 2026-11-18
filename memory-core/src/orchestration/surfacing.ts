@@ -7,7 +7,7 @@ export interface SurfacingInput {
 	manifest: EntryManifest[];
 	/** 用户这一轮的输入（调用方负责先截到预算内）。 */
 	userPrompt: string;
-	/** 本 session 已经注入过的文件，不再重复选。 */
+	/** 本 session 已让模型见过正文的文件（召回注入或工具读取），不再重复选。 */
 	injectedFiles: Set<string>;
 }
 

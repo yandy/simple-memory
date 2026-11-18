@@ -26,6 +26,12 @@ export const OUTPUT_SCHEMA = {
 export interface MemoryToolDeps {
 	/** 每次**成功**写 action 之后回调（core 的 `MemoryHandlerOptions.onWrite` 原样透传）。 */
 	onWrite?(info: { action: MemoryAction; name?: string }): void;
+	/**
+	 * 模型经工具**见过正文**之后回调（`add` / `replace` 成功，或 memory-scope `search` 命中）。
+	 * `index.ts` 的主 session 注册用它把文件计入召回去重；extract / dream 的 worker 工具**不传**。
+	 * 属于 deps（与 `onWrite` 并列）而不是 `options`：`options` 只描述「这个实例能偏离主 agent 口径的三处」。
+	 */
+	onContentSeen?(info: { action: MemoryAction; files: string[] }): void;
 	/** `search scope=sessions` 的宿主实现：返回已格式化好的文本。 */
 	searchSessions(cwd: string, query: string, cfg: { maxSessions: number; maxMatches: number }): Promise<string>;
 }
@@ -77,7 +83,13 @@ export function createMemoryTool(
 			searchSessions: deps.searchSessions,
 			cwd: () => rt.cwd,
 		},
-		{ actions, skipLogicalLock: options.skipLogicalLock, skipSnapshot: options.skipSnapshot, onWrite: deps.onWrite },
+		{
+			actions,
+			skipLogicalLock: options.skipLogicalLock,
+			skipSnapshot: options.skipSnapshot,
+			onWrite: deps.onWrite,
+			onContentSeen: deps.onContentSeen,
+		},
 	);
 
 	return {

@@ -5,9 +5,35 @@ import { DEFAULT_CONFIG, MemoryStore, mergeConfig } from "@yandy0725/memory-core
 import type { HeadlessOutcome, HeadlessRunRequest, MemoryConfig } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPreStepListener, createRecallMessage, humanPromptText } from "../src/surfacing.js";
-import type { SurfacingDeps } from "../src/surfacing.js";
+import type { PendingRecall, SurfacingDeps } from "../src/surfacing.js";
 import type { SessionMemoryRuntime } from "../src/store-registry.js";
 import { createFakeCtx, createSyntheticMsg, createUserMsg } from "./helpers/fake-ctx.js";
+
+/**
+ * 召回的本体语义（prefetch）：`agent/pre-step` 的 step 1 只**启动**侧查询并立即返回原 decision，
+ * 同一轮后续的 step ≥ 2 才消费已就绪的结果（splice + 标记去重）。所以这里每个「注入」断言都必需
+ * 两步：step 1 启动、step 2 消费；只有一步的测试只配断「没注入」。
+ *
+ * `vi.waitFor` 一律显式给 15s 上限：默认 1s 在 windows-latest 的 CI 上会因为文件系统抖动假红。
+ */
+const WAIT = { timeout: 15_000 } as const;
+
+/**
+ * 一条「上一轮遗留」的 pending。这些用例只关心它在 step 1 被销账，所以 `store` 用一份临时目录里的
+ * 真 store（消费路径根本走不到代数比较）；给了 `over` 就能覆盖字段。
+ */
+function stalePending(over: Partial<PendingRecall> = {}): PendingRecall {
+	return {
+		turn: 1,
+		settled: true,
+		prompt: "old question",
+		files: ["Alpha.md"],
+		content: "<relevant_memories>stale</relevant_memories>",
+		store: makeStore(join(dir, "stale-mem")),
+		generation: 0,
+		...over,
+	};
+}
 
 /** 测试级临时目录总根：所有记忆目录都建在它下面，`afterEach` 一次 `rm -rf` 全清。 */
 let dir: string;
@@ -60,6 +86,7 @@ function makeDeps(over: Partial<SurfacingDeps> = {}): SurfacingDeps {
 		headless: { run: vi.fn(async (): Promise<HeadlessOutcome> => ({ status: "not-run", cause: "host-refused" })) },
 		warn: vi.fn(),
 		injected: new Map<string, Set<string>>(),
+		pendingRecalls: new Map<string, PendingRecall>(),
 		...over,
 	};
 }
@@ -67,6 +94,96 @@ function makeDeps(over: Partial<SurfacingDeps> = {}): SurfacingDeps {
 /** 端口成功返回的形状；`text` 是 core 的 `parseSelectedFiles` 期望的含 `selected_files` 的 JSON 对象。 */
 function selectOutcome(files: string[]): HeadlessOutcome {
 	return { status: "completed", text: JSON.stringify({ selected_files: files }) };
+}
+
+type SideQuery = (req: HeadlessRunRequest) => Promise<HeadlessOutcome>;
+
+/** 手动控制 settle 时机的侧查询端口：第 N 次调用对应第 N 个 deferred。 */
+function deferredSideQuery(): {
+	run: SideQuery;
+	resolve(index: number, files: string[]): void;
+	reject(index: number, error: unknown): void;
+	calls(): number;
+} {
+	const settles: Array<{ resolve: (value: HeadlessOutcome) => void; reject: (e: unknown) => void }> = [];
+	const run: SideQuery = () =>
+		new Promise<HeadlessOutcome>((resolve, reject) => {
+			settles.push({ resolve, reject });
+		});
+	return {
+		run,
+		resolve(index, files) {
+			settles[index].resolve(selectOutcome(files));
+		},
+		reject(index, error) {
+			settles[index].reject(error);
+		},
+		calls: () => settles.length,
+	};
+}
+
+/** 等 prefetch 就绪；返回那条 pending（未出现或未 settle 就让 waitFor 抛）。 */
+async function waitSettled(pendingRecalls: Map<string, PendingRecall>, sessionId = "s1"): Promise<PendingRecall> {
+	await vi.waitFor(() => expect(pendingRecalls.get(sessionId)?.settled).toBe(true), WAIT);
+	return pendingRecalls.get(sessionId) as PendingRecall;
+}
+
+interface RigOptions {
+	/** 写进 store 的 entry（默认一条 Alpha）。 */
+	entries?: Array<[name: string, body: string]>;
+	sideQuery?: SideQuery;
+	/** 替身索引刷新（默认立即 resolve）；用于把 abort 卡在 `indexCache.refresh` 这个 await 点上。 */
+	refresh?: () => Promise<void>;
+	config?: MemoryConfig;
+	runtime?: Partial<SessionMemoryRuntime>;
+	/** 用替身 store（错误态 / 扫描失败用例）：给了就跳过 entries 写入。 */
+	store?: MemoryStore | null;
+}
+
+/** 手动控制 settle 时机的索引刷新：把调用次数当探针，避免固定等待造成的假绿。 */
+function deferredRefresh(): { refresh: () => Promise<void>; release(index: number): void; calls(): number } {
+	const gates: Array<() => void> = [];
+	return {
+		refresh() {
+			return new Promise<void>((resolve) => {
+				gates.push(resolve);
+			});
+		},
+		release(index) {
+			gates[index]();
+		},
+		calls: () => gates.length,
+	};
+}
+
+/** 一次 surfacing 测试的装配：真 MemoryStore + 假宿主 waterfall + 可控侧查询端口。 */
+async function makeRig(options: RigOptions = {}) {
+	const memoryDir = join(dir, "mem");
+	const config = options.config ?? makeConfig(memoryDir);
+	const store = options.store === undefined ? makeStore(memoryDir) : options.store;
+	if (options.store === undefined && store !== null) {
+		for (const [name, body] of options.entries ?? [["Alpha", "alpha body"]]) {
+			await store.addEntry({ name, description: `${name.toLowerCase()} note`, body });
+		}
+	}
+	const headlessRun = vi.fn(options.sideQuery ?? (async () => selectOutcome(["Alpha.md"])));
+	const injected = new Map<string, Set<string>>();
+	const pendingRecalls = new Map<string, PendingRecall>();
+	const refresh = vi.fn(options.refresh ?? (async () => {}));
+	const warn = vi.fn();
+	const rt = makeRuntime(memoryDir, store, { config, ...options.runtime });
+	const deps = makeDeps({
+		registry: { get: () => rt },
+		indexCache: { refresh },
+		headless: { run: headlessRun },
+		warn,
+		injected,
+		pendingRecalls,
+	});
+	const listener = createPreStepListener(deps);
+	const fake = createFakeCtx();
+	fake.ctx.on("agent/pre-step", listener, { prepend: true });
+	return { ...fake, memoryDir, config, store, rt, deps, listener, headlessRun, injected, pendingRecalls, refresh, warn };
 }
 
 describe("humanPromptText", () => {
@@ -82,10 +199,11 @@ describe("humanPromptText", () => {
 });
 
 describe("createPreStepListener", () => {
-	it("returns an inner reject unchanged and never runs the side query", async () => {
-		const headlessRun = vi.fn(async (): Promise<HeadlessOutcome> => ({ status: "not-run", cause: "host-refused" }));
+	it("returns an inner reject unchanged, never queries, and drops any pending recall", async () => {
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
-		const deps = makeDeps({ indexCache: { refresh }, headless: { run: headlessRun } });
+		const pendingRecalls = new Map<string, PendingRecall>([["s1", stalePending()]]);
+		const deps = makeDeps({ indexCache: { refresh }, headless: { run: headlessRun }, pendingRecalls });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 
 		// 内层监听器先返回 reject；我们的监听器以 { prepend: true } 注册在最外层、最后看到 decision。
@@ -97,58 +215,38 @@ describe("createPreStepListener", () => {
 			agent,
 			messages: [createUserMsg("hi")],
 			turn: 1,
-			step: 1,
+			step: 2,
 			signal: new AbortController().signal,
 		});
 
 		expect(decision).toEqual({ kind: "reject" });
 		expect(refresh).not.toHaveBeenCalled();
 		expect(headlessRun).not.toHaveBeenCalled();
+		// 被拒的 step 不会跑，这一轮不再有消费点：在途召回随轮作废。
+		expect(pendingRecalls.size).toBe(0);
 	});
 
-	it("skips recall on step > 1 but still refreshes the index cache", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
+	it("refreshes the index on every step but consumes nothing when no pending exists", async () => {
 		// 必须真的写一条 entry：core 的 autoSurfacing 在候选清单为空时短路（memory-core/src/
 		// orchestration/surfacing.ts 的 `candidates` 过滤），根本不会调用侧查询
-		// 端口 —— 那时 `expect(headlessRun).not.toHaveBeenCalled()` 恒真，钉不住 step 门禁本身。
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const refresh = vi.fn(async () => {});
-		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
-
-		const agent = makeAgent({ id: "s1" });
+		// 端口 —— 那时 `headlessRun` 恒不被调用，钉不住「step 2 也走消费分支」这件事本身。
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
 		const messages = [createUserMsg("hi")];
-		const decision = await emitter.preStep({
-			agent,
-			messages,
-			turn: 1,
-			step: 2,
-			signal: new AbortController().signal,
-		});
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
 
-		expect(refresh).toHaveBeenCalledTimes(1);
-		expect(headlessRun).not.toHaveBeenCalled();
+		expect(rig.refresh).toHaveBeenCalledTimes(1);
+		expect(rig.headlessRun).not.toHaveBeenCalled();
 		expect(decision.messages).toBe(messages);
+		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
 	it("skips recall when rt.surfacing.available is false", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
 		// 同上：没有 entry 时 core 会在调用端口之前短路，这条断言就变成恒真的空转测试。
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store, { surfacing: { available: false, reason: "no model" } });
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const refresh = vi.fn(async () => {});
-		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
+		const rig = await makeRig({ runtime: { surfacing: { available: false, reason: "no model" } } });
+		const agent = rig.makeAgent({ id: "s1" });
 
-		const agent = makeAgent({ id: "s1" });
-		const decision = await emitter.preStep({
+		const decision = await rig.emitter.preStep({
 			agent,
 			messages: [createUserMsg("hi")],
 			turn: 1,
@@ -156,30 +254,22 @@ describe("createPreStepListener", () => {
 			signal: new AbortController().signal,
 		});
 
-		expect(refresh).toHaveBeenCalledTimes(1);
-		expect(headlessRun).not.toHaveBeenCalled();
+		expect(rig.refresh).toHaveBeenCalledTimes(1);
+		expect(rig.headlessRun).not.toHaveBeenCalled();
+		expect(decision.messages).toHaveLength(1);
+		// 没启动 prefetch → 没有 pending 可留给后续 step。
+		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
 	it("skips recall when the runtime has no store (error state) and returns the decision unchanged", async () => {
-		const memoryDir = join(dir, "mem");
 		// 错误态运行时：`store === null` 而 memoryDir 非空。这是门禁的第三个条件，与 step / 可用性
 		// 两条独立 —— 目录解析失败的会话绝不该把空 cwd 发给侧查询端口。
-		const rt = makeRuntime(memoryDir, null, { error: "Failed to resolve memory directory: boom" });
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const refresh = vi.fn(async () => {});
-		const warn = vi.fn();
-		const deps = makeDeps({
-			registry: { get: () => rt },
-			indexCache: { refresh },
-			headless: { run: headlessRun },
-			warn,
-		});
-		const listener = createPreStepListener(deps);
-
+		const rig = await makeRig({ store: null, runtime: { error: "Failed to resolve memory directory: boom" } });
 		const user = createUserMsg("hi");
 		const messages = [user];
 		const inner = { kind: "enter" as const, messages };
-		const decision = await listener(
+
+		const decision = await rig.listener(
 			{ agent: { session: { id: "s1" } }, messages, turn: 1, step: 1, signal: new AbortController().signal },
 			async () => inner,
 		);
@@ -187,43 +277,207 @@ describe("createPreStepListener", () => {
 		expect(decision).toBe(inner);
 		if (decision.kind !== "enter") throw new Error("expected an enter decision");
 		expect(decision.messages).toBe(messages);
-		expect(headlessRun).not.toHaveBeenCalled();
+		expect(rig.headlessRun).not.toHaveBeenCalled();
 		// 门禁在扫描候选之前就短路了：绝不能走成「把 null store 交给 scanEntries → 抛错 → catch 里记一行
 		// warn」，那会在每个错误态会话的每一轮刷一条噪声日志。
-		expect(warn).not.toHaveBeenCalled();
+		expect(rig.warn).not.toHaveBeenCalled();
 		// 索引刷新与召回无关，错误态也照刷（index-cache 对 store === null 记空串）。
-		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(rig.refresh).toHaveBeenCalledTimes(1);
+		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
-	it("inserts the recall message after the last claimed user message", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		await store.addEntry({ name: "Beta", description: "beta note", body: "beta body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md", "Beta.md"]));
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
+	it("drops the previous turn's pending at step 1 even when the runtime is unavailable", async () => {
+		// 回归：新的一轮在可用性门之前就必须作废旧 pending。否则 runtime 不可用 / no prompt / surfacing
+		// 关闭的轮会在门里直接 return，旧 content/files 一直留在 Map 里等下一个消费点。
+		const stale: PendingRecall = stalePending();
+		const pendingRecalls = new Map<string, PendingRecall>([["s1", stale]]);
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
+		const deps = makeDeps({ headless: { run: headlessRun }, pendingRecalls });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
 
-		const agent = makeAgent({ id: "s1" });
-		const synthetic = createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z");
-		const user = createUserMsg("what did I say about alpha?");
-		const messages = [synthetic, user];
+		const messages = [createUserMsg("new question")];
 		const decision = await emitter.preStep({
+			agent: makeAgent({ id: "s1" }),
+			messages,
+			turn: 2,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+
+		expect(decision.messages).toBe(messages);
+		expect(headlessRun).not.toHaveBeenCalled();
+		// `registry.get` 恒返回 undefined —— 门没通过，但销账已经发生。
+		expect(pendingRecalls.size).toBe(0);
+	});
+
+	it("drops the previous turn's pending at step 1 when the new turn claims no human prompt", async () => {
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		rig.pendingRecalls.set("s1", stalePending());
+
+		// 全是合成消息：这一轮没有真人 prompt，不会启动新 prefetch。
+		const messages = [createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z")];
+		const decision = await rig.emitter.preStep({
 			agent,
 			messages,
+			turn: 2,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.headlessRun).not.toHaveBeenCalled();
+		expect(rig.pendingRecalls.size).toBe(0);
+	});
+
+	it("keeps a same-turn pending when a duplicate step 1 is turned away by the no-prompt gate", async () => {
+		// 回归：同 turn 重复进 step 1（宿主重试）不是「新的一轮」。若那次重复被真人 prompt 门挡回，
+		// 原来那份合法召回必须原样存活 —— 否则它被无谓作废，后续 step >= 2 再也拿不到这份召回，
+		// 还白付一次侧查询（重建也救不回来：有 prompt 门时压根不会重建）。
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const user = createUserMsg("what did I say about alpha?");
+
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		const settled = await waitSettled(rig.pendingRecalls);
+		expect(settled.content.startsWith("<relevant_memories>")).toBe(true);
+
+		// 同一 turn 又进了 step 1，但这回 claim 里全是合成消息 → 在 prompt 门提前返回。
+		const syntheticOnly = [createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z")];
+		const duplicate = await rig.emitter.preStep({
+			agent,
+			messages: syntheticOnly,
 			turn: 1,
 			step: 1,
 			signal: new AbortController().signal,
 		});
+
+		expect(duplicate.messages).toBe(syntheticOnly);
+		// 没启动第二次侧查询，且记录还是原来那一条（既没删也没被替换）。
+		expect(rig.headlessRun).toHaveBeenCalledTimes(1);
+		expect(rig.pendingRecalls.get("s1")).toBe(settled);
+
+		// 后续 step >= 2 照常消费这份召回。
+		const decision = await rig.emitter.preStep({
+			agent,
+			messages: [user],
+			turn: 1,
+			step: 2,
+			signal: new AbortController().signal,
+		});
+
+		expect(decision.messages).toHaveLength(2);
+		expect(decision.messages[1]).toMatchObject({ source: { kind: "simple-memory", form: "notice" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("keeps a same-turn pending when a duplicate step 1 is turned away by the availability gate", async () => {
+		// 同上一条的另一扇门：surfacing 在轮中被降级（模型被换掉等）时，同 turn 的重复 step 1 也必须在
+		// 门里提前返回，而不是把待消费的记录删掉。
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const user = createUserMsg("hi");
+
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		const settled = await waitSettled(rig.pendingRecalls);
+
+		rig.rt.surfacing = { available: false, reason: "no model" };
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+
+		expect(rig.headlessRun).toHaveBeenCalledTimes(1);
+		expect(rig.pendingRecalls.get("s1")).toBe(settled);
+		expect(rig.injected.has("s1")).toBe(false);
+
+		// 恢复可用后，后续 step >= 2 仍能消费那条存活下来的记录（空 claim → 追加到末尾）。
+		rig.rt.surfacing = { available: true, reason: null };
+		const decision = await rig.emitter.preStep({ agent, messages: [], turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toHaveLength(1);
+		expect(decision.messages[0]).toMatchObject({ source: { kind: "simple-memory", form: "notice" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+	});
+
+	it("replaces (rebuilds) the pending when a same-turn duplicate step 1 gets past the gates", async () => {
+		// 同 turn 重复 step 1 只要真能启动，就按「替换」处理：新记录覆盖旧的，旧 prefetch 的迟到结果被
+		// 身份校验丢弃。这条钉住上一条修复没有走成「同 turn 一律保留旧记录」。
+		const deferred = deferredSideQuery();
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: deferred.run,
+		});
+		const agent = rig.makeAgent({ id: "s1" });
+		const user = createUserMsg("hi");
+
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(deferred.calls()).toBe(1), WAIT);
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(deferred.calls()).toBe(2), WAIT);
+
+		// 旧那份迟到返回：已被新记录取代，结果不写回。
+		deferred.resolve(0, ["Alpha.md"]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const current = rig.pendingRecalls.get("s1") as PendingRecall;
+		expect(current.settled).toBe(false);
+		expect(current.content).toBe("");
+
+		deferred.resolve(1, ["Beta.md"]);
+		const pending = await waitSettled(rig.pendingRecalls);
+		expect(pending.content).toContain("## Beta");
+		expect(pending.content).not.toContain("## Alpha");
+	});
+
+	it("only starts the prefetch at step 1: the decision messages are untouched and the pending is recorded", async () => {
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("what did I say about alpha?")];
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+
+		// 侧查询不阻塞：decision 原样返回（同一个数组，一条也没多），而 pending 已经记下了
+		// turn 归属、真人 prompt（消费点的归属校验用它）、结果尚未就绪。
+		expect(decision.messages).toBe(messages);
+		const pending = rig.pendingRecalls.get("s1");
+		expect(pending).toMatchObject({ turn: 1, prompt: "what did I say about alpha?", files: [], content: "" });
+		expect(pending?.settled).toBe(false);
+
+		// 侧查询在后台跑（decision 返回这一刻它可能连端口都没调到：scanEntries 是个 await 点）。
+		await vi.waitFor(() => expect(rig.headlessRun).toHaveBeenCalledTimes(1), WAIT);
+		await waitSettled(rig.pendingRecalls);
+		expect(pending?.files).toEqual(["Alpha.md"]);
+		expect(pending?.content.startsWith("<relevant_memories>")).toBe(true);
+		// 未消费 → 不标记去重（标记只发生在真的把正文交给模型的那一步）。
+		expect(rig.injected.has("s1")).toBe(false);
+	});
+
+	it("consumes a settled pending on the same turn's step 2: splices after the last claimed message and marks injected", async () => {
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: async () => selectOutcome(["Alpha.md", "Beta.md"]),
+		});
+		const agent = rig.makeAgent({ id: "s1" });
+		const synthetic = createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z");
+		const user = createUserMsg("what did I say about alpha?");
+		const messages = [synthetic, user];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
 
 		expect(decision.kind).toBe("enter");
 		expect(decision.messages).toHaveLength(3);
 		expect(decision.messages[0]).toBe(synthetic);
 		expect(decision.messages[1]).toBe(user);
 
-		// 钉住监听器 splice 出去的是 core `renderSurfacedBlock` 的**真实渲染正文**：不做二次包裹、
+		// 钉住 splice 出去的是 core `renderSurfacedBlock` 的**真实渲染正文**：不做二次包裹、
 		// 不再净化、不是空串；summary 是短摘要。
 		const recall = decision.messages[2] as {
 			role: string;
@@ -238,39 +492,235 @@ describe("createPreStepListener", () => {
 		expect(text).toContain("## Alpha");
 		expect(text).toContain("alpha body");
 		expect(recall.source).toEqual({ kind: "simple-memory", form: "notice", summary: "Recalled 2 memories" });
+
+		// 消费即标记去重，且 pending 只够消费一次。
+		expect([...(rig.injected.get("s1") ?? [])].sort()).toEqual(["Alpha.md", "Beta.md"]);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
 	});
 
-	it("splices after the last original message when an inner listener appended its own", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
+	it("does not splice while the pending is still in flight, and consumes it on a later step", async () => {
+		const deferred = deferredSideQuery();
+		const rig = await makeRig({ sideQuery: deferred.run });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
 
-		const appended = createSyntheticMsg("time-context", "the current time is now");
-		// 内层监听器在 claim 的消息之后 append 一条自己的消息（time-context 就是这么干的）。
-		ctx.on(
-			"agent/pre-step",
-			async (_payload: unknown, next: () => Promise<{ kind: string; messages: unknown[] }>) => {
-				const d = await next();
-				if (d.kind === "reject") return d;
-				return { ...d, messages: [...d.messages, appended] };
-			},
-		);
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(deferred.calls()).toBe(1), WAIT);
 
-		const agent = makeAgent({ id: "s1" });
-		const synthetic = createSyntheticMsg("runtime-context", "some injected context");
-		const user = createUserMsg("hi");
-		const decision = await emitter.preStep({
+		const early = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+		// 未就绪：本轮这个请求不带召回（「永不阻塞」的代价面），pending 留着给后续 step。
+		expect(early.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(true);
+
+		deferred.resolve(0, ["Alpha.md"]);
+		await waitSettled(rig.pendingRecalls);
+
+		const later = await rig.emitter.preStep({ agent, messages, turn: 1, step: 3, signal: new AbortController().signal });
+		expect(later.messages).toHaveLength(2);
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("discards the pending when the step's turn no longer matches", async () => {
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 2, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		// turn 不匹配 → 作废（不留给下一轮的消费点）。
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("replaces the pending when a new turn starts before the previous prefetch settles", async () => {
+		const deferred = deferredSideQuery();
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: deferred.run,
+		});
+		const agent = rig.makeAgent({ id: "s1" });
+
+		await rig.emitter.preStep({
 			agent,
-			messages: [synthetic, user],
+			messages: [createUserMsg("first question")],
 			turn: 1,
 			step: 1,
 			signal: new AbortController().signal,
 		});
+		await vi.waitFor(() => expect(deferred.calls()).toBe(1), WAIT);
+		await rig.emitter.preStep({
+			agent,
+			messages: [createUserMsg("second question")],
+			turn: 2,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		await vi.waitFor(() => expect(deferred.calls()).toBe(2), WAIT);
+
+		// 旧那一份迟到返回：它已被新 turn 的 pending 取代，结果随轮作废，绝不写回。
+		deferred.resolve(0, ["Alpha.md"]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const afterStale = rig.pendingRecalls.get("s1") as PendingRecall;
+		expect(afterStale.turn).toBe(2);
+		expect(afterStale.prompt).toBe("second question");
+		expect(afterStale.content).toBe("");
+
+		deferred.resolve(1, ["Beta.md"]);
+		const pending = await waitSettled(rig.pendingRecalls);
+		expect(pending.content).toContain("## Beta");
+		expect(pending.content).not.toContain("## Alpha");
+	});
+
+	it("discards the pending when the same turn mutated the store", async () => {
+		// 竞态：step 1 启动侧查询、选中 Alpha.md 之后，主 agent 在同一轮的 step 1 里用 `memory remove`
+		// 删掉了它（删除不读正文，所以去重集合不变）。消费前 store 的写入代数已经变了 → 整份作废，
+		// 否则会把已删条目的正文 splice 进下一步请求。
+		const rig = await makeRig({ sideQuery: async () => selectOutcome(["Alpha.md"]) });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("what did I say about alpha?")];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		// 同轮写入：删掉被选中的那份记忆。
+		const store = rig.store;
+		if (store === null) throw new Error("expected a real store");
+		await store.removeEntry("Alpha");
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toBe(messages);
+		// 作废 = 不 splice、不标去重（这份文件没有到模型眼前）。
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("discards the whole pending when the same turn's tool already showed one of its files", async () => {
+		// 竞态：选中 Alpha.md + Beta.md 之后，主 agent 在同一轮用 `memory search` 看到了 Alpha.md 的
+		// 完整正文 → 装配层把它标进了本 session 的去重集合。此时再 splice 召回，同一份正文会在
+		// 工具结果和召回块里各出现一次。整份作废，且不顺手标记 Beta.md（下次重新检索）。
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: async () => selectOutcome(["Alpha.md", "Beta.md"]),
+		});
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("what did I say about alpha?")];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		// 同轮工具读取（装配层在工具成功后写的同一份账）：只有 Alpha.md，store 没动。
+		rig.injected.set("s1", new Set(["Alpha.md"]));
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toBe(messages);
+		// 整份作废的可见证据：Beta.md 没有被这次作废顺手标进集合。
+		expect([...(rig.injected.get("s1") ?? [])]).toEqual(["Alpha.md"]);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("discards the pending when the step claims a new human prompt", async () => {
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const first = createUserMsg("first question");
+
+		await rig.emitter.preStep({ agent, messages: [first], turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		// 同轮里又进来一条真人输入（steering / 排队的 follow-up 被这一步 claim）：召回属于前一条 prompt。
+		const messages = [first, createUserMsg("follow-up while the model was working")];
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("consumes when the claimed human text equals the pending prompt, even without shared message identity", async () => {
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+
+		await rig.emitter.preStep({
+			agent,
+			messages: [createUserMsg("hi")],
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		await waitSettled(rig.pendingRecalls);
+
+		// 同文本重复 prompt 视为同一轮（检索 query 相同，召回仍适用）；但这一步 claim 与 decision 里的
+		// 消息没有身份交集（宿主 step ≥ 2 的 claim 可能只含这一步收进 inbox 的消息）→ splice 追加到末尾。
+		const fresh = createUserMsg("hi");
+		const decision = await rig.emitter.preStep({ agent, messages: [fresh], turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toHaveLength(2);
+		expect(decision.messages[0]).toBe(fresh);
+		expect(decision.messages[1]).toMatchObject({ source: { kind: "simple-memory" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+	});
+
+	it("consumes and appends at the end when a step >= 2 claims no messages at all", async () => {
+		const rig = await makeRig();
+		const context = createSyntheticMsg("runtime-context", "some injected context");
+		const user = createUserMsg("hi");
+		const contextMessages = [context, user];
+
+		await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: new AbortController().signal },
+			async () => ({ kind: "enter" as const, messages: contextMessages }),
+		);
+		await waitSettled(rig.pendingRecalls);
+
+		// 宿主常见形状：step >= 2 的 `payload.messages` 是「这一步从 inbox 收走的那些消息」，常为空
+		// （只有工具结果、没有新输入）。空 claim 不是「新 prompt」：归属闸不能因此作废，仍要消费。
+		const decision = await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages: [], turn: 1, step: 2, signal: new AbortController().signal },
+			async () => ({ kind: "enter" as const, messages: contextMessages }),
+		);
+
+		if (decision.kind !== "enter") throw new Error("expected an enter decision");
+		// 空 claim 与 decision 里的消息没有身份交集（findLastIndex = -1）→ 追加到末尾，而不是插到最前。
+		expect(decision.messages).toHaveLength(3);
+		expect(decision.messages[0]).toBe(context);
+		expect(decision.messages[1]).toBe(user);
+		expect(decision.messages[2]).toMatchObject({ source: { kind: "simple-memory", form: "notice" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("splices after the last original message when an inner listener appended its own", async () => {
+		const rig = await makeRig();
+		const appended = createSyntheticMsg("time-context", "the current time is now");
+		// 内层监听器在 claim 的消息之后 append 一条自己的消息（time-context 就是这么干的）。
+		rig.ctx.on("agent/pre-step", async (_payload: unknown, next: () => Promise<{ kind: string; messages: unknown[] }>) => {
+			const d = await next();
+			if (d.kind === "reject") return d;
+			return { ...d, messages: [...d.messages, appended] };
+		});
+
+		const agent = rig.makeAgent({ id: "s1" });
+		const synthetic = createSyntheticMsg("runtime-context", "some injected context");
+		const user = createUserMsg("hi");
+		const messages = [synthetic, user];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
 
 		expect(decision.kind).toBe("enter");
 		expect(decision.messages).toHaveLength(4);
@@ -280,19 +730,20 @@ describe("createPreStepListener", () => {
 		expect(decision.messages[3]).toBe(appended);
 	});
 
-	it("preserves startsRequestSeries when splicing the recall message", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
-		const listener = createPreStepListener(deps);
-
+	it("preserves startsRequestSeries when consuming the recall message", async () => {
+		const rig = await makeRig();
 		const user = createUserMsg("hi");
-		const decision = await listener(
-			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: new AbortController().signal },
-			async () => ({ kind: "enter" as const, messages: [user], startsRequestSeries: true as const }),
+		const messages = [user];
+
+		await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages, turn: 1, step: 1, signal: new AbortController().signal },
+			async () => ({ kind: "enter" as const, messages, startsRequestSeries: true as const }),
+		);
+		await waitSettled(rig.pendingRecalls);
+
+		const decision = await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages, turn: 1, step: 2, signal: new AbortController().signal },
+			async () => ({ kind: "enter" as const, messages, startsRequestSeries: true as const }),
 		);
 
 		if (decision.kind !== "enter") throw new Error("expected an enter decision");
@@ -300,293 +751,286 @@ describe("createPreStepListener", () => {
 		expect(decision.messages).toHaveLength(2);
 	});
 
-	it("returns the original decision and warns once when recall fails", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		const rt = makeRuntime(memoryDir, store);
+	it("returns the decision unchanged and warns once when the prefetch fails", async () => {
 		// 触发 scanEntries 失败。注意：真正的 headless 失败会被 core 的 autoSurfacing 吞成 []
-		// （memory-core/src/orchestration/surfacing.ts 的 errorPolicy "swallow"），根本到不了监听器的 catch；
-		// 监听器自己的 catch 分支只在 manifest 扫描 / 渲染 / 意外形状等前置失败时可达。
-		rt.store = { listEntries: () => Promise.reject(new Error("disk gone")) } as unknown as MemoryStore;
-		const warn = vi.fn();
-		const deps = makeDeps({ registry: { get: () => rt }, warn });
-		const listener = createPreStepListener(deps);
+		// （memory-core/src/orchestration/surfacing.ts 的 errorPolicy "swallow"），根本到不了 prefetch 的
+		// catch；catch 分支只在 manifest 扫描 / 渲染 / 意外形状等前置失败时可达。
+		const brokenStore = { listEntries: () => Promise.reject(new Error("disk gone")) } as unknown as MemoryStore;
+		const rig = await makeRig({ store: brokenStore });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
 
-		const user = createUserMsg("hi");
-		const inner = { kind: "enter" as const, messages: [user] };
-		const decision = await listener(
-			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: new AbortController().signal },
-			async () => inner,
-		);
+		const first = await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		expect(first.messages).toBe(messages);
 
-		expect(decision).toBe(inner);
-		expect(warn).toHaveBeenCalledTimes(1);
-		expect(String(warn.mock.calls[0][0])).toContain("auto-surfacing skipped");
+		await vi.waitFor(() => expect(rig.warn).toHaveBeenCalledTimes(1), WAIT);
+		expect(String(rig.warn.mock.calls[0][0])).toContain("auto-surfacing skipped");
+
+		// 失败以空 content 收场：消费点据此丢弃，不 splice、不标记。
+		const pending = await waitSettled(rig.pendingRecalls);
+		expect(pending.content).toBe("");
+		const second = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+		expect(second.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
 	});
 
 	it("treats a headless rejection as no selection (core swallows it) without warning", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => {
-			throw new Error("boom");
+		const rig = await makeRig({
+			sideQuery: async () => {
+				throw new Error("boom");
+			},
 		});
-		const warn = vi.fn();
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun }, warn });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
-
-		const agent = makeAgent({ id: "s1" });
+		const agent = rig.makeAgent({ id: "s1" });
 		const messages = [createUserMsg("hi")];
-		const decision = await emitter.preStep({
-			agent,
-			messages,
-			turn: 1,
-			step: 1,
-			signal: new AbortController().signal,
-		});
 
-		expect(decision.messages).toBe(messages);
-		expect(warn).not.toHaveBeenCalled();
+		const first = await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		expect(first.messages).toBe(messages);
+
+		const pending = await waitSettled(rig.pendingRecalls);
+		expect(pending.content).toBe("");
+		expect(rig.warn).not.toHaveBeenCalled();
+
+		const second = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+		expect(second.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
 	});
 
-	it("dedupes per session: the second turn's side query sees injectedFiles with the first turn's selection", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		await store.addEntry({ name: "Beta", description: "beta note", body: "beta body" });
-		const rt = makeRuntime(memoryDir, store);
-		// 第一轮选 Alpha；第二轮「想再选 Alpha + Beta」，但 Alpha 已被 injectedFiles 过滤。
+	it("dedupes per session: only a consumed selection enters the next turn's candidate list", async () => {
 		const headlessRun = vi
-			.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>()
+			.fn<SideQuery>()
 			.mockResolvedValueOnce(selectOutcome(["Alpha.md"]))
 			.mockResolvedValueOnce(selectOutcome(["Alpha.md", "Beta.md"]));
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
-
-		const agent = makeAgent({ id: "s1" });
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: headlessRun as unknown as SideQuery,
+		});
+		const agent = rig.makeAgent({ id: "s1" });
 		const messages = [createUserMsg("hi")];
 
-		const first = await emitter.preStep({
-			agent,
-			messages,
-			turn: 1,
-			step: 1,
-			signal: new AbortController().signal,
-		});
+		// 第一轮：step 1 启动 + step 2 消费，Alpha 才算注入过。
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+		const first = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
 		expect(first.messages).toHaveLength(2);
 
-		const second = await emitter.preStep({
-			agent,
-			messages,
-			turn: 2,
-			step: 1,
-			signal: new AbortController().signal,
-		});
-		expect(second.messages).toHaveLength(2);
-
+		// 第二轮：launch 时的候选清单里 Alpha 已被过滤 —— 这就是 injectedFiles 生效的证据。
+		await rig.emitter.preStep({ agent, messages, turn: 2, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
 		expect(headlessRun).toHaveBeenCalledTimes(2);
-		// 第一轮候选包含两条；第二轮 Alpha 已被注入，候选里只剩 Beta —— 这就是 injectedFiles 生效的证据。
-		expect(headlessRun.mock.calls[0][0].task).toContain("Alpha.md");
-		expect(headlessRun.mock.calls[0][0].task).toContain("Beta.md");
 		expect(headlessRun.mock.calls[1][0].task).not.toContain("Alpha.md");
 		expect(headlessRun.mock.calls[1][0].task).toContain("Beta.md");
 	});
 
 	it("forwards the turn's signal and the memoryDir cwd to the side query", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>().mockResolvedValue(
-			selectOutcome(["Alpha.md"]),
-		);
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
-		const listener = createPreStepListener(deps);
-
+		const rig = await makeRig();
 		const controller = new AbortController();
-		const user = createUserMsg("hi");
-		const decision = await listener(
-			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: controller.signal },
-			async () => ({ kind: "enter" as const, messages: [user] }),
+
+		await rig.listener(
+			{
+				agent: { session: { id: "s1" } },
+				messages: [createUserMsg("hi")],
+				turn: 1,
+				step: 1,
+				signal: controller.signal,
+			},
+			async () => ({ kind: "enter" as const, messages: [] }),
 		);
 
-		expect(decision.kind).toBe("enter");
-		expect(headlessRun).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(rig.headlessRun).toHaveBeenCalledTimes(1), WAIT);
 		// 身份相等（不是「存在 signal 字段」）：证明 runTask 透传的是本轮 payload 的同一个 signal。
-		expect(headlessRun.mock.calls[0][0].signal).toBe(controller.signal);
+		expect(rig.headlessRun.mock.calls[0][0].signal).toBe(controller.signal);
 		// cwd 就是 memoryDir（不是 `?? ""` 静默出的空串）。
-		expect(headlessRun.mock.calls[0][0].cwd).toBe(memoryDir);
+		expect(rig.headlessRun.mock.calls[0][0].cwd).toBe(rig.memoryDir);
 	});
 
-	it("returns the decision unchanged when the turn is aborted during the side query", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const injected = new Map<string, Set<string>>();
-		let resolveRun: (value: HeadlessOutcome) => void = () => {};
-		// 一个「resolve 权在我们手上」的端口：resolve 前监听器一直挂在 runTask 的 await 上。
-		const headlessRun = vi.fn(
-			() =>
-				new Promise<HeadlessOutcome>((resolve) => {
-					resolveRun = resolve;
-				}),
-		);
-		const warn = vi.fn();
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun }, warn, injected });
-		const listener = createPreStepListener(deps);
-
+	it("does not splice or mark when the turn is aborted while the side query is in flight", async () => {
+		const deferred = deferredSideQuery();
+		const rig = await makeRig({ sideQuery: deferred.run });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
 		const controller = new AbortController();
-		const user = createUserMsg("hi");
-		const inner = { kind: "enter" as const, messages: [user] };
 
-		// 启动监听器，等它越过初始 abort 门、真正进入 headless.run 的 await。
-		const pending = listener(
-			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: controller.signal },
-			async () => inner,
-		);
-		await vi.waitFor(() => expect(headlessRun).toHaveBeenCalledTimes(1));
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: controller.signal });
+		await vi.waitFor(() => expect(deferred.calls()).toBe(1), WAIT);
 
 		// 侧查询 in-flight 时取消；随后让被取消的侧查询「迟到」地返回选中结果（模拟 30s 窗口）。
 		controller.abort();
-		resolveRun(selectOutcome(["Alpha.md"]));
-		const decision = await pending;
+		deferred.resolve(0, ["Alpha.md"]);
+		await waitSettled(rig.pendingRecalls);
 
-		if (decision.kind !== "enter") throw new Error("expected an enter decision");
-		expect(decision).toBe(inner);
-		expect(decision.messages).toHaveLength(1);
-		expect(injected.get("s1")).toBeUndefined();
-		expect(warn).not.toHaveBeenCalled();
+		// 已取消的轮不会有后续 step；即使来了，取消复检也拒绝消费（不标记、不 splice）。
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: controller.signal });
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+		expect(rig.warn).not.toHaveBeenCalled();
+	});
+
+	it("does not start the prefetch when the turn is aborted during the index refresh", async () => {
+		// 回归：refresh 是 abort 前的最后一个 await 点。它期间取消的轮不能再启动侧查询
+		// （否则白扫一遍 manifest，runTask 拿到的是已取消的 signal）。
+		const gate = deferredRefresh();
+		const rig = await makeRig({ refresh: gate.refresh });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+		const controller = new AbortController();
+
+		const call = rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: controller.signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(1), WAIT);
+		controller.abort();
+		gate.release(0);
+		const decision = await call;
+
+		expect(decision.messages).toBe(messages);
+		// 给 fire-and-forget 的 prefetch 一个落地的机会，再断言它根本没被启动过。
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(rig.headlessRun).not.toHaveBeenCalled();
+		expect(rig.pendingRecalls.size).toBe(0);
+		expect(rig.warn).not.toHaveBeenCalled();
+	});
+
+	it("drops an unsettled pending when the turn is aborted during the index refresh", async () => {
+		// 回归：取消复检必须在「未就绪就留给后续 step」之前。否则 abort 卡在 refresh 期间、pending
+		// 又还没 settle 时，监听器会空手返回、把 pending 留在 Map 里跨轮驻留。
+		const side = deferredSideQuery();
+		const gate = deferredRefresh();
+		const rig = await makeRig({ sideQuery: side.run, refresh: gate.refresh });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+
+		const launch = rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(1), WAIT);
+		gate.release(0);
+		const first = await launch;
+		expect(first.messages).toBe(messages);
+		await vi.waitFor(() => expect(side.calls()).toBe(1), WAIT);
+
+		const controller = new AbortController();
+		const call = rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: controller.signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(2), WAIT);
+		// 侧查询还在飞：这正是旧代码 `if (!pending.settled) return` 先于 abort 复检返回的那个窗口。
+		expect(rig.pendingRecalls.get("s1")?.settled).toBe(false);
+		controller.abort();
+		gate.release(1);
+		const decision = await call;
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		// 统一销账：取消的轮没有后续请求，pending 不能靠「未就绪」留下来。
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+		// 侧查询的迟到结果也不会把它重新写回（写回前有身份校验）。
+		side.resolve(0, ["Alpha.md"]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("does not splice a settled pending when the turn is aborted during the index refresh", async () => {
+		const gate = deferredRefresh();
+		const rig = await makeRig({ refresh: gate.refresh });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+
+		const launch = rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(1), WAIT);
+		gate.release(0);
+		await launch;
+		await waitSettled(rig.pendingRecalls);
+
+		const controller = new AbortController();
+		const call = rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: controller.signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(2), WAIT);
+		controller.abort();
+		gate.release(1);
+		const decision = await call;
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
 	});
 
 	it("returns the decision unchanged when the signal is already aborted", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const refresh = vi.fn(async () => {});
-		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
-		const listener = createPreStepListener(deps);
-
+		const rig = await makeRig();
 		const controller = new AbortController();
 		controller.abort();
 		const user = createUserMsg("hi");
-		const inner = { kind: "enter" as const, messages: [user] };
-		const decision = await listener(
-			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: controller.signal },
+		const messages = [user];
+		const inner = { kind: "enter" as const, messages };
+
+		const decision = await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages, turn: 1, step: 1, signal: controller.signal },
 			async () => inner,
 		);
 
 		expect(decision).toBe(inner);
-		expect(headlessRun).not.toHaveBeenCalled();
-		expect(refresh).not.toHaveBeenCalled();
+		expect(rig.headlessRun).not.toHaveBeenCalled();
+		expect(rig.refresh).not.toHaveBeenCalled();
+		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
 	it("runs no side query when every claimed message is synthetic", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
-		const refresh = vi.fn(async () => {});
-		const deps = makeDeps({ registry: { get: () => rt }, indexCache: { refresh }, headless: { run: headlessRun } });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
-
-		const agent = makeAgent({ id: "s1" });
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
 		// TEXT 与人类消息测试逐字相同 —— source.kind 是唯一的决定变量。
 		const messages = [
 			createSyntheticMsg("agent-instructions", "what did I say about alpha?"),
 			createSyntheticMsg("some-future-kind", "what did I say about alpha?"),
 		];
-		const decision = await emitter.preStep({
-			agent,
-			messages,
-			turn: 1,
-			step: 1,
-			signal: new AbortController().signal,
-		});
 
-		expect(headlessRun).not.toHaveBeenCalled();
-		expect(refresh).toHaveBeenCalledTimes(1);
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+
+		expect(rig.headlessRun).not.toHaveBeenCalled();
+		expect(rig.refresh).toHaveBeenCalledTimes(1);
 		expect(decision.messages).toBe(messages);
+		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
-	it("does not mark injected when the render is empty, so turn 2 still offers the same files", async () => {
+	it("does not mark injected when the render is empty, so the next turn still offers the same files", async () => {
 		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		await store.addEntry({ name: "Beta", description: "beta note", body: "beta body" });
 		// maxInjectionBytes: 0 让 renderSurfacedBlock 恒返回 ""（core/injection.ts:240,245）。
 		const config = mergeConfig(structuredClone(DEFAULT_CONFIG), {
 			memoryDir,
 			autoSurfacing: { model: "test/model", maxInjectionBytes: 0 },
 		});
-		const rt = makeRuntime(memoryDir, store, { config });
-		// 两轮都选中 Alpha + Beta，但渲染恒为空。
-		const headlessRun = vi
-			.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>()
-			.mockResolvedValue(selectOutcome(["Alpha.md", "Beta.md"]));
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
-		const { ctx, emitter, makeAgent } = createFakeCtx();
-		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
-
-		const agent = makeAgent({ id: "s1" });
+		const rig = await makeRig({
+			config,
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: async () => selectOutcome(["Alpha.md", "Beta.md"]),
+		});
+		const agent = rig.makeAgent({ id: "s1" });
 		const messages = [createUserMsg("hi")];
 
-		const first = await emitter.preStep({
-			agent,
-			messages,
-			turn: 1,
-			step: 1,
-			signal: new AbortController().signal,
-		});
-		expect(first.messages).toHaveLength(1); // 空渲染 → 不 splice
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+		const first = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+		expect(first.messages).toBe(messages); // 空渲染 → 不 splice、不标记
+		expect(rig.injected.has("s1")).toBe(false);
 
-		const second = await emitter.preStep({
-			agent,
-			messages,
-			turn: 2,
-			step: 1,
-			signal: new AbortController().signal,
-		});
-		expect(second.messages).toHaveLength(1);
-
-		expect(headlessRun).toHaveBeenCalledTimes(2);
+		await rig.emitter.preStep({ agent, messages, turn: 2, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+		expect(rig.headlessRun).toHaveBeenCalledTimes(2);
 		// 关键：第二轮候选里仍含 Alpha —— 空渲染没有把它标记为 injected。
-		expect(headlessRun.mock.calls[1][0].task).toContain("Alpha.md");
-		expect(headlessRun.mock.calls[1][0].task).toContain("Beta.md");
+		expect(rig.headlessRun.mock.calls[1][0].task).toContain("Alpha.md");
+		expect(rig.headlessRun.mock.calls[1][0].task).toContain("Beta.md");
 	});
 
 	it("caps the side-query user prompt at 4000 chars", async () => {
-		const memoryDir = join(dir, "mem");
-		const store = makeStore(memoryDir);
-		await store.addEntry({ name: "Alpha", description: "alpha note", body: "alpha body" });
-		const rt = makeRuntime(memoryDir, store);
-		const headlessRun = vi.fn<(req: HeadlessRunRequest) => Promise<HeadlessOutcome>>().mockResolvedValue(
-			selectOutcome(["Alpha.md"]),
-		);
-		const deps = makeDeps({ registry: { get: () => rt }, headless: { run: headlessRun } });
-		const listener = createPreStepListener(deps);
-
+		const rig = await makeRig();
 		const user = createUserMsg("a".repeat(4000) + "TAIL_BEYOND_CAP");
-		await listener(
-			{
-				agent: { session: { id: "s1" } },
-				messages: [user],
-				turn: 1,
-				step: 1,
-				signal: new AbortController().signal,
-			},
+
+		await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: new AbortController().signal },
 			async () => ({ kind: "enter" as const, messages: [user] }),
 		);
 
-		expect(headlessRun).toHaveBeenCalledTimes(1);
-		const task = headlessRun.mock.calls[0][0].task;
+		await vi.waitFor(() => expect(rig.headlessRun).toHaveBeenCalledTimes(1), WAIT);
+		const task = rig.headlessRun.mock.calls[0][0].task;
 		expect(task).toContain("a".repeat(4000));
 		expect(task).not.toContain("TAIL_BEYOND_CAP");
 	});

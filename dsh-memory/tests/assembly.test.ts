@@ -140,6 +140,48 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void
 	}
 }
 
+/**
+ * 从 step 2 起按宿主的多 step 方式轮询消费点，直到召回被 splice 进消息（`expected` 条）。
+ *
+ * 召回的 prefetch 是 fire-and-forget（step 1 立即返回、结果在后台就绪），测试侧没有「已就绪」的
+ * 直接信号，而固定等待会假绿。未就绪时监听器原样返回、无副作用，所以「多走几个 step」正是宿主
+ * 自己的行为，不是测试作弊。超过上界仍未消费就是真的失败。
+ *
+ * 这里刻意把 step ≥ 2 的 claim 也传成 step 1 的那份 messages（本文件的断言就建在这个身份交叠上）。
+ * 宿主真实的 step ≥ 2 claim 常为空（只有工具结果），那条「空 claim 仍要消费、追加到末尾」的路径
+ * 在 `surfacing.test.ts` 的 `consumes and appends at the end when a step >= 2 claims no messages`
+ * 用例里按监听器口径直接钉住。
+ */
+async function consumeRecall(
+	fake: Fake,
+	agent: ReturnType<Fake["makeAgent"]>,
+	messages: any[],
+	turn: number,
+	expected: number,
+	timeoutMs = 5000,
+): Promise<Extract<Decision, { kind: "enter" }>> {
+	const deadline = Date.now() + timeoutMs;
+	let step = 2;
+	for (;;) {
+		const decision = await fake.emitter.preStep({
+			agent,
+			messages,
+			turn,
+			step: step++,
+			signal: new AbortController().signal,
+		});
+		if (decision.kind === "reject") throw new Error("the recall step must not be rejected");
+		if (decision.messages.length === expected) return decision;
+		if (Date.now() > deadline) throw new Error("timed out waiting for the prefetched recall to be consumed");
+		await new Promise((resolveTimer) => setTimeout(resolveTimer, 5));
+	}
+}
+
+/** 侧查询端口收到的用户 prompt（`headless.ts` 把 `req.task` 放在唯一的 user 消息里）。 */
+function sideQueryPrompt(stream: ReturnType<typeof vi.fn>, index: number): string {
+	return stream.mock.calls[index][0].messages[0].content[0].text as string;
+}
+
 describe("apply — 全局注册（每进程一次）", () => {
 	it("registers the memory_index section at order 4000 with interpolation off", async () => {
 		const { fake } = await setup();
@@ -536,15 +578,16 @@ describe("apply — 启动期降级与每轮召回", () => {
 	it("recalls relevant memories on the agent/pre-step waterfall", async () => {
 		const memoryDir = memoryDirFor(cwd);
 		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
-		const { fake } = await setup(
-			{ llmStream: llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })) },
-			rowConfig({ autoSurfacing: { model: "prov/mod" } }),
-		);
+		// 第二条只当「候选清单探针」：它永远不被选中，但它的存在保证侧查询端口真的被调到
+		//（候选为空时 core 会在调端口之前短路），于是「这一轮的候选里有没有 Alpha」可以同步断言。
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+		const stream = vi.fn(llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })));
+		const { fake } = await setup({ llmStream: stream }, rowConfig({ autoSurfacing: { model: "prov/mod" } }));
 		const agent = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(agent);
 
 		const messages = [createUserMsg("tell me about alpha")];
-		const decision = await fake.emitter.preStep({
+		const first = await fake.emitter.preStep({
 			agent,
 			messages,
 			turn: 1,
@@ -552,8 +595,12 @@ describe("apply — 启动期降级与每轮召回", () => {
 			signal: new AbortController().signal,
 		});
 
-		expect(decision.kind).toBe("enter");
-		expect(decision.messages).toHaveLength(2);
+		// step 1 只启动侧查询：decision 原样返回（不阻塞请求，也还没有召回块）。
+		expect(first.kind).toBe("enter");
+		expect((first as { messages: unknown[] }).messages).toBe(messages);
+
+		// 同轮后续 step 消费：召回块 splice 在本轮 claim 的消息之后。
+		const decision = await consumeRecall(fake, agent, messages, 1, 2);
 		expect(decision.messages[0]).toBe(messages[0]);
 		const recalled = decision.messages[1];
 		expect(recalled.role).toBe("user");
@@ -562,29 +609,223 @@ describe("apply — 启动期降级与每轮召回", () => {
 		// 注入的是 entry 的**正文**（core 的 renderSurfacedBlock），frontmatter 不进上下文。
 		expect(recalled.content[0].text).toContain("the codeword is lantern");
 
-		// 同一会话里同一份文件不重复注入：injected 由装配层持有并交给 surfacing。
-		const second = await fake.emitter.preStep({
+		// 同一会话里同一份文件不重复注入：injected 由装配层持有并交给 surfacing，
+		// 下一轮的候选清单里已经没有 Alpha 了。
+		await fake.emitter.preStep({
 			agent,
 			messages: [createUserMsg("tell me about alpha again")],
 			turn: 2,
 			step: 1,
 			signal: new AbortController().signal,
 		});
-		expect(second.messages).toHaveLength(1);
+		await waitFor(() => stream.mock.calls.length >= 2);
+		expect(sideQueryPrompt(stream, 1)).not.toContain("Alpha.md");
+		expect(sideQueryPrompt(stream, 1)).toContain("Beta.md");
 
 		// 会话结束就销账（injected.delete）：宿主的 clear / compact 会用同一 sessionId 重建 agent，
 		// 新会话应该重新有召回机会。
 		fake.emitter.agentDisposed(agent);
 		const reborn = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(reborn);
-		const third = await fake.emitter.preStep({
+		const rebornMessages = [createUserMsg("tell me about alpha")];
+		await fake.emitter.preStep({
 			agent: reborn,
+			messages: rebornMessages,
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		await waitFor(() => stream.mock.calls.length >= 3);
+		expect(sideQueryPrompt(stream, 2)).toContain("Alpha.md");
+		const third = await consumeRecall(fake, reborn, rebornMessages, 1, 2);
+		expect(third.messages[1].content[0].text).toContain("the codeword is lantern");
+	});
+
+	it("drops an in-flight recall when the agent goes idle", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+
+		// 一次完整的跑：step 1 启动侧查询（被 gate 挡住）→ 可选地发一次 `agent/status` idle → 放行侧查询
+		// → 轮询同轮 step >= 2，返回是否真的消费到了召回。
+		//
+		// 宿主定义里 `idle` = "no driver is active"，所以 `idle` 之后不会再有同轮 step — 这里的 step >= 2
+		// 只是「这份 pending 还在不在」的探针（还在 = 迟到结果会被下一次消费点拿走）。
+		const run = async (goIdle: boolean): Promise<boolean> => {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const text = JSON.stringify({ selected_files: ["Alpha.md"] });
+			const stream = vi.fn(() => ({
+				async *[Symbol.asyncIterator]() {
+					await gate;
+					yield { type: "block-start", index: 0, blockType: "text" };
+					yield { type: "text-delta", index: 0, text };
+					yield { type: "block-end", index: 0, block: { type: "text", text } };
+					yield { type: "finish", reason: { kind: "stop" } };
+				},
+			}));
+			const { fake, dispose } = await setup({ llmStream: stream }, rowConfig({ autoSurfacing: { model: "prov/mod" } }));
+			const agent = fake.makeAgent({ id: "s1", cwd });
+			await fake.emitter.agentCreated(agent);
+			const messages = [createUserMsg("tell me about alpha")];
+			await fake.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+			await waitFor(() => stream.mock.calls.length === 1);
+			if (goIdle) fake.emitter.agentStatus(agent, "idle");
+			release();
+			const deadline = Date.now() + 2000;
+			let step = 2;
+			for (;;) {
+				const decision = await fake.emitter.preStep({
+					agent,
+					messages,
+					turn: 1,
+					step: step++,
+					signal: new AbortController().signal,
+				});
+				if (decision.messages.length > messages.length) {
+					dispose();
+					return true;
+				}
+				if (Date.now() > deadline) {
+					dispose();
+					return false;
+				}
+				await new Promise((resolveTimer) => setTimeout(resolveTimer, 5));
+			}
+		};
+
+		// 对照：不发 idle 时同轮 step >= 2 一定消费到 —— 证明上面那套等待足以让 prefetch 就绪，
+		// 下面那句「没消费」不是「根本没就绪」的假绿。
+		expect(await run(false)).toBe(true);
+		// `agent/status` 转 idle：pending 已销账，迟到的结果不会被任何后续消费点拿走。
+		expect(await run(true)).toBe(false);
+	});
+
+	it("drops the recall dedupe state when the host rebuilds the agent for compact or clear", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		// 探针 entry：见上一个用例 —— 它让每一轮的侧查询端口都会被调到，去重状态因此可以按
+		// 「这一轮的候选清单里有没有 Alpha」直接断言。
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+		const stream = vi.fn(llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })));
+		const { fake } = await setup({ llmStream: stream }, rowConfig({ autoSurfacing: { model: "prov/mod" } }));
+		const recall = (agent: ReturnType<Fake["makeAgent"]>, turn: number) =>
+			fake.emitter.preStep({
+				agent,
+				messages: [createUserMsg("tell me about alpha")],
+				turn,
+				step: 1,
+				signal: new AbortController().signal,
+			});
+		const candidatesOf = async (turn: number): Promise<string> => {
+			await waitFor(() => stream.mock.calls.length >= turn);
+			return sideQueryPrompt(stream, turn - 1);
+		};
+
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+		await recall(agent, 1);
+		expect(await candidatesOf(1)).toContain("Alpha.md");
+		// 消费点走完（这一步才标记去重）。
+		await consumeRecall(fake, agent, [createUserMsg("tell me about alpha")], 1, 2);
+
+		// `startup` / `resume` 重建：历史还在上下文里，已注入的正文仍在 → 去重状态必须保留。
+		const restarted = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(restarted, "startup");
+		await recall(restarted, 2);
+		expect(await candidatesOf(2)).not.toContain("Alpha.md");
+
+		const resumed = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(resumed, "resume");
+		await recall(resumed, 3);
+		expect(await candidatesOf(3)).not.toContain("Alpha.md");
+
+		// `compact`：宿主把历史压成摘要后重建 agent，已注入的正文被挤出上下文。去重状态若不清空，
+		// 这些文件在本会话里永不再浮现（正文已不在历史里）—— 正是要修的 bug。
+		const compacted = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(compacted, "compact");
+		const compactedMessages = [createUserMsg("tell me about alpha")];
+		await recall(compacted, 4);
+		expect(await candidatesOf(4)).toContain("Alpha.md");
+		expect((await consumeRecall(fake, compacted, compactedMessages, 4, 2)).messages[1].content[0].text).toContain(
+			"the codeword is lantern",
+		);
+
+		// `clear`：同一 sessionId 重建、上下文清空，同理。
+		const cleared = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(cleared, "clear");
+		const clearedMessages = [createUserMsg("tell me about alpha")];
+		await recall(cleared, 5);
+		expect(await candidatesOf(5)).toContain("Alpha.md");
+		expect((await consumeRecall(fake, cleared, clearedMessages, 5, 2)).messages).toHaveLength(2);
+	});
+
+	it("counts files the main session tool read as already seen", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		// 探针 entry（见上）：它保证侧查询端口真的被调到，于是「这一轮的候选里还有没有 Alpha」可断言。
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+		const stream = vi.fn(llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })));
+		const { fake } = await setup({ llmStream: stream }, rowConfig({ autoSurfacing: { model: "prov/mod" } }));
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		// 模型在会话里用 `memory` 工具读到了 Alpha 的正文（memory-scope search）。
+		const tool = memoryToolOf(fake, "s1");
+		const read = await tool?.execute({ action: "search", query: "lantern" }, {});
+		expect(read.content).toContain("the codeword is lantern");
+
+		// 正文已进了主模型上下文：装配层把它计入与召回共用的 injected，所以这一轮的侧查询候选里
+		// 不该再有 Alpha（core 的 candidates() 会过滤掉它），只剩探针 Beta。
+		await fake.emitter.preStep({
+			agent,
 			messages: [createUserMsg("tell me about alpha")],
 			turn: 1,
 			step: 1,
 			signal: new AbortController().signal,
 		});
-		expect(third.messages).toHaveLength(2);
+		await waitFor(() => stream.mock.calls.length >= 1);
+		expect(sideQueryPrompt(stream, 0)).not.toContain("Alpha.md");
+		expect(sideQueryPrompt(stream, 0)).toContain("Beta.md");
+	});
+
+	it("does not count files the headless worker tool read", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		// 探针 entry（见上）：它保证侧查询端口真的被调到。
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+		const stream = vi.fn(llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })));
+		const { fake } = await setup(
+			{ llmStream: stream },
+			rowConfig({
+				defaults: { model: "prov/x" },
+				extractMemories: { enabled: true },
+				autoSurfacing: { model: "prov/mod" },
+			}),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		// extract 的常驻 worker 在会话启动时建好；它的 `memory` 工具是**子会话**的工具实例。
+		expect(fake.childSessions).toHaveLength(1);
+		const workerTool = memoryToolOf(fake, `${fake.childSessions[0].sessionId}:child`);
+		expect(workerTool).toBeDefined();
+		const read = await workerTool!.execute({ action: "search", query: "lantern" }, {});
+		expect(read.content).toContain("the codeword is lantern");
+
+		// 正文只进了子会话，主模型没见过：主 session 的去重集合必须仍为空，所以这一轮的侧查询
+		// 候选里 Alpha 还在（与上一个用例——主 session 工具读过——正好相反）。
+		await fake.emitter.preStep({
+			agent,
+			messages: [createUserMsg("tell me about alpha")],
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		await waitFor(() => stream.mock.calls.length >= 1);
+		expect(sideQueryPrompt(stream, 0)).toContain("Alpha.md");
 	});
 
 	it("registers the recall listener outermost so an inner rewrite cannot drop the recalled block", async () => {
@@ -604,21 +845,22 @@ describe("apply — 启动期降级与每轮召回", () => {
 		const agent = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(agent);
 
-		const decision = await fake.emitter.preStep({
+		const messages = [createUserMsg("tell me about alpha")];
+		await fake.emitter.preStep({
 			agent,
-			messages: [createUserMsg("tell me about alpha")],
+			messages,
 			turn: 1,
 			step: 1,
 			signal: new AbortController().signal,
 		});
 
-		expect(decision.kind).toBe("enter");
-		// 内层监听器抹掉了原始 claim 消息，所以 `findLastIndex` 返回 -1，召回块落在最前（surfacing.ts
-		// 里记过的 first-party 同款行为）。关键是：它**还在**。
-		expect(decision.messages).toHaveLength(2);
-		expect(decision.messages[0].source.kind).toBe("simple-memory");
-		expect(decision.messages[0].content[0].text).toContain("the codeword is lantern");
-		expect(decision.messages[1].content[0].text).toBe("compacted");
+		// 同轮后续 step 消费：内层监听器抹掉了原始 claim 消息，`findLastIndex` 返回 -1，召回块按
+		// 「追加到末尾」落在内层那份消息之后（surfacing.ts 里记过为什么不能像 first-party 那样插到
+		// 最前）。关键是：它**还在**。
+		const decision = await consumeRecall(fake, agent, messages, 1, 2);
+		expect(decision.messages[0].content[0].text).toBe("compacted");
+		expect(decision.messages[1].source.kind).toBe("simple-memory");
+		expect(decision.messages[1].content[0].text).toContain("the codeword is lantern");
 	});
 });
 

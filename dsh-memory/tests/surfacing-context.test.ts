@@ -44,6 +44,7 @@ describe("surfacing context wiring", () => {
 			headless: { run: vi.fn(async (): Promise<HeadlessOutcome> => ({ status: "not-run", cause: "host-refused" })) },
 			warn: vi.fn(),
 			injected: new Map<string, Set<string>>(),
+			pendingRecalls: new Map(),
 		};
 
 		scanEntriesMock.mockResolvedValue([
@@ -64,7 +65,8 @@ describe("surfacing context wiring", () => {
 		);
 
 		expect(decision.kind).toBe("enter");
-		expect(runTaskMock).toHaveBeenCalledTimes(1);
+		// prefetch 是 fire-and-forget：decision 先返回，侧查询随后在后台跑完。
+		await vi.waitFor(() => expect(runTaskMock).toHaveBeenCalledTimes(1), { timeout: 15_000 });
 		expect(runTaskMock.mock.calls[0][0]).toBe(TASKS.autoSurfacing);
 		const input = runTaskMock.mock.calls[0][1];
 		const ctx = runTaskMock.mock.calls[0][2];

@@ -18,6 +18,7 @@ import { createSessionSearch } from "./session-search.js";
 import type { AgentLike, HostDirLike, SessionMemoryRuntime } from "./store-registry.js";
 import { createStoreRegistry, isRootAgent } from "./store-registry.js";
 import { createPreStepListener } from "./surfacing.js";
+import type { PendingRecall } from "./surfacing.js";
 import type { DshSyncSession } from "./sync.js";
 import { createDshSyncRuntime, syncErrorMessage } from "./sync.js";
 import { createDshTranscript } from "./transcript.js";
@@ -208,6 +209,11 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	/** sessionId → 本会话已注入过召回的 entry 文件名。surfacing 读写它，装配层负责在会话结束时销账。 */
 	const injected = new Map<string, Set<string>>();
 	/**
+	 * sessionId → 在途召回（prefetch）状态。写入在 surfacing 侧；装配层只负责在会话边界作废它
+	 * （compact / clear / disposed）——「哪一代 agent 的召回」不能跨代复用。
+	 */
+	const pendingRecalls = new Map<string, PendingRecall>();
+	/**
 	 * sessionId → **agent 作用域**下的 `agents` 服务绑定。
 	 *
 	 * 子会话必须通过它创建：cordis 的 traceable 机制会把 `create()` 的 owner 解析成「访问服务时的
@@ -317,13 +323,20 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 
 	// 6. `agent/created`：串行、且在创建完成前被 await —— 这是唯一的异步窗口。记忆目录要探 git remote
 	//    （异步），而 core 的工具 handler 只能在执行时同步 `getStore()`，所以目录必须在这里解析完。
-	ctx.on("agent/created", async ({ agent, signal }) => {
+	ctx.on("agent/created", async ({ agent, source, signal }) => {
 		const like: AgentLike = agent; // 宿主 Agent 结构化满足我们的接缝，无需 cast
 		// 子 agent 门禁：`agent/created` 对每个 agent 都发（子 agent 由 dsh-subagent 走 ctx.agents.create，
 		// 根 ctx 的监听器看得到全部）。不过滤的话每个子 agent 都要付一次 git 探测 + 建 store，
 		// 且每轮多付一次侧查询。判据是 `session.header.origin`（见 isRootAgent）。
 		if (!isRootAgent(like)) return;
 		const sessionId = like.session.id;
+		// 宿主 compact / clear 会用**同一个 sessionId** 重建 agent：被挤掉的召回正文不再在上下文里，
+		// 去重状态与在途召回必须随之作废，否则这些文件在本会话里永不再浮现（正文已不在历史里）。
+		// `startup` / `resume` 相反：历史还在，去重状态必须保留。
+		if (source === "compact" || source === "clear") {
+			injected.delete(sessionId);
+			pendingRecalls.delete(sessionId);
+		}
 		// 同一 session 重建时先收掉上一代 engine/timer，避免旧自动轮次跨代写远端。
 		await disposeSyncSession(sessionId);
 
@@ -395,6 +408,8 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			const extractPlan = TASKS.extractMemories.plan;
 			const dreamPlan = TASKS.dream.plan;
 			const buildTool = (options: NestedMemoryToolOptions): unknown =>
+				// worker（extract / dream）**不**传 `onContentSeen`：它们读到的正文只进了子会话，主模型没见过，
+				// 标成「已见过」会把本该浮现的条目吞掉。
 				createMemoryTool(rt, { searchSessions, onWrite: writeHook(options.onWrite, false) }, options);
 			const makeWorker = async (task: "extractMemories" | "dream") => {
 				const plan = task === "dream" ? dreamPlan : extractPlan;
@@ -442,6 +457,13 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			// refresh 必须 fire-and-forget：core onWrite 同步、宿主 section text 也同步。
 			// 原写入语义不变，writeHook 另外把同一次成功写交给当前 sync engine。
 			onWrite: writeHook(undefined, true),
+			// 主 session 才计入召回去重：工具把正文交给了主模型，下一轮 surfaced 不该重复。
+			// 与召回共用同一个 Set（`injected` 由 surfacing 读写，装配层负责在会话结束时销账）。
+			onContentSeen: ({ files }) => {
+				const seen = injected.get(sessionId) ?? new Set<string>();
+				for (const file of files) seen.add(file);
+				injected.set(sessionId, seen);
+			},
 		});
 
 		// 同一个 sessionId 可能再来一次 created（宿主的 clear / compact 会重建 agent）：先撤掉上一份，
@@ -489,6 +511,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			.catch(() => false)
 			.then(() => Promise.allSettled([slot?.extract?.dispose(), slot?.dream?.dispose()]));
 		injected.delete(sessionId);
+		pendingRecalls.delete(sessionId);
 	});
 
 	// 8. 每轮召回挂在 `agent/pre-step` waterfall 上，`{ prepend: true }` 让我们在最外层：先进入、
@@ -501,6 +524,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// 所以固定用零工具端口：不建子会话，也不在宿主会话日志里留痕。
 		headless: zeroToolHeadless,
 		injected,
+		pendingRecalls,
 		warn: (message, ...args) => ctx.logger.warn(message, ...args),
 	});
 	ctx.on(
@@ -515,6 +539,16 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		async (payload, next) => (await recall(payload, next)) as HostPreStepDecision,
 		{ prepend: true },
 	);
+
+	// 8b. `agent/status` 转 `idle` 时作废在途召回。
+	//
+	// pending 在消费路径上是懒清理的：零工具一轮（模型直接答完）、未就绪、被每一步的 turn / prompt /
+	// 同步门挡回，都只是「不消费」而不销账。所以必须有一个「这一轮真的结束了」的收口点，否则一份没
+	// 赶上的召回会一直驻留到下一次同 turn 的 step >= 2（或进程退出），甚至跨过一轮被误消费。宿主
+	// 把 `idle` 定义为“no driver is active”，正是「这一轮（以及任何排队续轮）都跑完了」。
+	ctx.on("agent/status", ({ agent, status }) => {
+		if (status === "idle") pendingRecalls.delete(agent.session.id);
+	});
 
 	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
 	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
@@ -553,5 +587,6 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		cleanups.clear();
 		agentAgents.clear();
 		injected.clear();
+		pendingRecalls.clear();
 	};
 }

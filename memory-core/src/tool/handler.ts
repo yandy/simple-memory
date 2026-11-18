@@ -36,6 +36,12 @@ export interface MemoryHandlerOptions {
 	 * 适配层用它统计一轮写入了几条：handler 跑在 headless 子会话里，自己看不到 UI。
 	 */
 	onWrite?: (info: { action: MemoryAction; name?: string }) => void;
+	/**
+	 * 模型经工具**见过正文**之后回调（`add` / `replace` 成功，或 memory-scope `search` 命中）：
+	 * `files` 是承载这些正文的 entry 文件。`list` 只有摘要、sessions-scope `search` 搜的是会话日志、
+	 * `remove` 已删文件、任何抛错都不回调。适配层用它让召回去重记住「模型已经知道的内容」。
+	 */
+	onContentSeen?: (info: { action: MemoryAction; files: string[] }) => void;
 }
 
 /** 给模型看的文本 + 给宿主看的结构化结果。 */
@@ -153,7 +159,8 @@ export function createMemoryActionHandler(
 					hits.length === 0
 						? "No matches in memory."
 						: hits.map((e) => `## ${e.name}\nfile: ${e.file}\ntype: ${e.type}\n\n${e.body}`).join("\n\n");
-				details = { count: hits.length };
+				// `files` 是 model 已经见过正文的清单（正文已拼进 text），宿主用它做召回去重。
+				details = { count: hits.length, files: hits.map((e) => e.file) };
 				break;
 			}
 			case "rename": {
@@ -179,6 +186,12 @@ export function createMemoryActionHandler(
 
 		// 写在 switch 之后：任何抛错都会跳过它，于是「成功完成写 action」是唯一触发条件。
 		if (WRITE_ACTIONS.has(p.action)) options.onWrite?.({ action: p.action, name: p.name?.trim() });
+
+		// 同样只在成功路径上报：写入的正文、memory-scope search 返回的完整 body 都已进入模型上下文。
+		let seenFiles: string[] = [];
+		if (p.action === "add" || p.action === "replace") seenFiles = [details.file as string];
+		else if (p.action === "search" && p.scope !== "sessions") seenFiles = details.files as string[];
+		if (seenFiles.length > 0) options.onContentSeen?.({ action: p.action, files: seenFiles });
 
 		return { text, details };
 	};

@@ -420,12 +420,86 @@ describe("search 的 sessions 分支也填 details", () => {
 		expect(result.text).toBe("session hits");
 	});
 
-	it("keeps the memory scope details as they were", async () => {
+	it("adds the hit files to the memory scope details", async () => {
 		const handler = createMemoryActionHandler(deps());
 		await handler({ action: "add", name: "A", description: "d", content: "正文" });
 
 		const result = await handler({ action: "search", query: "正文" });
 
-		expect(result.details).toEqual({ count: 1 });
+		expect(result.details).toEqual({ count: 1, files: ["A.md"] });
+	});
+});
+
+describe("onContentSeen 回调", () => {
+	it("fires with the written file after a successful add", async () => {
+		const onContentSeen = vi.fn();
+		const handler = createMemoryActionHandler(deps(), { onContentSeen });
+
+		await run(handler, { action: "add", name: "Use real DB in tests", content: "集成测试必须连真实 PostgreSQL。" });
+
+		expect(onContentSeen.mock.calls.map((call) => call[0])).toEqual([
+			{ action: "add", files: ["Use-real-DB-in-tests.md"] },
+		]);
+	});
+
+	it("fires with the written file after a successful replace", async () => {
+		const onContentSeen = vi.fn();
+		const handler = createMemoryActionHandler(deps(), { onContentSeen });
+		await run(handler, { action: "add", name: "A", content: "正文" });
+		onContentSeen.mockClear();
+
+		await run(handler, { action: "replace", name: "A", content: "新正文" });
+
+		expect(onContentSeen.mock.calls.map((call) => call[0])).toEqual([{ action: "replace", files: ["A.md"] }]);
+	});
+
+	it("fires once with every hit file for a memory scope search, same list as details.files", async () => {
+		const onContentSeen = vi.fn();
+		const handler = createMemoryActionHandler(deps(), { onContentSeen });
+		await run(handler, { action: "add", name: "A", content: "共同关键词 alpha" });
+		await run(handler, { action: "add", name: "B", content: "共同关键词 beta" });
+		onContentSeen.mockClear();
+
+		const result = await handler({ action: "search", query: "共同关键词" });
+
+		expect(onContentSeen.mock.calls.map((call) => call[0])).toEqual([
+			{ action: "search", files: ["A.md", "B.md"] },
+		]);
+		expect(result.details).toEqual({ count: 2, files: ["A.md", "B.md"] });
+	});
+
+	it("never fires for a search that misses", async () => {
+		const onContentSeen = vi.fn();
+		const handler = createMemoryActionHandler(deps(), { onContentSeen });
+
+		expect(await run(handler, { action: "search", query: "nothing" })).toBe("No matches in memory.");
+
+		expect(onContentSeen).not.toHaveBeenCalled();
+	});
+
+	it("never fires for a sessions scope search", async () => {
+		const onContentSeen = vi.fn();
+		const searchSessions = vi.fn(async () => "Found 1 match(es)");
+		const handler = createMemoryActionHandler(deps({ searchSessions }), { onContentSeen });
+
+		await run(handler, { action: "search", query: "q", scope: "sessions" });
+
+		expect(searchSessions).toHaveBeenCalled();
+		expect(onContentSeen).not.toHaveBeenCalled();
+	});
+
+	it("never fires for reads, removals, or rejected writes", async () => {
+		const onContentSeen = vi.fn();
+		const handler = createMemoryActionHandler(deps(), { onContentSeen });
+		await run(handler, { action: "add", name: "A", content: "正文" });
+		onContentSeen.mockClear();
+
+		await run(handler, { action: "list" });
+		await run(handler, { action: "remove", name: "A" });
+		await expect(run(handler, { action: "replace", content: "x" })).rejects.toThrow(
+			"name is required for replace",
+		);
+
+		expect(onContentSeen).not.toHaveBeenCalled();
 	});
 });

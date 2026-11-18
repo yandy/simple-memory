@@ -24,6 +24,9 @@ import { format } from "node:util";
  *   不带 `origin`/`delegationDepth`，仍是根 agent（`parentSession` 存在不足以判定子 agent）。
  */
 
+/** 宿主 `SessionStartSource`（`dsh-agent/lib/types/runtime-types.d.ts:130`，逐字）。 */
+export type SessionStartSource = "startup" | "resume" | "clear" | "compact";
+
 export interface FakeAgent {
 	id: string;
 	sessionId: string;
@@ -244,8 +247,10 @@ export function createFakeCtx(
 	commands: RecordedCommand[];
 	logs: Array<{ level: string; message: string }>;
 	emitter: {
-		agentCreated(agent: FakeAgent): Promise<void>;
+		agentCreated(agent: FakeAgent, source?: SessionStartSource): Promise<void>;
 		agentDisposed(agent: FakeAgent): void;
+		/** `agent/status` 的 emit（`idle` ⇄ `running`；fire-and-forget，与宿主一致）。 */
+		agentStatus(agent: FakeAgent, status: "idle" | "running"): void;
 		turnStopping(payload: { agent: FakeAgent; turn?: number }): Promise<void>;
 		preStep(payload: {
 			agent: FakeAgent;
@@ -313,6 +318,7 @@ export function createFakeCtx(
 	const disposedListeners: ListenerEntry[] = [];
 	const preStepListeners: ListenerEntry[] = [];
 	const turnStoppingListeners: ListenerEntry[] = [];
+	const statusListeners: ListenerEntry[] = [];
 
 	/** 每个 agent 作用域调过的 `tools.restrict()` 过滤器（按调用顺序）。 */
 	const restrictions: Array<{ agentId: string; filter: { allow?: readonly string[]; deny?: readonly string[] } }> = [];
@@ -326,6 +332,7 @@ export function createFakeCtx(
 		else if (event === "agent/disposed") arr = disposedListeners;
 		else if (event === "agent/pre-step") arr = preStepListeners;
 		else if (event === "agent/turn-stopping") arr = turnStoppingListeners;
+		else if (event === "agent/status") arr = statusListeners;
 		if (!arr) throw new Error(`fake ctx: unknown event "${event}"`);
 		const entry: ListenerEntry = { handler, prepend };
 		if (prepend) arr.unshift(entry);
@@ -846,11 +853,11 @@ export function createFakeCtx(
 		return agent;
 	}
 
-	async function agentCreated(agent: FakeAgent): Promise<void> {
+	async function agentCreated(agent: FakeAgent, source: SessionStartSource = "startup"): Promise<void> {
 		if (!(agent as any).ctx) (agent as any).ctx = makeAgentCtx(agent);
 		// serial：按序 await，抛错即创建失败。
 		for (const { handler } of createdListeners.slice()) {
-			await handler({ agent, source: "startup" });
+			await handler({ agent, source });
 		}
 	}
 
@@ -865,9 +872,15 @@ export function createFakeCtx(
 		}
 	}
 
+	/** 触发 `agent/status`（`emit`，同步派发）。 */
+	function agentStatus(agent: FakeAgent, status: "idle" | "running"): void {
+		for (const { handler } of statusListeners.slice()) handler({ agent, status });
+	}
+
 	const emitter = {
 		agentCreated,
 		agentDisposed,
+		agentStatus,
 		turnStopping,
 		preStep(payload: {
 			agent: FakeAgent;

@@ -144,6 +144,26 @@ function compareSummaries(a: EntrySummary, b: EntrySummary): number {
 export class MemoryStore {
 	readonly #cache = new Map<string, CacheRow>();
 
+	/**
+	 * 本实例的写入代数：**每次成功的写原语 +1**（读与失败不动它）。
+	 *
+	 * 唯一的消费者是宿主的召回 prefetch 门：侧查询在飞时记下当时的代数，消费前发现它变了就整份作废。
+	 * 放在 store 层而不是宿主回调里，是因为写入方不止主 agent 的工具 —— dream / extract 的 headless
+	 * 工具、同步引擎的逐字落盘与索引重建走的都是这个实例，而它们谁的正文都不该被一份过期的召回再
+	 * 渲染一次（同轮里模型已经通过工具看到过，或者文件已经被删 / 改写）。
+	 *
+	 * 粒度是「调用了写原语」而不是「输出逐字节变了」：一次空转的 `applyEntryFiles` 也会让它 +1。
+	 * 门只会因此更保守（多作废一份召回、下一轮重新检索），不会漏判。
+	 *
+	 * 计数是**每实例**的：跨实例比较没有语义（两个实例看的是同一份目录，但各数各的）。
+	 */
+	#generation = 0;
+
+	/** 只读的写入代数，见 `#generation`。 */
+	get generation(): number {
+		return this.#generation;
+	}
+
 	get #platform(): NodeJS.Platform {
 		return this.cfg.platform ?? process.platform;
 	}
@@ -232,7 +252,16 @@ export class MemoryStore {
 	 * 两级锁的顺序固定（逻辑锁在外），因此不存在锁序反转。
 	 */
 	async #pipeline<T>(op: string, options: WriteOptions | undefined, fn: () => Promise<T>): Promise<T> {
-		const run = () => this.#savingQueue(() => this.#locked(op, this.cfg.lock.timeoutMs, fn));
+		// 代数只在 `fn` 正常返回后 +1：抛错（条目不存在、校验失败、锁超时、物理写入失败）都不算写入，
+		// 让它涨会把「失败」误报成「store 变了」并白作废一份合法召回。
+		const run = () =>
+			this.#savingQueue(() =>
+				this.#locked(op, this.cfg.lock.timeoutMs, async () => {
+					const result = await fn();
+					this.#generation += 1;
+					return result;
+				}),
+			);
 		if (options?.skipLogicalLock) return run();
 		return withProcessLock(this.#logicalKey, this.cfg.lock.timeoutMs, run);
 	}

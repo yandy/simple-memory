@@ -485,10 +485,11 @@ export function uiCtx(over: Record<string, unknown> = {}) {
 }
 
 /** 现状宿主的 fake 事件：`systemPromptOptions.sections` 是可变对象，注入就地写进去。 */
-export function sectionsEvent(prompt = "q") {
+export function sectionsEvent(prompt = "q", images?: unknown[]) {
 	return {
 		messageType: "user" as const,
 		prompt,
+		...(images ? { images } : {}),
 		systemPrompt: "BASE_PROMPT",
 		systemPromptOptions: { sections: {} as Record<string, string | null> },
 	};
