@@ -26,6 +26,11 @@ extract 与 dream 都靠**子会话**跑（dsh 里唯一能跑工具循环的机
 6. **同步没有退出兜底推送。** 长寿命宿主里 `agent/disposed` 不是可靠的收口点（见下文
    [跨设备同步](#跨设备同步)），所以不同于 pi 的 `session_shutdown` flush，dsh 不会在会话销毁时
    尝试推送。没发布出去的写入由下一次 `agent/created` 的启动轮次补上。
+7. **召回的消费点不同。** pi 在本轮的 `turn_end` 边界把召回块作为 `custom_message` entries 追加进
+   会话；dsh 没有能在边界追加消息的事件，改为 `pre-step` 两段式：`step 1` 只启动侧查询，同一 turn 的
+   `step >= 2` 才把召回消息 splice 进这一步 claim 的消息里（随 admitted messages 一起落 session）。
+   由此还有一处语义分叉：pi 在「有工具结果但 run 随即结束」的轮仍会持久化召回，dsh 因为没有下一个
+   `pre-step` 会把它作废（见 [pi-memory 参考](./pi-memory.zh.md#自动浮现)）。
 
 除此之外，`dream` / `extractMemories` 两个配置子树与 pi 的 `memory.json` 逐字同名，可以照抄；
 它们的 `model` / `thinkLevel` / 预算值全部由 core 自己消费，本适配层一个都不读（除了 `/memory` 的
@@ -127,7 +132,7 @@ Windows 上的 `/mnt/…`）、空值，以及「根存在但不是目录」或�
 与 pi 一样，侧查询不阻塞任何请求；dsh 的差异在消费点 —— 没有 pi 那种可以在边界追加消息的 `turn_end`，所以用「同轮的后续 step」。监听器挂在 `agent/pre-step` waterfall 上，用 `{ prepend: true }` 注册在最外层：先进入、最后看到 decision，于是 splice 进去的是其它监听器（compaction / instructions / time-context）都处理过的最终消息数组。
 
 1. `step === 1`（轮首，且这一步 claim 的 messages 里有真人 prompt）：先作废**上一轮**的在途召回，再把 `scanEntries` + 侧查询丢到后台，**立即返回原 decision** —— 本轮第一个请求与侧查询并行，可能不带召回。
-2. **同一 turn** 的 `step >= 2`（模型调过工具之后）：结果已就绪才把 `<relevant_memories>` 消息 splice 进这一步 claim 的消息之后（`form: "notice"` + 一行 `Recalled N memories` 摘要），并把这些文件标进去重集合；未就绪就原样返回，留给后面的 step。
+2. **同一 turn** 的 `step >= 2`（模型调过工具之后）：结果已就绪才把 `<relevant_memories>` 消息 splice 进这一步 claim 的消息之后（`form: "notice"` + 一行 `Recalled N memories` 摘要 —— 只有 1 条时是 `Recalled 1 memory`），并把这些文件标进去重集合；未就绪就原样返回，留给后面的 step。
 3. 下列情况结果一律作废、不标去重：turn 变了、step 被拒、轮被取消、这一步 claim 里出现与启动时不同的真人输入、`agent/status` 转 `idle`（这一轮及其排队续轮都跑完了，没赶上的结果不跨轮保留），以及这一轮没有后续 step（模型直接答完）。同一 turn 重复进 step 1 = 重新启动一次预取，旧结果按身份校验丢弃。
 4. 去重口径与 pi 一致：「本 session 已让模型见过正文的文件」—— 召回注入的文件，加上**主 session** `memory` 工具读取过的（`add` / `replace` 成功写入的文件，`scope=memory` 的 `search` 命中的文件；`list` / `scope=sessions` / 失败调用不计）。extract / dream 的常驻 worker 读到的正文只进了子会话，主模型没见过，不标记。
 5. 同轮的并发写入同样被两道**同步门**拦住（与 pi 相同的判据）：结果在飞期间 store 被写过（同轮 `memory remove` / `replace`、常驻 worker、同步写入都算），或者选中的文件里已有一个进了去重集合（同轮 `memory search` 已经把完整正文交给模型）→ 整份作废，不 splice、不标去重。
