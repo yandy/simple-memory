@@ -395,6 +395,8 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			const extractPlan = TASKS.extractMemories.plan;
 			const dreamPlan = TASKS.dream.plan;
 			const buildTool = (options: NestedMemoryToolOptions): unknown =>
+				// worker（extract / dream）**不**传 `onContentSeen`：它们读到的正文只进了子会话，主模型没见过，
+				// 标成「已见过」会把本该浮现的条目吞掉。
 				createMemoryTool(rt, { searchSessions, onWrite: writeHook(options.onWrite, false) }, options);
 			const makeWorker = async (task: "extractMemories" | "dream") => {
 				const plan = task === "dream" ? dreamPlan : extractPlan;
@@ -442,6 +444,13 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			// refresh 必须 fire-and-forget：core onWrite 同步、宿主 section text 也同步。
 			// 原写入语义不变，writeHook 另外把同一次成功写交给当前 sync engine。
 			onWrite: writeHook(undefined, true),
+			// 主 session 才计入召回去重：工具把正文交给了主模型，下一轮 surfaced 不该重复。
+			// 与召回共用同一个 Set（`injected` 由 surfacing 读写，装配层负责在会话结束时销账）。
+			onContentSeen: ({ files }) => {
+				const seen = injected.get(sessionId) ?? new Set<string>();
+				for (const file of files) seen.add(file);
+				injected.set(sessionId, seen);
+			},
 		});
 
 		// 同一个 sessionId 可能再来一次 created（宿主的 clear / compact 会重建 agent）：先撤掉上一份，

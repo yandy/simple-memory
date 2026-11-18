@@ -237,6 +237,52 @@ describe("createMemoryTool", () => {
 		expect(searchSessions).toHaveBeenCalledExactlyOnceWith(cwd, "hello", sessionSearch);
 	});
 
+	it("reports the written file after a successful add", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		const rt = makeRuntime(memoryDir, store);
+		const onContentSeen = vi.fn();
+		const tool = createMemoryTool(rt, makeDeps({ onContentSeen }));
+
+		await tool.execute({ action: "add", name: "A", description: "d", content: "正文" }, {});
+
+		// core 只在成功路径上报；index.ts 的主 session 注册靠它把文件计入召回去重。
+		expect(onContentSeen.mock.calls.map((call) => call[0])).toEqual([{ action: "add", files: ["A.md"] }]);
+	});
+
+	it("reports every hit file for a memory search", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		const rt = makeRuntime(memoryDir, store);
+		const onContentSeen = vi.fn();
+		const tool = createMemoryTool(rt, makeDeps({ onContentSeen }));
+		await tool.execute({ action: "add", name: "A", description: "d", content: "共同关键词 alpha" }, {});
+		await tool.execute({ action: "add", name: "B", description: "d", content: "共同关键词 beta" }, {});
+		onContentSeen.mockClear();
+
+		await tool.execute({ action: "search", query: "共同关键词" }, {});
+
+		// search 把完整 body 拼进了 text，模型确实见过 —— 下一轮 surfaced 不该重复这两条。
+		expect(onContentSeen.mock.calls.map((call) => call[0])).toEqual([
+			{ action: "search", files: ["A.md", "B.md"] },
+		]);
+	});
+
+	it("stays optional: a tool without the callback behaves exactly as before (worker shape)", async () => {
+		const memoryDir = join(dir, "mem");
+		const store = makeStore(memoryDir);
+		const rt = makeRuntime(memoryDir, store);
+		// extract / dream 的 worker 工具就是这个形态：不传 onContentSeen。
+		const tool = createMemoryTool(rt, makeDeps());
+
+		await expect(tool.execute({ action: "add", name: "A", description: "d", content: "正文" }, {})).resolves.toEqual({
+			content: 'Saved "A" (A.md).',
+		});
+		await expect(tool.execute({ action: "search", query: "nothing" }, {})).resolves.toEqual({
+			content: "No matches in memory.",
+		});
+	});
+
 	it("isConcurrencySafe is total and returns true only for list/search", () => {
 		const rt = makeRuntime(join(dir, "mem"), null);
 		const tool = createMemoryTool(rt, makeDeps());

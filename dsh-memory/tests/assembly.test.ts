@@ -587,6 +587,34 @@ describe("apply — 启动期降级与每轮召回", () => {
 		expect(third.messages).toHaveLength(2);
 	});
 
+	it("counts files the main session tool read as already seen", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		const { fake } = await setup(
+			{ llmStream: llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })) },
+			rowConfig({ autoSurfacing: { model: "prov/mod" } }),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		// 模型在会话里用 `memory` 工具读到了 Alpha 的正文（memory-scope search）。
+		const tool = memoryToolOf(fake, "s1");
+		const read = await tool?.execute({ action: "search", query: "lantern" }, {});
+		expect(read.content).toContain("the codeword is lantern");
+
+		// 正文已进了主模型上下文：装配层把它计入与召回共用的 injected，下一轮 surfaced 不该重复。
+		// 侧查询照旧被要求「选」Alpha.md，但 core 的 candidates() 已把它过滤掉 → 没有内容可注入。
+		const decision = await fake.emitter.preStep({
+			agent,
+			messages: [createUserMsg("tell me about alpha")],
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		expect(decision.kind).toBe("enter");
+		expect(decision.messages).toHaveLength(1);
+	});
+
 	it("registers the recall listener outermost so an inner rewrite cannot drop the recalled block", async () => {
 		const memoryDir = memoryDirFor(cwd);
 		await seedEntry(memoryDir, "Alpha", "about alpha", "the codeword is lantern");
