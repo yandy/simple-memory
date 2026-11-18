@@ -19,12 +19,16 @@ function entry(file: string, description = "d") {
 	return { file, name: file.replace(/\.md$/, ""), description, type: "project", modified: "2026-01-01T00:00:00.000Z" };
 }
 
+/** 宿主 `ImageContent` 的最小形状（只关心 `type: "image"`）。 */
+const IMAGE = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
+
 /**
  * 真实用户消息的投影形状：宿主 `_prepareRun` 总是给块数组（`[text, ...images]`）。
  * `memory-auto-surfacing` 这类 custom_message 投影成 `role: "custom"`，不在这里。
+ * 带图时文本是 `prompt + "\n\n" + hints`，content 里同时有 image block。
  */
-function userMessage(text: string) {
-	return { role: "user", content: [{ type: "text", text }], timestamp: 0 };
+function userMessage(text: string, images: unknown[] = []) {
+	return { role: "user", content: [{ type: "text", text }, ...images], timestamp: 0 };
 }
 
 /**
@@ -401,7 +405,7 @@ describe("index wiring — auto-surfacing", () => {
 
 	it("consumes a recall for a repeated prompt with the same text", async () => {
 		// 同文本重复 prompt：检索 query 相同，召回内容对新 prompt 同样适用，所以按归属消费
-		//（误判无害）。带图片时宿主把归一化提示以 `\n\n` 追加到用户文本后，也是同一轮。
+		//（误判无害）。
 		const { notify, setStatus, ctx } = spyUi();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -418,17 +422,98 @@ describe("index wiring — auto-surfacing", () => {
 		);
 		expect(repeated.entries.at(-1)).toEqual(recallEntry);
 		expect(notify).toHaveBeenCalledWith("Recalled: 2 entries", "info");
+	});
 
-		// 图片提示的形状：`prompt + "\n\n" + hints`。
-		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+	it("consumes a recall for the image-hint suffix of the same prompt", async () => {
+		// 带图那一轮：宿主把图片归一化提示以 `prompt + "\n\n" + hints` 追加到用户文本后，
+		// content 里同时有 image block（`_prepareRun`）。两个条件都成立时才是同一轮。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: RECALL });
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?", [IMAGE]), ctx);
 		await flushPrefetch(setStatus);
-		notify.mockClear();
 		const withImages = await handlers["turn_end"][0](
-			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\n[Image #1: screenshot]")) }),
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\n[Image #1: screenshot]", [IMAGE])) }),
 			ctx,
 		);
 		expect(withImages.entries.at(-1)).toEqual(recallEntry);
 		expect(notify).toHaveBeenCalledWith("Recalled: 2 entries", "info");
+	});
+
+	it("discards the recall when a different prompt merely starts with the same text", async () => {
+		// 反例：B 的 prompt 是 `ssh?\n\nuse staging instead` —— 文本确实以 `prompt + "\n\n"` 开头，
+		// 但既不是同一段 prompt、也没带图，所以不是同一轮（前缀匹配不能单凭文本成立）。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: RECALL };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		const boundary = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\nuse staging instead")) }),
+			ctx,
+		);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// 作废不标去重：同一个文件在下一轮 side query 里仍是可选项。
+		await handlers["before_agent_start"][0](sectionsEvent("staging?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall.at(-1)).toEqual(new Set());
+	});
+
+	it("discards the image-hint shape when the boundary message carries no image", async () => {
+		// 无图轮的用户消息文本就是 prompt 原文；带后缀又没有 image block，说明那不是带图轮的
+		// `prompt + "\n\n" + hints`，而是另一个 prompt。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: RECALL });
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		const boundary = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\n[Image #1: screenshot]")) }),
+			ctx,
+		);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// pending 带图但边界消息无图：同样作废。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?", [IMAGE]), ctx);
+		await flushPrefetch(setStatus);
+		const mismatch = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\nuse staging instead")) }),
+			ctx,
+		);
+		expect(mismatch).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// pending 无图但边界消息带图：不是带图轮的提示后缀（那个轮次在启动时就带图）。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		const lateImage = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\nuse staging instead\n\n[Image #1: screenshot]", [IMAGE])) }),
+			ctx,
+		);
+		expect(lateImage).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
 	});
 
 	it("keeps the new status line when a superseded prefetch finishes late", async () => {

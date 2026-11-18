@@ -102,7 +102,7 @@ function countInjectedBlocks(content: string): number {
 }
 
 /**
- * 取边界上「最后一条真实用户消息」的文本（`turn_end` 的归属校验用）。
+ * 取边界上「最后一条真实用户消息」的文本与带图信息（`turn_end` 的归属校验用）。
  *
  * 取 `event.context.contextMessages` 而不是 `ctx.sessionManager.getBranch()`：
  * - 它就是宿主为这个边界合成、下一个请求要用的那份会话上下文（`_buildBoundaryContext`），
@@ -113,34 +113,56 @@ function countInjectedBlocks(content: string): number {
  *   `contextMessages`：它们还没进消息流，这个边界仍属于原 prompt；
  * - 纯事件字段，同步读取，不会在 session dispose 后回读失效的 `ctx` 代理。
  *
- * 用户消息的 content 是字符串或块数组（宿主 `_prepareRun` 总是给 `[text, ...images]`）。
+ * 用户消息的 content 是字符串或块数组（宿主 `_prepareRun` 总是给 `[text, ...images]`），
+ * 所以这里同时带回「有没有 image block」：带图那一轮的文本不是纯 prompt，见 `boundaryOwnsRecall`。
  */
-function lastUserMessageText(context: BoundaryContextPreview | undefined): string | undefined {
+interface BoundaryUserMessage {
+	text: string;
+	/** 该消息的 content 里是否有 image block（宿主只在真的带图时才追加图片）。 */
+	hasImages: boolean;
+}
+
+function lastUserMessage(context: BoundaryContextPreview | undefined): BoundaryUserMessage | undefined {
 	const messages = context?.contextMessages;
 	if (!Array.isArray(messages)) return undefined;
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
 		if (message.role !== "user") continue;
 		const content = message.content;
-		if (typeof content === "string") return content;
-		return content
-			.filter((block) => block.type === "text")
-			.map((block) => (block.type === "text" ? block.text : ""))
-			.join("");
+		if (typeof content === "string") return { text: content, hasImages: false };
+		return {
+			text: content
+				.filter((block) => block.type === "text")
+				.map((block) => (block.type === "text" ? block.text : ""))
+				.join(""),
+			hasImages: content.some((block) => block.type === "image"),
+		};
 	}
 	return undefined;
 }
 
 /**
- * 这个边界是否仍属于启动本轮检索的那个 user run。
+ * 这个边界是否仍属于启动本轮检索的那个 user run。两道判据，缺一不可（下面的注释解释为什么
+ * 前缀匹配必须被「两边都带图」这一条钉死）。
  *
- * 同文本重复 prompt 视为同一轮：检索 query 相同，召回内容对新 prompt 同样适用，误判无害。
- * 带图片时宿主把归一化提示以 `prompt + "\n\n" + hints` 追加到用户文本后（`_prepareRun`），
- * 那是同一轮的前缀形态。
+ * 1. **严格相等**：同文本重复 prompt 视为同一轮 —— 检索 query 相同，召回内容对新 prompt 同样
+ *    适用，误判无害；无图 prompt 的用户消息文本就是 prompt 原文（宿主 `_prepareRun` 只在有
+ *    提示时才拼接），所以无图轮走到这里就结束。
+ * 2. **带图的前缀形态**：宿主把图片归一化提示以 `prompt + "\n\n" + hints` 追加到用户文本后
+ *    （`agent-session.js` `_prepareRun`），同一轮的文本因此带一个后缀。但「文本以
+ *    `prompt + "\n\n"` 开头」本身不能证明是同一条用户消息 —— 用 `A` 的召回去记 `B` 的
+ *    多行 prompt（`A` + 换行 + 更多内容）会把召回记到别人的头上，还会错误标记去重。所以前缀
+ *    分支额外要求：启动检索时 pending 确实带图，且边界上的这条用户消息也确实含 image block。
+ *    无图的后缀文本一律作废。
+ *
+ * 残留的极端情形：pending 带图 + 不同 prompt 恰好以 `prompt + "\n\n"` 开头 + 新 prompt 也
+ * 带图。此时文本前缀相同，语义上高度相关，召回仍适用（与同文本重复 prompt 同性质），可接受。
  */
-function boundaryOwnsRecall(lastUserText: string | undefined, prompt: string): boolean {
-	if (lastUserText === undefined) return false;
-	return lastUserText === prompt || lastUserText.startsWith(`${prompt}\n\n`);
+function boundaryOwnsRecall(last: BoundaryUserMessage | undefined, pending: PendingRecall): boolean {
+	if (last === undefined) return false;
+	if (last.text === pending.prompt) return true;
+	if (pending.imageCount === 0 || !last.hasImages) return false;
+	return last.text.startsWith(`${pending.prompt}\n\n`);
 }
 
 /**
@@ -169,6 +191,8 @@ interface PendingRecall {
 	settled: boolean;
 	/** 启动这一轮检索的 user run 的 prompt（`BeforeAgentStartUserEvent.prompt`，已展开）。 */
 	prompt: string;
+	/** 启动时这条 prompt 附带的图片数（`BeforeAgentStartUserEvent.images`）：0 = 无图轮。 */
+	imageCount: number;
 	files: string[];
 	content: string;
 }
@@ -700,6 +724,8 @@ export default function (pi: ExtensionAPI) {
 		// `messageType: "custom"`（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）带 `message`。
 		// 自动浮现按用户输入检索，custom run 没有用户输入可检索，跳过（不是降级）。
 		const promptText = event.messageType === "user" ? event.prompt : undefined;
+		// 带图轮的归属判据（见 `boundaryOwnsRecall`）：只有 user run 才可能带图。
+		const imageCount = event.messageType === "user" ? (event.images?.length ?? 0) : 0;
 		if (autoSurfacing?.enabled && promptText && !isSubagent) {
 			// prefetch 与主循环并行：**同步段**把宿主值与本轮输入抓成局部量，异步链此后不再回读
 			// `ctx`（pi 的 ExtensionContext 是代理，session dispose 之后 `hasUI` / `ui` 直接抛错）。
@@ -707,7 +733,13 @@ export default function (pi: ExtensionAPI) {
 			const cfg = config;
 			const dir = memoryDir;
 			const headless = headlessFor(ctx.modelRegistry);
-			const pending: PendingRecall = { settled: false, prompt: promptText, files: [], content: "" };
+			const pending: PendingRecall = {
+				settled: false,
+				prompt: promptText,
+				imageCount,
+				files: [],
+				content: "",
+			};
 			pendingRecall = pending;
 			if (ui) {
 				surfacingStatusFor = pending;
@@ -760,8 +792,9 @@ export default function (pi: ExtensionAPI) {
 	 * 的 turn 边界才持久化。
 	 *
 	 * - 零工具调用的 turn（含单请求轮）= 本轮之后再没有请求：召回作废，不落 session、不标去重；
-	 * - 归属校验：`event.context` 里最后一条真实用户消息不是下一个 run 的 prompt 时，这个边界
-	 *   已经属于别的输入（例如排队中的 follow-up 已被 drain），旧 pending 作废而不是记到新输入头上；
+	 * - 归属校验（`boundaryOwnsRecall`）：`event.context` 里最后一条真实用户消息不是下一个 run
+	 *   的 prompt 时，这个边界已经属于别的输入（例如排队中的 follow-up 已被 drain），旧 pending
+	 *   作废而不是记到新输入头上；
 	 * - `custom_message` entries 只能追加在边界，所以持久块位置固定、只出现一次（prefix cache）；
 	 * - 不 `continue`：工具结果本身就会引发下一请求，额外请求只会重算前缀。
 	 */
@@ -771,7 +804,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
 		// 消费点归属校验：无论结果要不要，这个边界上的 pending 都只能消费一次。
 		pendingRecall = undefined;
-		if (!boundaryOwnsRecall(lastUserMessageText(event.context), pending.prompt)) return;
+		if (!boundaryOwnsRecall(lastUserMessage(event.context), pending)) return;
 		// 渲染成功才算注入（content 非空）；持久化保证它最迟在下一请求进入上下文。
 		for (const f of pending.files) injectedFiles.add(f);
 		// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知；ctx 只在同步段读一次。
