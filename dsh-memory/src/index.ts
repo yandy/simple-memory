@@ -524,6 +524,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		// 所以固定用零工具端口：不建子会话，也不在宿主会话日志里留痕。
 		headless: zeroToolHeadless,
 		injected,
+		pendingRecalls,
 		warn: (message, ...args) => ctx.logger.warn(message, ...args),
 	});
 	ctx.on(

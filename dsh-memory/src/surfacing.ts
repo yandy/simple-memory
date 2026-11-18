@@ -4,8 +4,15 @@ import type { HeadlessAgentPort } from "@yandy0725/memory-core";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
- * 每轮召回：挂在宿主 `agent/pre-step` waterfall 上，在模型被调用前，用一轮零工具侧查询挑出与用户
- * 这轮输入相关的 entry，再把它们渲染成 `<relevant_memories>` 块 splice 进进入该 step 的消息里。
+ * 每轮召回：挂在宿主 `agent/pre-step` waterfall 上，用一轮零工具侧查询挑出与用户这轮输入相关的
+ * entry，再把它们渲染成 `<relevant_memories>` 块 splice 进进入该 step 的消息里。
+ *
+ * **prefetch 两段式**（侧查询不阻塞任何请求）：
+ *
+ * - `step === 1`：记下真人 prompt，把 `scanEntries` + `runTask` 丢到后台（fire-and-forget），
+ *   **立即返回原 decision** —— 这一轮的第一个请求与侧查询并行，不等它。
+ * - **同一 turn** 的 `step >= 2`：pending 已就绪且渲染非空才消费（splice + 标记去重 + 销账）。
+ *   未就绪就留给后面的 step；turn 变了、被拒、取消、或这一步 claim 里出现别的真人输入 → 作废。
  *
  * 记忆逻辑全在 core（`runTask(TASKS.autoSurfacing)` 选文件并渲染、净化）；本模块是宿主胶水：
  * 找到真人 prompt、调 core、把结果放进宿主真正会投递的位置。两处宿主敏感语义：
@@ -21,7 +28,15 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
 const USER_PROMPT_MAX_CHARS = 4000;
 
 /**
- * 一条在途的召回（prefetch）状态：`turn` 是它服务的轮次，`settled` 表示侧查询已返回。
+ * 一条在途的召回（prefetch）状态。
+ *
+ * 归属有两道闸，缺一不可：
+ * 1. `turn`：只有**同一轮**的后续 step 才消费（新的一轮在 step 1 直接覆盖整条 pending）；
+ * 2. `prompt`：消费前拿这一刻 step claim 的真人 prompt 比对 —— 宿主的 inbox 可以在 handler 未完成时
+ *    收进新的真人输入（steering / 排队 follow-up），那种情况下这条召回属于**前一条** prompt，
+ *    第 1 道闸是哑的（turn 没变），只有按 prompt 校验才能把结果扣在正确的输入上。
+ *
+ * `settled` 之前 `files` / `content` 一律不可信（消费点必须先看它）。
  *
  * 装配层持有 `Map<sessionId, PendingRecall>`（宿主的 compact / clear 与 dispose 都要作废它），
  * 会话边界的销账语义在 index.ts。
@@ -29,6 +44,8 @@ const USER_PROMPT_MAX_CHARS = 4000;
 export interface PendingRecall {
 	turn: number;
 	settled: boolean;
+	/** 启动 prefetch 时这一轮 claim 里的真人 prompt（消费点的归属校验用它）。 */
+	prompt: string;
 	files: string[];
 	content: string;
 }
@@ -39,6 +56,8 @@ export interface SurfacingDeps {
 	headless: HeadlessAgentPort;
 	warn(message: string, ...args: unknown[]): void;
 	injected: Map<string, Set<string>>; // sessionId → 已注入的 entry 文件名
+	/** sessionId → 在途召回。读写都在本模块，装配层只在会话边界清（compact / clear / disposed）。 */
+	pendingRecalls: Map<string, PendingRecall>;
 }
 
 export interface UserMessageLike {
@@ -139,9 +158,16 @@ export function createPreStepListener(
 		// 从这里到结尾统一包一层 try：payload 违约（messages 不可迭代、next() 解析成非 decision）或
 		// 召回任一步失败，都记一行并原样返回 decision，而不是把 turn 弄崩 —— 召回是增强。
 		try {
-			if (decision.kind === "reject" || payload.signal.aborted) return decision;
+			const sessionId = payload.agent.session.id;
 
-			const rt = deps.registry.get(payload.agent.session.id);
+			// 被拒的 step 不会跑、取消的轮不会再有后续请求：两种情况下这一轮都**没有消费点**了，
+			// 在途召回随轮作废（不标记去重 —— 正文没到模型眼前）。
+			if (decision.kind === "reject" || payload.signal.aborted) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
+			}
+
+			const rt = deps.registry.get(sessionId);
 
 			// 每轮每个 step 都刷新索引快照（廉价路径）：这是长寿命会话最终看到其它进程写入记忆的途径。
 			// 与召回无关（索引 section 是另一条注入通道），所以放在 surfacing 可用性门之前。
@@ -149,55 +175,101 @@ export function createPreStepListener(
 				await deps.indexCache.refresh(rt);
 			}
 
-			// 只在 step === 1 召回：召回服务的是「这一轮的用户意图」，同一轮里模型自己发起的后续 step
-			// 不该再付一次侧查询的延迟与 token。`rt.memoryDir === null` 显式声明不变量
+			// 召回服务的是「这一轮的用户意图」，所以只有 step === 1 启动侧查询：同一轮里模型自己发起的
+			// 后续 step 不该再付一次侧查询的 token。`rt.memoryDir === null` 显式声明不变量
 			// （registry 只在解析出 memoryDir 时才给出非空 store；`fail()` 两者同空）—— 显式 return
 			// 而不是 `?? ""`，避免静默把空 cwd 发给侧查询端口。
-			if (
-				payload.step !== 1 ||
-				rt === undefined ||
-				rt.store === null ||
-				rt.memoryDir === null ||
-				!rt.surfacing.available
-			) {
+			if (payload.step === 1) {
+				if (rt === undefined || rt.store === null || rt.memoryDir === null || !rt.surfacing.available) return decision;
+				const prompt = humanPromptText(payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>);
+				if (prompt === "") return decision;
+
+				// 同步段只做两件事：记下 pending、把侧查询丢到后台。此后不能再回读 `rt` 的字段（长寿命对象，
+				// 会话可能在侧查询在飞期间被收回），所以先把要用的值抓成局部常量。
+				const store = rt.store;
+				const memoryDir = rt.memoryDir;
+				const cfg = rt.config;
+				// 去重集合递**快照**：查询在飞时同轮的消费点可能把别的文件标进活 Set，传引用会让
+				// 「查询输入」随之后写而变。
+				const injectedFiles = new Set(deps.injected.get(sessionId) ?? []);
+				const pending: PendingRecall = { turn: payload.turn, settled: false, prompt, files: [], content: "" };
+				// 覆盖旧 pending：新的一轮取代旧的一轮（旧那份的结果在写回前会被丢弃）。
+				deps.pendingRecalls.set(sessionId, pending);
+				const prefetch = (async () => {
+					try {
+						const manifest = await scanEntries(store);
+						const { files, content } = await runTask(
+							TASKS.autoSurfacing,
+							{ userPrompt: prompt.slice(0, USER_PROMPT_MAX_CHARS), injectedFiles, manifest },
+							{ cfg, cwd: memoryDir, store, signal: payload.signal, ports: { headless: deps.headless } },
+						);
+						// 期间有新的 step 1 启动（这份 pending 已被取代）：结果随轮作废，不写回。
+						if (deps.pendingRecalls.get(sessionId) !== pending) return;
+						pending.files = files;
+						pending.content = content;
+					} catch (e) {
+						// 召回是增强，绝不能拖垮这一轮：失败只记一行，pending 以空 content 收场
+						// （消费点据此丢弃它，不 splice、不标记）。
+						deps.warn("simple-memory: auto-surfacing skipped: %s", e);
+					} finally {
+						pending.settled = true;
+					}
+				})();
+				// 兜底：链内已全 catch，这里再挡一层意外 rejection（未处理的 rejection 在宿主里没人接）。
+				void prefetch.catch(() => undefined);
 				return decision;
 			}
 
-			const prompt = humanPromptText(payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>);
-			if (prompt === "") return decision;
+			// ---- step >= 2：消费同轮已就绪的 prefetch。 ----
+			const pending = deps.pendingRecalls.get(sessionId);
+			if (pending === undefined) return decision;
 
-			const manifest = await scanEntries(rt.store);
-			const injectedFiles = deps.injected.get(rt.sessionId) ?? new Set<string>();
-			const { files, content } = await runTask(
-				TASKS.autoSurfacing,
-				{ userPrompt: prompt.slice(0, USER_PROMPT_MAX_CHARS), injectedFiles, manifest },
-				{
-					cfg: rt.config,
-					cwd: rt.memoryDir,
-					store: rt.store,
-					signal: payload.signal,
-					ports: { headless: deps.headless },
-				},
-			);
-			if (content === "") return decision;
+			// turn 不匹配：这份结果属于更早的轮（或压缩重建把 turn 计数改了），一律作废。
+			if (pending.turn !== payload.turn) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
+			}
 
-			// 复检取消：侧查询最长可跑 30s，用户可能在 await 期间取消了这一轮。若已取消，绝不标记
-			// injected、绝不 splice —— 这些文件根本没到模型眼前，标记了就白烧本会话再召回的机会。
-			if (payload.signal.aborted) return decision;
+			// 归属校验：这一步 claim 里若出现**新的、与启动时不同**的真人输入，这份召回属于前一条 prompt
+			// （宿主允许 handler 未完成时收进 steering / followed-up 输入）—— 不 splice、不标记去重，作废。
+			// 没有真人输入（step >= 2 通常只 claim 工具结果）或文本相同（同文本重复 prompt = 检索 query
+			// 相同，召回仍适用）都照常消费。
+			const claimed = humanPromptText(payload.messages as Array<{ source?: { kind?: string }; content?: unknown }>);
+			if (claimed !== "" && claimed !== pending.prompt) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
+			}
 
-			// 只在成功且非空渲染之后才标记 injected（与 pi 一致）：空渲染不消耗这些文件本会话再浮现的机会。
-			for (const file of files) injectedFiles.add(file);
-			deps.injected.set(rt.sessionId, injectedFiles);
+			// 未就绪：这个请求不带召回（「永不阻塞」的代价面），pending 留给后面的 step。
+			if (!pending.settled) return decision;
 
-			// 召回插在「最后一条仍来自本轮 claim 的消息」之后：用身份包含（而非 source.kind）判定，
+			// 复检取消：索引刷新是个 await 点，用户可能在它期间取消了这一轮。已取消就不标记、不 splice ——
+			// 这些文件根本没到模型眼前，标记了就白烧本会话再召回的机会。
+			if (payload.signal.aborted) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
+			}
+
+			// 就绪的 pending 只有一次消费机会：无论成败都销账，绝不让后续 step 再拼一次同样一块。
+			deps.pendingRecalls.delete(sessionId);
+
+			// 只在成功且非空渲染之后才标记 injected（与 pi 一致）：空渲染（含 prefetch 失败）不消耗
+			// 这些文件本会话再浮现的机会。
+			if (pending.content === "") return decision;
+			const consumed = deps.injected.get(sessionId) ?? new Set<string>();
+			for (const file of pending.files) consumed.add(file);
+			deps.injected.set(sessionId, consumed);
+
+			// 召回插在「最后一条仍来自这一步 claim 的消息」之后：用身份包含（而非 source.kind）判定，
 			// 因为内层监听器可能已经 append 了新消息，我们只关心原始 claim 里最后一条的落点。
-			// `findLastIndex` 找不到 → -1 → `toSpliced(0, 0, msg)` 会把块放到最前（在任何 compaction
-			// summary 之前）。这与 first-party 一致（`dsh-agent-instructions/lib/index.js:1493-1494`
-			// 同样的未加 guard 的 `-1 + 1`），且是理论场景（没有哪个被调研的监听器产出 identity-
-			// disjoint 消息）—— 不加 guard，在这里与 first-party 分叉本身是另一种风险。
+			// 找不到（-1）= 这一步 claim 与 decision 里的消息没有身份交集（宿主的 `payload.messages` 是
+			// 「这一步从 inbox 收走的那些消息」，step >= 2 常见为空或全是工具结果）→ 追加到末尾，
+			// 即落在本轮已有消息之后、下一次请求之前。绝不能像 first-party 的 `-1 + 1` 那样插到最前：
+			// 那会把召回放到本轮 prompt **之前**，位置错乱且破坏前缀缓存。
 			const lastClaimed = decision.messages.findLastIndex((m) => payload.messages.includes(m));
-			const message = createRecallMessage(content, files.length);
-			return { ...decision, messages: decision.messages.toSpliced(lastClaimed + 1, 0, message) };
+			const at = lastClaimed === -1 ? decision.messages.length : lastClaimed + 1;
+			const message = createRecallMessage(pending.content, pending.files.length);
+			return { ...decision, messages: decision.messages.toSpliced(at, 0, message) };
 		} catch (e) {
 			// 召回是增强，绝不能拖垮这一轮：任何失败都记一行，原样返回 decision。
 			deps.warn("simple-memory: auto-surfacing skipped: %s", e);
