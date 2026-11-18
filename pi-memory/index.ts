@@ -1,7 +1,6 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
-	BeforeAgentStartEventResult,
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionUIContext,
@@ -111,6 +110,16 @@ function unwarnedStartupTail(delivered: string | undefined, warning: string | un
 	if (warning === delivered) return "";
 	// core 用 `joinWarning` 以换行追加；只剥一层分隔符，不改写内容。
 	return warning.startsWith(`${delivered}\n`) ? warning.slice(delivered.length + 1) : warning;
+}
+
+/**
+ * prefetch 的结果槽：`settled` 之前 `content` 一律不可信（消费点必须先看它）。
+ * pi 侧刻意不带 turn 号 —— `before_agent_start` 替换语义已经保证「新一轮即作废」。
+ */
+interface PendingRecall {
+	settled: boolean;
+	files: string[];
+	content: string;
 }
 
 export const IMPLEMENTED_TASKS = ["dream", "extractMemories", "autoSurfacing"] as const;
@@ -234,6 +243,17 @@ export default function (pi: ExtensionAPI) {
 	let currentCwd = "";
 	/** 本 session 已注入过的 entry **文件名**（spec §9.3）。session_compact 会清空它。 */
 	const injectedFiles = new Set<string>();
+	/**
+	 * 本轮 `before_agent_start` 启动的侧查询（spec §5.2）。`before_agent_start` 不 await 它，
+	 * 只在结果就绪且本轮还有后续请求时由 `turn_end` 持久化一次；新一轮启动即作废。
+	 */
+	let pendingRecall: PendingRecall | undefined;
+	/**
+	 * 当前**拥有** `surfacing` 状态行的那一份 pending。收尾时必须持有它才能清 —— 被新一轮取代的
+	 * prefetch 若无条件清，会把新一轮已经亮出来的状态行擦掉；反之（被作废且没有新检索）则必须由
+	 * 它自己清，否则状态行就永久挂着。
+	 */
+	let surfacingStatusFor: PendingRecall | undefined;
 	let lastSystemPrompt = "";
 	/** extract 失败通知的限流（spec §14：同一 session 最多 1 次）。session_start 重置。 */
 	let extractErrorNotified = false;
@@ -608,15 +628,16 @@ export default function (pi: ExtensionAPI) {
 		lastSystemPrompt = event.systemPrompt;
 		// 先拷到 const：`store` 是工厂作用域的 let，在异步回调里 TS 不会保留它的外层收窄。
 		const activeStore = store;
-		if (!config || !memoryDir || !activeStore) return;
-		const headless = headlessFor(ctx.modelRegistry);
+		// 任何 run（含 custom）都先作废旧 pending：它属于被这一轮取代的那个 prompt
+		//（spec §5.1「新用户轮启动时旧 pending 一律作废」）。
+		pendingRecall = undefined;
+		if (!config || !memoryDir || !activeStore) return {};
 
 		// 索引 section：**每一轮无条件**写入冻结值（含 resume / fork / reload）。
 		// 省略这个键 = pi 的 diffSystemPromptSections 生成 { memory_index: null } = 把索引从
 		// system prompt 里静默删掉（spec §9.1 的 null 陷阱）。「不想改」只能靠喂回同一个值。
-		// 必须在 auto-surfacing **之前**：surfacing 的 `finally` 在 await 之后读 `ctx.hasUI`，
-		// session 在途中 dispose 会让 handler 从那里抛出（R49）——那时 section 已经被跳过，
-		// 这一轮就从「喂回冻结值」变成了「删段」。
+		// 它必须在**任何 await 之前**：handler 一旦在写 section 之前让出，session 途中 dispose
+		// 就能让这一轮从「喂回冻结值」变成「删段」（R49）。
 		applyIndexSection(event.systemPromptOptions, indexSnapshot);
 		const autoSurfacing = config.autoSurfacing;
 		// Skip auto-surfacing in subagent sessions: pi-subagents injects an
@@ -628,35 +649,85 @@ export default function (pi: ExtensionAPI) {
 		// `messageType: "custom"`（`pi.sendMessage(..., { triggerTurn: true })` 空闲触发）带 `message`。
 		// 自动浮现按用户输入检索，custom run 没有用户输入可检索，跳过（不是降级）。
 		const promptText = event.messageType === "user" ? event.prompt : undefined;
-		let injectedMessage: BeforeAgentStartEventResult["message"];
 		if (autoSurfacing?.enabled && promptText && !isSubagent) {
-			try {
-				if (ctx.hasUI) ctx.ui.setStatus("surfacing", "Searching relevant memories…");
-				const manifest = await scanEntries(activeStore);
-				if (manifest.length > 0) {
+			// prefetch 与主循环并行：**同步段**把宿主值与本轮输入抓成局部量，异步链此后不再回读
+			// `ctx`（pi 的 ExtensionContext 是代理，session dispose 之后 `hasUI` / `ui` 直接抛错）。
+			const ui = ctx.hasUI ? ctx.ui : undefined;
+			const cfg = config;
+			const dir = memoryDir;
+			const headless = headlessFor(ctx.modelRegistry);
+			const pending: PendingRecall = { settled: false, files: [], content: "" };
+			pendingRecall = pending;
+			if (ui) {
+				surfacingStatusFor = pending;
+				try {
+					ui.setStatus("surfacing", "Searching relevant memories…");
+				} catch {
+					/* UI 拒绝画状态行不影响检索 */
+				}
+			}
+			const prefetch = (async () => {
+				try {
+					const manifest = await scanEntries(activeStore);
+					if (manifest.length === 0) return;
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
 						{ userPrompt: promptText.slice(0, 4000), injectedFiles, manifest },
-						{ cfg: config, cwd: memoryDir, store: activeStore, ports: { headless } },
+						{ cfg, cwd: dir, store: activeStore, ports: { headless } },
 					);
-					// 渲染成功才算注入（content 非空）；渲染不出的文件不标记，下一轮仍有机会再选。
-					if (content !== "") {
-						for (const f of files) injectedFiles.add(f);
-						injectedMessage = { customType: "memory-auto-surfacing", content, display: false };
-						// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知。
-						if (ctx.hasUI) {
-							ctx.ui.notify(`Recalled: ${countInjectedBlocks(content)} entries`, "info");
+					// 期间有新一轮 run 启动（这一份 pending 已被作废）：结果随轮作废，不写回。
+					if (pendingRecall !== pending) return;
+					pending.files = files;
+					pending.content = content;
+				} catch {
+					/* silently skip auto-surfacing on error */
+				} finally {
+					pending.settled = true;
+					// 只有仍是状态行的持有者才收：新一轮已在搜的话，它的 finally 负责收尾。
+					if (surfacingStatusFor === pending) {
+						surfacingStatusFor = undefined;
+						try {
+							ui?.setStatus("surfacing", undefined);
+						} catch {
+							/* session 在途中 dispose：UI 已失效 */
 						}
 					}
 				}
-			} catch {
-				/* silently skip auto-surfacing on error */
-			} finally {
-				if (ctx.hasUI) ctx.ui.setStatus("surfacing", undefined);
-			}
+			})();
+			// 未处理 rejection 在 pi 里没有全局 handler（Node 会直接杀进程）：链内已全 catch，
+			// 这里再兜一层，保证 prefetch 永不影响宿主。
+			void prefetch.catch(() => undefined);
 		}
 
-		return injectedMessage ? { message: injectedMessage } : {};
+		return {};
+	});
+
+	/**
+	 * prefetch 的消费点（spec §5.2）：只有「本轮还有后续请求」的 turn 边界才持久化。
+	 *
+	 * - 零工具调用的 turn（含单请求轮）= 本轮之后再没有请求：召回作废，不落 session、不标去重；
+	 * - `custom_message` entries 只能追加在边界，所以持久块位置固定、只出现一次（prefix cache）；
+	 * - 不 `continue`：工具结果本身就会引发下一请求，额外请求只会重算前缀。
+	 */
+	pi.on("turn_end", (event, ctx) => {
+		const pending = pendingRecall;
+		if (!pending?.settled || pending.content === "") return;
+		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
+		pendingRecall = undefined;
+		// 渲染成功才算注入（content 非空）；持久化保证它最迟在下一请求进入上下文。
+		for (const f of pending.files) injectedFiles.add(f);
+		// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知；ctx 只在同步段读一次。
+		try {
+			if (ctx.hasUI) ctx.ui.notify(`Recalled: ${countInjectedBlocks(pending.content)} entries`, "info");
+		} catch {
+			/* session 在边界上 dispose：通知丢了，召回本身仍然有效 */
+		}
+		return {
+			entries: [
+				...event.entries,
+				{ type: "custom_message" as const, customType: "memory-auto-surfacing", content: pending.content, display: false },
+			],
+		};
 	});
 
 	// D14：compaction 是**唯一**的会话内刷新点。compaction 已经重写了对话中段，头部再变一次
