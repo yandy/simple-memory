@@ -146,6 +146,11 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void
  * 召回的 prefetch 是 fire-and-forget（step 1 立即返回、结果在后台就绪），测试侧没有「已就绪」的
  * 直接信号，而固定等待会假绿。未就绪时监听器原样返回、无副作用，所以「多走几个 step」正是宿主
  * 自己的行为，不是测试作弊。超过上界仍未消费就是真的失败。
+ *
+ * 这里刻意把 step ≥ 2 的 claim 也传成 step 1 的那份 messages（本文件的断言就建在这个身份交叠上）。
+ * 宿主真实的 step ≥ 2 claim 常为空（只有工具结果），那条「空 claim 仍要消费、追加到末尾」的路径
+ * 在 `surfacing.test.ts` 的 `consumes and appends at the end when a step >= 2 claims no messages`
+ * 用例里按监听器口径直接钉住。
  */
 async function consumeRecall(
 	fake: Fake,

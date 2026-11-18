@@ -115,10 +115,28 @@ interface RigOptions {
 	/** 写进 store 的 entry（默认一条 Alpha）。 */
 	entries?: Array<[name: string, body: string]>;
 	sideQuery?: SideQuery;
+	/** 替身索引刷新（默认立即 resolve）；用于把 abort 卡在 `indexCache.refresh` 这个 await 点上。 */
+	refresh?: () => Promise<void>;
 	config?: MemoryConfig;
 	runtime?: Partial<SessionMemoryRuntime>;
 	/** 用替身 store（错误态 / 扫描失败用例）：给了就跳过 entries 写入。 */
 	store?: MemoryStore | null;
+}
+
+/** 手动控制 settle 时机的索引刷新：把调用次数当探针，避免固定等待造成的假绿。 */
+function deferredRefresh(): { refresh: () => Promise<void>; release(index: number): void; calls(): number } {
+	const gates: Array<() => void> = [];
+	return {
+		refresh() {
+			return new Promise<void>((resolve) => {
+				gates.push(resolve);
+			});
+		},
+		release(index) {
+			gates[index]();
+		},
+		calls: () => gates.length,
+	};
 }
 
 /** 一次 surfacing 测试的装配：真 MemoryStore + 假宿主 waterfall + 可控侧查询端口。 */
@@ -134,7 +152,7 @@ async function makeRig(options: RigOptions = {}) {
 	const headlessRun = vi.fn(options.sideQuery ?? (async () => selectOutcome(["Alpha.md"])));
 	const injected = new Map<string, Set<string>>();
 	const pendingRecalls = new Map<string, PendingRecall>();
-	const refresh = vi.fn(async () => {});
+	const refresh = vi.fn(options.refresh ?? (async () => {}));
 	const warn = vi.fn();
 	const rt = makeRuntime(memoryDir, store, { config, ...options.runtime });
 	const deps = makeDeps({
@@ -250,6 +268,63 @@ describe("createPreStepListener", () => {
 		expect(rig.warn).not.toHaveBeenCalled();
 		// 索引刷新与召回无关，错误态也照刷（index-cache 对 store === null 记空串）。
 		expect(rig.refresh).toHaveBeenCalledTimes(1);
+		expect(rig.pendingRecalls.size).toBe(0);
+	});
+
+	it("drops the previous turn's pending at step 1 even when the runtime is unavailable", async () => {
+		// 回归：新的一轮在可用性门之前就必须作废旧 pending。否则 runtime 不可用 / no prompt / surfacing
+		// 关闭的轮会在门里直接 return，旧 content/files 一直留在 Map 里等下一个消费点。
+		const stale: PendingRecall = {
+			turn: 1,
+			settled: true,
+			prompt: "old question",
+			files: ["Alpha.md"],
+			content: "<relevant_memories>stale</relevant_memories>",
+		};
+		const pendingRecalls = new Map<string, PendingRecall>([["s1", stale]]);
+		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
+		const deps = makeDeps({ headless: { run: headlessRun }, pendingRecalls });
+		const { ctx, emitter, makeAgent } = createFakeCtx();
+		ctx.on("agent/pre-step", createPreStepListener(deps), { prepend: true });
+
+		const messages = [createUserMsg("new question")];
+		const decision = await emitter.preStep({
+			agent: makeAgent({ id: "s1" }),
+			messages,
+			turn: 2,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+
+		expect(decision.messages).toBe(messages);
+		expect(headlessRun).not.toHaveBeenCalled();
+		// `registry.get` 恒返回 undefined —— 门没通过，但销账已经发生。
+		expect(pendingRecalls.size).toBe(0);
+	});
+
+	it("drops the previous turn's pending at step 1 when the new turn claims no human prompt", async () => {
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		rig.pendingRecalls.set("s1", {
+			turn: 1,
+			settled: true,
+			prompt: "old question",
+			files: ["Alpha.md"],
+			content: "<relevant_memories>stale</relevant_memories>",
+		});
+
+		// 全是合成消息：这一轮没有真人 prompt，不会启动新 prefetch。
+		const messages = [createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z")];
+		const decision = await rig.emitter.preStep({
+			agent,
+			messages,
+			turn: 2,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.headlessRun).not.toHaveBeenCalled();
 		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
@@ -443,6 +518,35 @@ describe("createPreStepListener", () => {
 		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
 	});
 
+	it("consumes and appends at the end when a step >= 2 claims no messages at all", async () => {
+		const rig = await makeRig();
+		const context = createSyntheticMsg("runtime-context", "some injected context");
+		const user = createUserMsg("hi");
+		const contextMessages = [context, user];
+
+		await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages: [user], turn: 1, step: 1, signal: new AbortController().signal },
+			async () => ({ kind: "enter" as const, messages: contextMessages }),
+		);
+		await waitSettled(rig.pendingRecalls);
+
+		// 宿主常见形状：step >= 2 的 `payload.messages` 是「这一步从 inbox 收走的那些消息」，常为空
+		// （只有工具结果、没有新输入）。空 claim 不是「新 prompt」：归属闸不能因此作废，仍要消费。
+		const decision = await rig.listener(
+			{ agent: { session: { id: "s1" } }, messages: [], turn: 1, step: 2, signal: new AbortController().signal },
+			async () => ({ kind: "enter" as const, messages: contextMessages }),
+		);
+
+		if (decision.kind !== "enter") throw new Error("expected an enter decision");
+		// 空 claim 与 decision 里的消息没有身份交集（findLastIndex = -1）→ 追加到末尾，而不是插到最前。
+		expect(decision.messages).toHaveLength(3);
+		expect(decision.messages[0]).toBe(context);
+		expect(decision.messages[1]).toBe(user);
+		expect(decision.messages[2]).toMatchObject({ source: { kind: "simple-memory", form: "notice" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
 	it("splices after the last original message when an inner listener appended its own", async () => {
 		const rig = await makeRig();
 		const appended = createSyntheticMsg("time-context", "the current time is now");
@@ -609,6 +713,88 @@ describe("createPreStepListener", () => {
 		expect(rig.injected.has("s1")).toBe(false);
 		expect(rig.pendingRecalls.has("s1")).toBe(false);
 		expect(rig.warn).not.toHaveBeenCalled();
+	});
+
+	it("does not start the prefetch when the turn is aborted during the index refresh", async () => {
+		// 回归：refresh 是 abort 前的最后一个 await 点。它期间取消的轮不能再启动侧查询
+		// （否则白扫一遍 manifest，runTask 拿到的是已取消的 signal）。
+		const gate = deferredRefresh();
+		const rig = await makeRig({ refresh: gate.refresh });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+		const controller = new AbortController();
+
+		const call = rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: controller.signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(1), WAIT);
+		controller.abort();
+		gate.release(0);
+		const decision = await call;
+
+		expect(decision.messages).toBe(messages);
+		// 给 fire-and-forget 的 prefetch 一个落地的机会，再断言它根本没被启动过。
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(rig.headlessRun).not.toHaveBeenCalled();
+		expect(rig.pendingRecalls.size).toBe(0);
+		expect(rig.warn).not.toHaveBeenCalled();
+	});
+
+	it("drops an unsettled pending when the turn is aborted during the index refresh", async () => {
+		// 回归：取消复检必须在「未就绪就留给后续 step」之前。否则 abort 卡在 refresh 期间、pending
+		// 又还没 settle 时，监听器会空手返回、把 pending 留在 Map 里跨轮驻留。
+		const side = deferredSideQuery();
+		const gate = deferredRefresh();
+		const rig = await makeRig({ sideQuery: side.run, refresh: gate.refresh });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+
+		const launch = rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(1), WAIT);
+		gate.release(0);
+		const first = await launch;
+		expect(first.messages).toBe(messages);
+		await vi.waitFor(() => expect(side.calls()).toBe(1), WAIT);
+
+		const controller = new AbortController();
+		const call = rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: controller.signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(2), WAIT);
+		// 侧查询还在飞：这正是旧代码 `if (!pending.settled) return` 先于 abort 复检返回的那个窗口。
+		expect(rig.pendingRecalls.get("s1")?.settled).toBe(false);
+		controller.abort();
+		gate.release(1);
+		const decision = await call;
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		// 统一销账：取消的轮没有后续请求，pending 不能靠「未就绪」留下来。
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+		// 侧查询的迟到结果也不会把它重新写回（写回前有身份校验）。
+		side.resolve(0, ["Alpha.md"]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("does not splice a settled pending when the turn is aborted during the index refresh", async () => {
+		const gate = deferredRefresh();
+		const rig = await makeRig({ refresh: gate.refresh });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("hi")];
+
+		const launch = rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(1), WAIT);
+		gate.release(0);
+		await launch;
+		await waitSettled(rig.pendingRecalls);
+
+		const controller = new AbortController();
+		const call = rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: controller.signal });
+		await vi.waitFor(() => expect(gate.calls()).toBe(2), WAIT);
+		controller.abort();
+		gate.release(1);
+		const decision = await call;
+
+		expect(decision.messages).toBe(messages);
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
 	});
 
 	it("returns the decision unchanged when the signal is already aborted", async () => {

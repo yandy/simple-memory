@@ -9,8 +9,9 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
  *
  * **prefetch 两段式**（侧查询不阻塞任何请求）：
  *
- * - `step === 1`：记下真人 prompt，把 `scanEntries` + `runTask` 丢到后台（fire-and-forget），
- *   **立即返回原 decision** —— 这一轮的第一个请求与侧查询并行，不等它。
+ * - `step === 1`：先**无条件作废**上一轮的 pending（再谈能不能启动），然后记下真人 prompt，把
+ *   `scanEntries` + `runTask` 丢到后台（fire-and-forget），**立即返回原 decision** —— 这一轮的第一个
+ *   请求与侧查询并行，不等它。
  * - **同一 turn** 的 `step >= 2`：pending 已就绪且渲染非空才消费（splice + 标记去重 + 销账）。
  *   未就绪就留给后面的 step；turn 变了、被拒、取消、或这一步 claim 里出现别的真人输入 → 作废。
  *
@@ -31,7 +32,7 @@ const USER_PROMPT_MAX_CHARS = 4000;
  * 一条在途的召回（prefetch）状态。
  *
  * 归属有两道闸，缺一不可：
- * 1. `turn`：只有**同一轮**的后续 step 才消费（新的一轮在 step 1 直接覆盖整条 pending）；
+ * 1. `turn`：只有**同一轮**的后续 step 才消费（新的一轮在 step 1 就先把旧记录销账）；
  * 2. `prompt`：消费前拿这一刻 step claim 的真人 prompt 比对 —— 宿主的 inbox 可以在 handler 未完成时
  *    收进新的真人输入（steering / 排队 follow-up），那种情况下这条召回属于**前一条** prompt，
  *    第 1 道闸是哑的（turn 没变），只有按 prompt 校验才能把结果扣在正确的输入上。
@@ -167,12 +168,30 @@ export function createPreStepListener(
 				return decision;
 			}
 
+			// 新的一轮在 step 1 就作废上一轮的 pending：**先销账，再谈能不能启动**。放在可用性门 /
+			// 真人 prompt 门**之前**，也放在下面的 `indexCache.refresh` await 之前 —— 那一轮就算 runtime
+			// 不可用、store 为空、surfacing 关着或没有真人 prompt，旧的 content/files 也不该继续驻留
+			// （「后续 step 靠 turn 不匹配清掉」只在后续 step 恰好来了时才成立，不是作废语义）。
+			if (payload.step === 1) {
+				deps.pendingRecalls.delete(sessionId);
+			}
+
 			const rt = deps.registry.get(sessionId);
 
 			// 每轮每个 step 都刷新索引快照（廉价路径）：这是长寿命会话最终看到其它进程写入记忆的途径。
 			// 与召回无关（索引 section 是另一条注入通道），所以放在 surfacing 可用性门之前。
 			if (rt) {
 				await deps.indexCache.refresh(rt);
+			}
+
+			// 取消复检：上面的 refresh 是 await 点，用户可能正好在它期间取消这一轮。abort 一律**先销账
+			// 再返回**，且不分 step / 不分 pending 是否就绪：
+			// - step 1：不启动一个已经取消的侧查询（runTask 只会立刻被取消，白付一次扫描）；
+			// - step >= 2：不 splice；且未就绪的 pending 也不能靠「留给后续 step」活下来 —— 取消的轮没有
+			//   后续请求，它会一直留在 Map 里跨轮驻留。
+			if (payload.signal.aborted) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
 			}
 
 			// 召回服务的是「这一轮的用户意图」，所以只有 step === 1 启动侧查询：同一轮里模型自己发起的
@@ -193,7 +212,7 @@ export function createPreStepListener(
 				// 「查询输入」随之后写而变。
 				const injectedFiles = new Set(deps.injected.get(sessionId) ?? []);
 				const pending: PendingRecall = { turn: payload.turn, settled: false, prompt, files: [], content: "" };
-				// 覆盖旧 pending：新的一轮取代旧的一轮（旧那份的结果在写回前会被丢弃）。
+				// 记下这一轮的 pending（上面已按「新的一轮作废旧记录」清过，这里只是在空位上 set）。
 				deps.pendingRecalls.set(sessionId, pending);
 				const prefetch = (async () => {
 					try {
@@ -241,14 +260,8 @@ export function createPreStepListener(
 			}
 
 			// 未就绪：这个请求不带召回（「永不阻塞」的代价面），pending 留给后面的 step。
+			// 取消不在这条路径上 —— 上面 refresh 之后的 abort 复检已经先销账并返回了。
 			if (!pending.settled) return decision;
-
-			// 复检取消：索引刷新是个 await 点，用户可能在它期间取消了这一轮。已取消就不标记、不 splice ——
-			// 这些文件根本没到模型眼前，标记了就白烧本会话再召回的机会。
-			if (payload.signal.aborted) {
-				deps.pendingRecalls.delete(sessionId);
-				return decision;
-			}
 
 			// 就绪的 pending 只有一次消费机会：无论成败都销账，绝不让后续 step 再拼一次同样一块。
 			deps.pendingRecalls.delete(sessionId);
