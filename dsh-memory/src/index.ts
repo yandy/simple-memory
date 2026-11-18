@@ -18,6 +18,7 @@ import { createSessionSearch } from "./session-search.js";
 import type { AgentLike, HostDirLike, SessionMemoryRuntime } from "./store-registry.js";
 import { createStoreRegistry, isRootAgent } from "./store-registry.js";
 import { createPreStepListener } from "./surfacing.js";
+import type { PendingRecall } from "./surfacing.js";
 import type { DshSyncSession } from "./sync.js";
 import { createDshSyncRuntime, syncErrorMessage } from "./sync.js";
 import { createDshTranscript } from "./transcript.js";
@@ -208,6 +209,11 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	/** sessionId → 本会话已注入过召回的 entry 文件名。surfacing 读写它，装配层负责在会话结束时销账。 */
 	const injected = new Map<string, Set<string>>();
 	/**
+	 * sessionId → 在途召回（prefetch）状态。传输写入在 surfacing 侧；装配层只负责在会话边界作废它
+	 * （compact / clear / disposed）——「哪一代 agent 的召回」不能跨代复用。
+	 */
+	const pendingRecalls = new Map<string, PendingRecall>();
+	/**
 	 * sessionId → **agent 作用域**下的 `agents` 服务绑定。
 	 *
 	 * 子会话必须通过它创建：cordis 的 traceable 机制会把 `create()` 的 owner 解析成「访问服务时的
@@ -317,13 +323,20 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 
 	// 6. `agent/created`：串行、且在创建完成前被 await —— 这是唯一的异步窗口。记忆目录要探 git remote
 	//    （异步），而 core 的工具 handler 只能在执行时同步 `getStore()`，所以目录必须在这里解析完。
-	ctx.on("agent/created", async ({ agent, signal }) => {
+	ctx.on("agent/created", async ({ agent, source, signal }) => {
 		const like: AgentLike = agent; // 宿主 Agent 结构化满足我们的接缝，无需 cast
 		// 子 agent 门禁：`agent/created` 对每个 agent 都发（子 agent 由 dsh-subagent 走 ctx.agents.create，
 		// 根 ctx 的监听器看得到全部）。不过滤的话每个子 agent 都要付一次 git 探测 + 建 store，
 		// 且每轮多付一次侧查询。判据是 `session.header.origin`（见 isRootAgent）。
 		if (!isRootAgent(like)) return;
 		const sessionId = like.session.id;
+		// 宿主 compact / clear 会用**同一个 sessionId** 重建 agent：被挤掉的召回正文不再在上下文里，
+		// 去重状态与在途召回必须随之作废，否则这些文件在本会话里永不再浮现（正文已不在历史里）。
+		// `startup` / `resume` 相反：历史还在，去重状态必须保留。
+		if (source === "compact" || source === "clear") {
+			injected.delete(sessionId);
+			pendingRecalls.delete(sessionId);
+		}
 		// 同一 session 重建时先收掉上一代 engine/timer，避免旧自动轮次跨代写远端。
 		await disposeSyncSession(sessionId);
 
@@ -498,6 +511,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 			.catch(() => false)
 			.then(() => Promise.allSettled([slot?.extract?.dispose(), slot?.dream?.dispose()]));
 		injected.delete(sessionId);
+		pendingRecalls.delete(sessionId);
 	});
 
 	// 8. 每轮召回挂在 `agent/pre-step` waterfall 上，`{ prepend: true }` 让我们在最外层：先进入、
@@ -562,5 +576,6 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		cleanups.clear();
 		agentAgents.clear();
 		injected.clear();
+		pendingRecalls.clear();
 	};
 }

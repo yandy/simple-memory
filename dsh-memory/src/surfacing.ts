@@ -20,6 +20,19 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
 /** 侧查询的 `userPrompt` 预算，与 pi 的 `event.prompt.slice(0, 4000)` 逐字一致。 */
 const USER_PROMPT_MAX_CHARS = 4000;
 
+/**
+ * 一条在途的召回（prefetch）状态：`turn` 是它服务的轮次，`settled` 表示侧查询已返回。
+ *
+ * 装配层持有 `Map<sessionId, PendingRecall>`（宿主的 compact / clear 与 dispose 都要作废它），
+ * 会话边界的销账语义在 index.ts。
+ */
+export interface PendingRecall {
+	turn: number;
+	settled: boolean;
+	files: string[];
+	content: string;
+}
+
 export interface SurfacingDeps {
 	registry: { get(sessionId: string): SessionMemoryRuntime | undefined };
 	indexCache: { refresh(rt: SessionMemoryRuntime): Promise<void> };

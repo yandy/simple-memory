@@ -587,6 +587,43 @@ describe("apply — 启动期降级与每轮召回", () => {
 		expect(third.messages).toHaveLength(2);
 	});
 
+	it("drops the recall dedupe state when the host rebuilds the agent for compact or clear", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		const { fake } = await setup(
+			{ llmStream: llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })) },
+			rowConfig({ autoSurfacing: { model: "prov/mod" } }),
+		);
+		const recall = (agent: ReturnType<Fake["makeAgent"]>, turn = 1) =>
+			fake.emitter.preStep({
+				agent,
+				messages: [createUserMsg("tell me about alpha")],
+				turn,
+				step: 1,
+				signal: new AbortController().signal,
+			});
+
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+		expect((await recall(agent)).messages).toHaveLength(2);
+
+		// `startup` / `resume` 重建：历史还在上下文里，已注入的正文仍在 → 去重状态必须保留。
+		const resumed = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(resumed, "resume");
+		expect((await recall(resumed, 2)).messages).toHaveLength(1);
+
+		// `compact`：宿主把历史压成摘要后重建 agent，已注入的正文被挤出上下文。去重状态若不清空，
+		// 这些文件在本会话里永不再浮现（正文已不在历史里）—— 正是要修的 bug。
+		const compacted = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(compacted, "compact");
+		expect((await recall(compacted, 3)).messages).toHaveLength(2);
+
+		// `clear`：同一 sessionId 重建、上下文清空，同理。
+		const cleared = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(cleared, "clear");
+		expect((await recall(cleared, 4)).messages).toHaveLength(2);
+	});
+
 	it("counts files the main session tool read as already seen", async () => {
 		const memoryDir = memoryDirFor(cwd);
 		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");

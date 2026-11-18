@@ -24,6 +24,9 @@ import { format } from "node:util";
  *   不带 `origin`/`delegationDepth`，仍是根 agent（`parentSession` 存在不足以判定子 agent）。
  */
 
+/** 宿主 `SessionStartSource`（`dsh-agent/lib/types/runtime-types.d.ts:130`，逐字）。 */
+export type SessionStartSource = "startup" | "resume" | "clear" | "compact";
+
 export interface FakeAgent {
 	id: string;
 	sessionId: string;
@@ -244,7 +247,7 @@ export function createFakeCtx(
 	commands: RecordedCommand[];
 	logs: Array<{ level: string; message: string }>;
 	emitter: {
-		agentCreated(agent: FakeAgent): Promise<void>;
+		agentCreated(agent: FakeAgent, source?: SessionStartSource): Promise<void>;
 		agentDisposed(agent: FakeAgent): void;
 		turnStopping(payload: { agent: FakeAgent; turn?: number }): Promise<void>;
 		preStep(payload: {
@@ -846,11 +849,11 @@ export function createFakeCtx(
 		return agent;
 	}
 
-	async function agentCreated(agent: FakeAgent): Promise<void> {
+	async function agentCreated(agent: FakeAgent, source: SessionStartSource = "startup"): Promise<void> {
 		if (!(agent as any).ctx) (agent as any).ctx = makeAgentCtx(agent);
 		// serial：按序 await，抛错即创建失败。
 		for (const { handler } of createdListeners.slice()) {
-			await handler({ agent, source: "startup" });
+			await handler({ agent, source });
 		}
 	}
 
