@@ -249,7 +249,8 @@ session_shutdown
 | 事件 | pi-memory 做什么 |
 |---|---|
 | `session_start` | 加载配置 → 校验必需模型（失败即什么都不初始化）→ 解析记忆目录 → **准备跨设备同步**（首次使用时自动初始化，即使 `pullOnStart: false` 也照做）→ `pullOnStart` 开启时跑一轮收敛（一轮 push）→ **确定索引值并冻结**（`startup`/`new` 读磁盘；`resume`/`fork`/`reload` 重放 transcript 取录制值）→ 注册 `memory` 工具（仅首次，5 个 action）→ 重建清单缓存 → dream 提醒检查 |
-| `before_agent_start` | 把冻结值写进 `sections["memory_index"]`（**每一轮、无条件**），然后做 auto-surfacing（主会话、非子 agent、且只针对用户消息触发的 run —— custom 消息触发的 run 没有用户输入可检索） |
+| `before_agent_start` | 把冻结值写进 `sections["memory_index"]`（**每一轮、无条件**），然后在**主会话的用户轮**里启动召回预取（不 await、本轮不注入；custom 消息触发的 run 没有用户输入可检索，跳过） |
+| `turn_end` | 召回的消费点：结果已就绪、本轮有工具结果（= 后面还有请求）、且边界仍属于启动检索的那条 prompt 时，把召回块持久化进会话并标记去重。零工具轮、取消、未就绪、被新 prompt 取代的轮都不会碰到这一步 |
 | `agent_end` | `extractMemories.enabled` 开启时触发异步 extract；写入成功通知 `Extracted N memories.`，失败通知 `Extract failed: …`（每会话一次） |
 | `session_compact` | 清空已注入集合，**并从磁盘重读索引** —— 会话内唯一的刷新点 |
 | `session_shutdown` | 把待发布的同步推送 flush 一次（上限 `sync.autoTimeoutMs`），并等在途写入收尾（上限 `lock.timeoutMs`），因此退出既不会留下 stale 的 `.lock`，也不会留下一批只到过本地磁盘的记忆 |
@@ -267,10 +268,14 @@ pi 用有序的 sections 构建 system prompt，只对**值发生变化**的 sec
 
 ### 自动浮现
 
-1. 从 store 的 `mtime` 缓存构建清单：`[type] file.md — description`，按 `modified` 降序，最多 200 条、4000 字符（description 预算按条数均分，每条不低于 80 字符）。
-2. 侧查询（`maxTurns: 1`、零工具）从清单里返回至多 `maxFiles` 个文件名；不在清单里的一律丢弃。
-3. 选中 entry 的**正文**（不含 frontmatter）按 `maxEntryBytes` 截断、净化，作为一条 `display: false` 的 custom 消息注入，外面包 `<relevant_memories>`；总量到 `maxInjectionBytes` 就停。
-4. 注入过的文件名在本会话内记住，compaction 时清空。你会看到 `Recalled: N entries` 通知。
+召回是**非阻塞预取**：侧查询与主循环并行，本轮第一个请求不等它。
+
+1. 用户轮开始时（主会话、非子 agent、`messageType` 为 `user`）从 store 的 `mtime` 缓存构建清单：`[type] file.md — description`，按 `modified` 降序，最多 200 条、4000 字符（description 预算按条数均分，每条不低于 80 字符）。
+2. 侧查询（`maxTurns: 1`、零工具）在后台启动，从清单里返回至多 `maxFiles` 个文件名；不在清单里的一律丢弃。结果没就绪的请求**不带召回** —— 包括本轮的第一个请求。
+3. 只有「本轮之后还会有请求」的边界才消费：`turn_end` 有工具结果、结果已就绪、且这个边界仍属于启动检索的那条 prompt 时，选中 entry 的**正文**（不含 frontmatter）按 `maxEntryBytes` 截断、净化，作为一条 `display: false` 的 custom 消息**持久化**到会话，外面包 `<relevant_memories>`；总量到 `maxInjectionBytes` 就停。它在下一请求进入上下文，位置固定、只出现一次。你会看到 `Recalled: N entries` 通知。
+4. 消费不了的轮**作废**：零工具调用的单请求轮（本轮之后再没有请求）、取消的轮、结果还没就绪的轮、被新用户 prompt 取代的轮，都不落 session、不标去重；下一轮按新 prompt 重新检索。
+5. 去重口径是「本 session 已让模型见过正文的文件」：注入过的 entry，加上**主 session** 的 `memory` 工具读取过的 —— `add` / `replace` 成功写入的文件，以及 `scope=memory` 的 `search` 命中的文件（它的结果带完整正文）。`list`（只有摘要）、`scope=sessions`（搜的是会话日志）、失败的调用都不算。headless 子会话（dream / extract）的工具读到的正文主模型没见过，不标记。
+6. compaction 清空去重集合（正文被挤出上下文，这些 entry 必须能重新浮现）；会话切换时也从空集合开始。
 
 ### 自动提取
 

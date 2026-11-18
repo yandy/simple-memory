@@ -122,6 +122,16 @@ Windows 上的 `/mnt/…`）、空值，以及「根存在但不是目录」或�
 错误态（不建 store、不注册工具，`/memory` 打印原因），而**不是**被 `resolve()` 悄悄落到工作目录下开一个
 新库。这道校验不依赖环境变量或平台配置，零配置即可用。
 
+## 召回：pre-step 两段式
+
+与 pi 一样，侧查询不阻塞任何请求；dsh 的差异在消费点 —— 没有 pi 那种可以在边界追加消息的 `turn_end`，所以用「同轮的后续 step」。监听器挂在 `agent/pre-step` waterfall 上，用 `{ prepend: true }` 注册在最外层：先进入、最后看到 decision，于是 splice 进去的是其它监听器（compaction / instructions / time-context）都处理过的最终消息数组。
+
+1. `step === 1`（轮首，且这一步 claim 的 messages 里有真人 prompt）：先作废**上一轮**的在途召回，再把 `scanEntries` + 侧查询丢到后台，**立即返回原 decision** —— 本轮第一个请求与侧查询并行，可能不带召回。
+2. **同一 turn** 的 `step >= 2`（模型调过工具之后）：结果已就绪才把 `<relevant_memories>` 消息 splice 进这一步 claim 的消息之后（`form: "notice"` + 一行 `Recalled N memories` 摘要），并把这些文件标进去重集合；未就绪就原样返回，留给后面的 step。
+3. 下列情况结果一律作废、不标去重：turn 变了、step 被拒、轮被取消、这一步 claim 里出现与启动时不同的真人输入，以及这一轮没有后续 step（模型直接答完）。同一 turn 重复进 step 1 = 重新启动一次预取，旧结果按身份校验丢弃。
+4. 去重口径与 pi 一致：「本 session 已让模型见过正文的文件」—— 召回注入的文件，加上**主 session** `memory` 工具读取过的（`add` / `replace` 成功写入的文件，`scope=memory` 的 `search` 命中的文件；`list` / `scope=sessions` / 失败调用不计）。extract / dream 的常驻 worker 读到的正文只进了子会话，主模型没见过，不标记。
+5. 宿主 compact / clear 会用**同一个 sessionId** 重建 agent（`agent/created` 的 `payload.source` 为 `compact` / `clear`）：这时清空去重集合与在途召回 —— 被挤出或清空的正文若继续算「已见过」，这些 entry 在本会话里就再也不会浮现。`startup` / `resume` 相反：历史还在上下文里，去重状态保留。
+
 ## 跨设备同步
 
 dsh-memory 可以把一个项目的记忆 entry 同步到**一个 git 远端**，同一仓库在另一台机器上打开时会落到

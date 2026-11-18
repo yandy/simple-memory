@@ -1,7 +1,7 @@
 # Surfacing 对齐 Claude Code：compaction 清空、工具读取去重、prefetch 非阻塞
 
 日期：2026-11-19
-状态：待批准
+状态：已批准
 
 ## 1. 意图与背景
 
