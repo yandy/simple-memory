@@ -103,6 +103,24 @@ describe("三通道文案来自 core", () => {
 		expect(tool.promptGuidelines).toEqual([...MEMORY_TOOL_GUIDELINES]);
 		expect(tool.promptGuidelines).toHaveLength(7);
 	});
+
+	it("gates writes on future usefulness and excludes low-value facts", () => {
+		const gate = createMemoryTool(deps()).promptGuidelines?.[0] ?? "";
+
+		expect(gate).toMatch(/future sessions/);
+		expect(gate).toMatch(/project constraints/);
+		expect(gate).toMatch(/user preferences/);
+		expect(gate).toMatch(/process rules/);
+		expect(gate).toMatch(/durable decisions/);
+		expect(gate).toMatch(/lessons learned/);
+		expect(gate).toMatch(/completed work/);
+		expect(gate).toMatch(/repository status/);
+		expect(gate).toMatch(/one command/);
+		expect(gate).toMatch(/one-time/);
+		expect(gate).toMatch(/obvious/);
+		expect(gate).toMatch(/When in doubt, skip/);
+		expect(gate).not.toContain("Each memory lives in its own file");
+	});
 });
 
 describe("Saved 通知（pi 通道，core 不认识 ctx.ui）", () => {

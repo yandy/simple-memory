@@ -339,6 +339,19 @@ describe("buildExtractTask", () => {
 		expect(task).toContain("## What to Skip");
 	});
 
+	it("skips repository-state echoes and facts that one command can recover", () => {
+		const task = buildExtractTask([{ role: "user", text: "hi" }], 2000, [], {
+			maxToolResultChars: 500,
+			maxAssistantChars: 2000,
+		});
+		const skip = task.split("## What to Skip")[1]?.split("## Output")[0] ?? "";
+
+		expect(skip).toMatch(/completed work/i);
+		expect(skip).toMatch(/repository status/i);
+		expect(skip).toMatch(/one command/);
+		expect(skip).toMatch(/durable decisions or constraints/);
+	});
+
 	it("drops the legacy wording and the legacy tool names", () => {
 		const task = buildExtractTask([{ role: "user", text: "hi" }], 2000, [], {
 			maxToolResultChars: 500,

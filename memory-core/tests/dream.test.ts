@@ -116,11 +116,16 @@ describe("buildDreamTask", () => {
 		expect(buildDreamTask(42)).toContain("hard limit of 42 lines");
 	});
 
-	it("keeps the do-not-prune-process-rules guard", () => {
+	it("requires low-value pruning while preserving durable process rules", () => {
 		const task = buildDreamTask(200);
-		expect(task).toContain("do not prune process rules");
+		expect(task).toContain("prune low-value memories");
+		expect(task).toContain("Delete memories that only restate completed work or repository status");
+		expect(task).toContain("one command");
+		expect(task).toContain("durable decisions or constraints");
+		expect(task).toContain("preserve durable process rules");
 		expect(task).toContain('"Always do X" / "Never do Y"');
 		expect(task).toContain("just because they look like meta-instructions");
+		expect(task).not.toContain("do not prune process rules");
 	});
 
 	it("requires self-contained descriptions and defines merge as replace + remove", () => {
