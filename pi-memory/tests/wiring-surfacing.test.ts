@@ -20,8 +20,26 @@ function entry(file: string, description = "d") {
 }
 
 /**
+ * 真实用户消息的投影形状：宿主 `_prepareRun` 总是给块数组（`[text, ...images]`）。
+ * `memory-auto-surfacing` 这类 custom_message 投影成 `role: "custom"`，不在这里。
+ */
+function userMessage(text: string) {
+	return { role: "user", content: [{ type: "text", text }], timestamp: 0 };
+}
+
+/**
+ * 边界上下文：`contextMessages` 是宿主在 handler 之前用会话投影重建的那份消息列表
+ *（`_buildBoundaryContext`）。排队未 drain 的 follow-up / steering 不在里面（宿主放在
+ * `pendingMessages`），所以它表示的正是「下一请求会带上的真实消息」。
+ */
+function boundaryContext(...messages: unknown[]) {
+	return { contextMessages: messages };
+}
+
+/**
  * `turn_end` 的宿主事件（pi >= 1.5.0 的形状）：`entries` 是**当前**边界提案，handler 返回的
- * `entries` 完整替换它 —— 所以断言里必须能看到原提案还在。
+ * `entries` 完整替换它 —— 所以断言里必须能看到原提案还在。`context` 默认是「刚刚提交了
+ * "ssh?" 的 user run」的边界上下文。
  */
 function turnEndEvent(over: Record<string, unknown> = {}) {
 	return {
@@ -34,21 +52,12 @@ function turnEndEvent(over: Record<string, unknown> = {}) {
 		outcome: "completed",
 		entries: [] as unknown[],
 		continue: false,
-		context: {},
+		context: boundaryContext(userMessage("ssh?")),
 		...over,
 	};
 }
 
 const recallEntry = { type: "custom_message", customType: "memory-auto-surfacing", content: RECALL, display: false };
-
-/**
- * `input` 事件的宿主形状（pi >= 1.5.0）：`streamingBehavior` 只有**run 进行中**的输入才有值
- *（`prompt()` / `steer()` / `followUp()` / `sendUserMessage()` 都在 `isStreaming` 时带上它）。
- * 这类输入由同一个低层 run drain，中途**不会**再发 `before_agent_start`。
- */
-function queuedInput(streamingBehavior: "steer" | "followUp", over: Record<string, unknown> = {}) {
-	return { type: "input", text: "then what?", images: undefined, source: "interactive", streamingBehavior, ...over };
-}
 
 /**
  * 宿主的**消息投影重放器**：缓存回归用例的请求序列不再手写，而是按宿主的三件事累积。
@@ -77,7 +86,11 @@ function createHostRun() {
 			committed.push({ role: "toolResult", content: `command output ${turnIndex}` });
 			const projection = snapshot();
 			const boundary = await handler(
-				turnEndEvent({ turnIndex, entries: [], context: { llmMessages: projection } }),
+				turnEndEvent({
+					turnIndex,
+					entries: [],
+					context: { ...boundaryContext(...projection), llmMessages: projection },
+				}),
 				ctx,
 			);
 			// 宿主提交提案（无返回值 = 什么都不提交），然后才发下一个请求。
@@ -252,12 +265,30 @@ describe("index wiring — auto-surfacing", () => {
 		expect(real[2].filter(isRecall)).toHaveLength(1);
 	});
 
-	it("drops a pending recall when a follow-up is queued mid-run", async () => {
-		// 宿主生命周期：中间**没有** `before_agent_start` 的连续 turn。
-		// 1. user run 启动（委托召回 1）→ 零工具 turn_end：pending 保留（本轮可能还有后续请求）；
-		// 2. 用户排入 follow-up（`input` + `streamingBehavior: "followUp"`）——宿主在同一个低层 run
-		//    里 drain 它，不再发 `before_agent_start`；
-		// 3. follow-up 之后带工具的 turn_end：不能把上一个 prompt 的召回记到这一轮头上。
+	it("consumes the recall at a tool boundary while a follow-up is only queued", async () => {
+		// 宿主：follow-up 只在没有更多工具调用、也没有 steering 时才拉进来
+		//（`agent-loop.js:197` 的 `getFollowUpMessages` 在 inner loop 退出之后），所以它**排队**时
+		// 还在宿主的 `pendingMessages`，没进消息流。这个带工具的 turn_end 仍属于原 prompt，必须消费。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: RECALL });
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+
+		// 上下文里最后一条真实用户消息仍是 "ssh?"（follow-up 只在队列里，看不见）。
+		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
+		expect(boundary.entries.at(-1)).toEqual(recallEntry);
+		expect(notify).toHaveBeenCalledWith("Recalled: 2 entries", "info");
+	});
+
+	it("discards the recall when the boundary belongs to a follow-up already on the message flow", async () => {
+		// 同一个低层 run 在 `agent_end` 之前 drain follow-up，全程不再发 `before_agent_start`；
+		// 一旦它进了消息流，边界上的「最后一条真实用户消息」就是它，而不是启动检索的那个 prompt。
 		const { notify, setStatus, ctx } = spyUi();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -272,21 +303,105 @@ describe("index wiring — auto-surfacing", () => {
 
 		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
 		await flushPrefetch(setStatus);
-		expect(await handlers["turn_end"][0](turnEndEvent({ toolResults: [] }), ctx)).toBeUndefined();
 
-		await handlers["input"][0](queuedInput("followUp"), ctx);
-		const boundary = await handlers["turn_end"][0](turnEndEvent({ turnIndex: 2 }), ctx);
+		// follow-up 已落 session：投影里最后一条真实用户消息换了文本。
+		const boundary = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?"), userMessage("then what?")) }),
+			ctx,
+		);
 		expect(boundary).toBeUndefined();
 		expect(notify).not.toHaveBeenCalled();
 
-		// 作废不标去重：下一个 prompt 里同一文件仍可浮现。
+		// 作废不标去重：同一个文件在下一个 prompt 里仍可浮现。
 		await handlers["before_agent_start"][0](sectionsEvent("ssh again?"), ctx);
 		await flushPrefetch(setStatus);
 		expect(injectedAtCall[1]).toEqual(new Set());
 	});
 
-	it("drops a pending recall when a steering message arrives mid-turn", async () => {
-		// steering 同一个道理：`input` 一响，当前 pending 就不再属于这个 run 的最终上下文。
+	it("discards the recall when steering entered the message flow mid-turn", async () => {
+		// 宿主：steering 在 `turn_end` 之后、下一次请求之前才被拉进消息流
+		//（`agent-loop.js:191` 的 `getSteeringMessages` 在 `emit(turn_end)` 之后）。所以它一旦
+		// 进去，再到的边界就已经属于 steering 的 prompt —— 侧查询晚到时不得落盘。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		let resolveRun: ((value: { files: string[]; content: string }) => void) | undefined;
+		runTaskMock.mockImplementationOnce(
+			() =>
+				new Promise<{ files: string[]; content: string }>((resolve) => {
+					resolveRun = resolve;
+				}),
+		);
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flush();
+		// 第一个带工具边界：侧查询还没 settle（同一个低层 run 下一个请求等它不，谁也不等）。
+		expect(await handlers["turn_end"][0](turnEndEvent(), ctx)).toBeUndefined();
+
+		// steering 已进入消息流，之后侧查询才落地。
+		resolveRun?.({ files: ["ssh.md"], content: RECALL });
+		await flushPrefetch(setStatus);
+		const boundary = await handlers["turn_end"][0](
+			turnEndEvent({ turnIndex: 2, context: boundaryContext(userMessage("ssh?"), userMessage("no, use the staging host")) }),
+			ctx,
+		);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+	});
+
+	it("discards a late-settled recall when the input arrived before the run's prep finished", async () => {
+		// 宿主的准备期竞争：`_startRun` 先把 `_isAgentRunActive` 置为 true，再 `await _prepareRun()`
+		//（`before_agent_start` 在里面异步分发），所以 follow-up 可以在这之前就排进这个 run。
+		// 于是：B 的输入 → A 的 before_agent_start 建 pending，两道闸中的第一道是哑的。
+		// 侧查询晚到（A 的带工具 turn_end 时还没 settle），A 的召回只能由消费点按上下文判归属，
+		// 绝不能在 follow-up 已经进消息流之后落盘。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		let resolveRun: ((value: { files: string[]; content: string }) => void) | undefined;
+		runTaskMock.mockImplementationOnce(
+			() =>
+				new Promise<{ files: string[]; content: string }>((resolve) => {
+					resolveRun = resolve;
+				}),
+		);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: RECALL };
+		});
+
+		// B 的 follow-up 已在宿主的队列里（本扩展看不到它），A 的 before_agent_start 随后建 pending。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flush();
+		// A 的带工具边界：侧查询还没 settle，什么都不带（pending 保留）。
+		expect(await handlers["turn_end"][0](turnEndEvent(), ctx)).toBeUndefined();
+
+		// 侧查询在 A 的边界之后才落地；同时间 follow-up 已被 drain 进消息流。
+		resolveRun?.({ files: ["ssh.md"], content: RECALL });
+		await flushPrefetch(setStatus);
+		const boundary = await handlers["turn_end"][0](
+			turnEndEvent({ turnIndex: 2, context: boundaryContext(userMessage("ssh?"), userMessage("then what?")) }),
+			ctx,
+		);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// 没被标记去重；下一轮 side query 的输入仍是空集。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh again?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall.at(-1)).toEqual(new Set());
+	});
+
+	it("consumes a recall for a repeated prompt with the same text", async () => {
+		// 同文本重复 prompt：检索 query 相同，召回内容对新 prompt 同样适用，所以按归属消费
+		//（误判无害）。带图片时宿主把归一化提示以 `\n\n` 追加到用户文本后，也是同一轮。
 		const { notify, setStatus, ctx } = spyUi();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
@@ -297,12 +412,23 @@ describe("index wiring — auto-surfacing", () => {
 
 		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
 		await flushPrefetch(setStatus);
-		// turn 1 进行中插入 steering，直到本轮结束都不会再有 `before_agent_start`。
-		await handlers["input"][0](queuedInput("steer"), ctx);
+		const repeated = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?"), userMessage("ssh?")) }),
+			ctx,
+		);
+		expect(repeated.entries.at(-1)).toEqual(recallEntry);
+		expect(notify).toHaveBeenCalledWith("Recalled: 2 entries", "info");
 
-		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
-		expect(boundary).toBeUndefined();
-		expect(notify).not.toHaveBeenCalled();
+		// 图片提示的形状：`prompt + "\n\n" + hints`。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		notify.mockClear();
+		const withImages = await handlers["turn_end"][0](
+			turnEndEvent({ context: boundaryContext(userMessage("ssh?\n\n[Image #1: screenshot]")) }),
+			ctx,
+		);
+		expect(withImages.entries.at(-1)).toEqual(recallEntry);
+		expect(notify).toHaveBeenCalledWith("Recalled: 2 entries", "info");
 	});
 
 	it("keeps the new status line when a superseded prefetch finishes late", async () => {

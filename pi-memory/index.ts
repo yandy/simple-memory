@@ -1,6 +1,7 @@
 import { unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
+	BoundaryContextPreview,
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionUIContext,
@@ -101,6 +102,48 @@ function countInjectedBlocks(content: string): number {
 }
 
 /**
+ * 取边界上「最后一条真实用户消息」的文本（`turn_end` 的归属校验用）。
+ *
+ * 取 `event.context.contextMessages` 而不是 `ctx.sessionManager.getBranch()`：
+ * - 它就是宿主为这个边界合成、下一个请求要用的那份会话上下文（`_buildBoundaryContext`），
+ *   所以「真实用户消息」= 真的会进入上下文的 `role: "user"` 消息。我们自己的
+ *   `memory-auto-surfacing` 与其它扩展的 custom_message 投影成 `role: "custom"`，
+ *   compaction / branch summary 有各自的 role，bash 执行是 `bashExecution` —— 全被排除；
+ * - 排队但尚未 drain 的 follow-up / steering 在宿主的 `pendingMessages` 里，不在
+ *   `contextMessages`：它们还没进消息流，这个边界仍属于原 prompt；
+ * - 纯事件字段，同步读取，不会在 session dispose 后回读失效的 `ctx` 代理。
+ *
+ * 用户消息的 content 是字符串或块数组（宿主 `_prepareRun` 总是给 `[text, ...images]`）。
+ */
+function lastUserMessageText(context: BoundaryContextPreview | undefined): string | undefined {
+	const messages = context?.contextMessages;
+	if (!Array.isArray(messages)) return undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "user") continue;
+		const content = message.content;
+		if (typeof content === "string") return content;
+		return content
+			.filter((block) => block.type === "text")
+			.map((block) => (block.type === "text" ? block.text : ""))
+			.join("");
+	}
+	return undefined;
+}
+
+/**
+ * 这个边界是否仍属于启动本轮检索的那个 user run。
+ *
+ * 同文本重复 prompt 视为同一轮：检索 query 相同，召回内容对新 prompt 同样适用，误判无害。
+ * 带图片时宿主把归一化提示以 `prompt + "\n\n" + hints` 追加到用户文本后（`_prepareRun`），
+ * 那是同一轮的前缀形态。
+ */
+function boundaryOwnsRecall(lastUserText: string | undefined, prompt: string): boolean {
+	if (lastUserText === undefined) return false;
+	return lastUserText === prompt || lastUserText.startsWith(`${prompt}\n\n`);
+}
+
+/**
  * `startup` 的 `outcome.warning` 是「prepare 预告 + 可能追加的启动预算用尽行」的拼接，而预告已经
  * 由 `onWarning` 通道即时通知过。这里只取尚未通知的尾部，避免同一条预告在账本里记两次。
  */
@@ -114,12 +157,18 @@ function unwarnedStartupTail(delivered: string | undefined, warning: string | un
 
 /**
  * prefetch 的结果槽：`settled` 之前 `content` 一律不可信（消费点必须先看它）。
- * pi 侧刻意不带 turn 号：「新一轮即作废」由 `before_agent_start`（新 run）与 `input`
- *（run 进行中的 queued follow-up / steering）两个入口保证，两者覆盖了「会产生
- * `before_agent_start`」与「不会产生它」的全部输入路径。
+ *
+ * 归属有两道闸，缺一不可：
+ * 1. `before_agent_start` 一到就无条件作废旧 pending（新 run 取代旧 run）；
+ * 2. 消费点（`turn_end`）比对 `prompt` 与边界上「最后一条真实用户消息」—— 宿主允许在
+ *    `before_agent_start` handlers 未完成时收到并排队输入（`_startRun` 先把 `_isAgentRunActive`
+ *    置为 true），因此「B 的 queued 输入 → A 的 before_agent_start 建 pending」这一时序里第 1 道闸
+ *    是哑的，只有消费点按当前上下文校验才能把结果扣在正确的 prompt 上。
  */
 interface PendingRecall {
 	settled: boolean;
+	/** 启动这一轮检索的 user run 的 prompt（`BeforeAgentStartUserEvent.prompt`，已展开）。 */
+	prompt: string;
 	files: string[];
 	content: string;
 }
@@ -247,8 +296,7 @@ export default function (pi: ExtensionAPI) {
 	const injectedFiles = new Set<string>();
 	/**
 	 * 本轮 `before_agent_start` 启动的侧查询（spec §5.2）。`before_agent_start` 不 await 它，
-	 * 只在结果就绪且本轮还有后续请求时由 `turn_end` 持久化一次；新输入（含 run 进行中的
-	 * queued follow-up / steering）一到即作废。
+	 * 只在结果就绪、本轮还有后续请求、且边界仍属于同一个 prompt 时由 `turn_end` 持久化一次。
 	 */
 	let pendingRecall: PendingRecall | undefined;
 	/**
@@ -627,25 +675,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	/**
-	 * 作废入口之二（spec §5.1）：run **进行中**排队的用户输入（follow-up / steering）。
-	 *
-	 * pi 只在 `_prepareRun` 里发 `before_agent_start`；queued 输入由**同一个**低层 run 在
-	 * `agent_end` 之前 drain（`_handlePostAgentRun` → `agent.hasQueuedMessages()` →
-	 * `agent.continue()`），全程不再发该事件。没有这个入口，旧 prompt 的召回就会在 queued
-	 * 输入之后的那个带工具 `turn_end` 上被当成这一轮的结果持久化（并标记去重）。
-	 *
-	 * `streamingBehavior` 正是「这条输入会在当前 run 里被 drain」的宿主标记：`prompt()` /
-	 * `steer()` / `followUp()` / `sendUserMessage()` 都在 `isStreaming`（= 有活动 run）时带上它。
-	 * idle 输入拿不到它，而 idle 输入必然经 `_startRun` → `before_agent_start`，那里已经作废过。
-	 *
-	 * 取舍：queued 输入自己不检索（没有 `before_agent_start` 就没有检索点）。宁可这一轮不浮现，
-	 * 也不把上一个 prompt 的召回记到新输入头上。
-	 */
-	pi.on("input", (event) => {
-		if (event.streamingBehavior !== undefined) pendingRecall = undefined;
-	});
-
 	pi.on("before_agent_start", async (event, ctx) => {
 		lastSystemPrompt = event.systemPrompt;
 		// 先拷到 const：`store` 是工厂作用域的 let，在异步回调里 TS 不会保留它的外层收窄。
@@ -678,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 			const cfg = config;
 			const dir = memoryDir;
 			const headless = headlessFor(ctx.modelRegistry);
-			const pending: PendingRecall = { settled: false, files: [], content: "" };
+			const pending: PendingRecall = { settled: false, prompt: promptText, files: [], content: "" };
 			pendingRecall = pending;
 			if (ui) {
 				surfacingStatusFor = pending;
@@ -727,9 +756,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	/**
-	 * prefetch 的消费点（spec §5.2）：只有「本轮还有后续请求」的 turn 边界才持久化。
+	 * prefetch 的消费点（spec §5.2）：只有「本轮还有后续请求」且「这个边界仍属于启动检索的 prompt」
+	 * 的 turn 边界才持久化。
 	 *
 	 * - 零工具调用的 turn（含单请求轮）= 本轮之后再没有请求：召回作废，不落 session、不标去重；
+	 * - 归属校验：`event.context` 里最后一条真实用户消息不是下一个 run 的 prompt 时，这个边界
+	 *   已经属于别的输入（例如排队中的 follow-up 已被 drain），旧 pending 作废而不是记到新输入头上；
 	 * - `custom_message` entries 只能追加在边界，所以持久块位置固定、只出现一次（prefix cache）；
 	 * - 不 `continue`：工具结果本身就会引发下一请求，额外请求只会重算前缀。
 	 */
@@ -737,7 +769,9 @@ export default function (pi: ExtensionAPI) {
 		const pending = pendingRecall;
 		if (!pending?.settled || pending.content === "") return;
 		if (event.outcome !== "completed" || event.toolResults.length === 0) return;
+		// 消费点归属校验：无论结果要不要，这个边界上的 pending 都只能消费一次。
 		pendingRecall = undefined;
+		if (!boundaryOwnsRecall(lastUserMessageText(event.context), pending.prompt)) return;
 		// 渲染成功才算注入（content 非空）；持久化保证它最迟在下一请求进入上下文。
 		for (const f of pending.files) injectedFiles.add(f);
 		// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知；ctx 只在同步段读一次。
