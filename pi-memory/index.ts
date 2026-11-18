@@ -114,7 +114,9 @@ function unwarnedStartupTail(delivered: string | undefined, warning: string | un
 
 /**
  * prefetch 的结果槽：`settled` 之前 `content` 一律不可信（消费点必须先看它）。
- * pi 侧刻意不带 turn 号 —— `before_agent_start` 替换语义已经保证「新一轮即作废」。
+ * pi 侧刻意不带 turn 号：「新一轮即作废」由 `before_agent_start`（新 run）与 `input`
+ *（run 进行中的 queued follow-up / steering）两个入口保证，两者覆盖了「会产生
+ * `before_agent_start`」与「不会产生它」的全部输入路径。
  */
 interface PendingRecall {
 	settled: boolean;
@@ -245,7 +247,8 @@ export default function (pi: ExtensionAPI) {
 	const injectedFiles = new Set<string>();
 	/**
 	 * 本轮 `before_agent_start` 启动的侧查询（spec §5.2）。`before_agent_start` 不 await 它，
-	 * 只在结果就绪且本轮还有后续请求时由 `turn_end` 持久化一次；新一轮启动即作废。
+	 * 只在结果就绪且本轮还有后续请求时由 `turn_end` 持久化一次；新输入（含 run 进行中的
+	 * queued follow-up / steering）一到即作废。
 	 */
 	let pendingRecall: PendingRecall | undefined;
 	/**
@@ -624,6 +627,25 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	/**
+	 * 作废入口之二（spec §5.1）：run **进行中**排队的用户输入（follow-up / steering）。
+	 *
+	 * pi 只在 `_prepareRun` 里发 `before_agent_start`；queued 输入由**同一个**低层 run 在
+	 * `agent_end` 之前 drain（`_handlePostAgentRun` → `agent.hasQueuedMessages()` →
+	 * `agent.continue()`），全程不再发该事件。没有这个入口，旧 prompt 的召回就会在 queued
+	 * 输入之后的那个带工具 `turn_end` 上被当成这一轮的结果持久化（并标记去重）。
+	 *
+	 * `streamingBehavior` 正是「这条输入会在当前 run 里被 drain」的宿主标记：`prompt()` /
+	 * `steer()` / `followUp()` / `sendUserMessage()` 都在 `isStreaming`（= 有活动 run）时带上它。
+	 * idle 输入拿不到它，而 idle 输入必然经 `_startRun` → `before_agent_start`，那里已经作废过。
+	 *
+	 * 取舍：queued 输入自己不检索（没有 `before_agent_start` 就没有检索点）。宁可这一轮不浮现，
+	 * 也不把上一个 prompt 的召回记到新输入头上。
+	 */
+	pi.on("input", (event) => {
+		if (event.streamingBehavior !== undefined) pendingRecall = undefined;
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		lastSystemPrompt = event.systemPrompt;
 		// 先拷到 const：`store` 是工厂作用域的 let，在异步回调里 TS 不会保留它的外层收窄。
@@ -672,7 +694,9 @@ export default function (pi: ExtensionAPI) {
 					if (manifest.length === 0) return;
 					const { files, content } = await runTask(
 						TASKS.autoSurfacing,
-						{ userPrompt: promptText.slice(0, 4000), injectedFiles, manifest },
+						// 去重集合递**快照**（spec §5.2.1）：侧查询在飞的时候 `turn_end` 可能已经把
+						// 本轮召回的文件标进活 Set，传引用会让「查询输入」随之后写而变。
+						{ userPrompt: promptText.slice(0, 4000), injectedFiles: new Set(injectedFiles), manifest },
 						{ cfg, cwd: dir, store: activeStore, ports: { headless } },
 					);
 					// 期间有新一轮 run 启动（这一份 pending 已被作废）：结果随轮作废，不写回。

@@ -244,10 +244,12 @@ describe("index wiring — memory_index section", () => {
 
 		expect(second.systemPromptOptions.sections["memory_index"]).toBe(DISK_INDEX);
 		// 注册的事件集本身就是约定：除了 session_compact，没有任何事件能刷新索引快照。
-		// `turn_end` 只消费 prefetch 结果（持久化召回块），不碰索引。
+		// `turn_end` 只消费 prefetch 结果（持久化召回块），`input` 只作废过期的 pending，
+		// 两者都不碰索引。
 		expect(Object.keys(handlers).sort()).toEqual([
 			"agent_end",
 			"before_agent_start",
+			"input",
 			"session_compact",
 			"session_shutdown",
 			"session_start",

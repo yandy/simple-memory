@@ -41,6 +41,57 @@ function turnEndEvent(over: Record<string, unknown> = {}) {
 
 const recallEntry = { type: "custom_message", customType: "memory-auto-surfacing", content: RECALL, display: false };
 
+/**
+ * `input` 事件的宿主形状（pi >= 1.5.0）：`streamingBehavior` 只有**run 进行中**的输入才有值
+ *（`prompt()` / `steer()` / `followUp()` / `sendUserMessage()` 都在 `isStreaming` 时带上它）。
+ * 这类输入由同一个低层 run drain，中途**不会**再发 `before_agent_start`。
+ */
+function queuedInput(streamingBehavior: "steer" | "followUp", over: Record<string, unknown> = {}) {
+	return { type: "input", text: "then what?", images: undefined, source: "interactive", streamingBehavior, ...over };
+}
+
+/**
+ * 宿主的**消息投影重放器**：缓存回归用例的请求序列不再手写，而是按宿主的三件事累积。
+ *
+ * 1. 每个请求的上下文 = 此刻的会话消息（宿主 `_buildBoundaryContext` 的 `llmMessages`）；
+ * 2. `turn_end` 的 `entries` 是边界提案，handler 返回值**完整替换**它（`emitBoundary`）；
+ * 3. 提案的 `custom_message` draft 提交后成为下一条会话消息（`_applyBoundaryDrafts`）。
+ *
+ * 所以「注入后的序列」只能是 handler 实际返回值的累积结果，而不是断言自己搭出来的。
+ */
+function createHostRun() {
+	type HostMessage = { role: string; content: string; customType?: string };
+	const committed: HostMessage[] = [];
+	const requests: HostMessage[][] = [];
+	const snapshot = () => committed.map((m) => ({ ...m }));
+	return {
+		requests,
+		/** 用户提交 prompt：run 的第一个请求就是此刻的上下文（`before_agent_start` 之后、请求之前）。 */
+		submit(prompt: string): void {
+			committed.push({ role: "user", content: prompt });
+			requests.push(snapshot());
+		},
+		/** 一个带工具结果的 turn 结束：边界在 assistant + toolResult 已进会话之后触发。 */
+		async finishTurn(handler: (event: any, ctx: any) => any, ctx: any, turnIndex = 1) {
+			committed.push({ role: "assistant", content: `checking memory ${turnIndex}` });
+			committed.push({ role: "toolResult", content: `command output ${turnIndex}` });
+			const projection = snapshot();
+			const boundary = await handler(
+				turnEndEvent({ turnIndex, entries: [], context: { llmMessages: projection } }),
+				ctx,
+			);
+			// 宿主提交提案（无返回值 = 什么都不提交），然后才发下一个请求。
+			for (const draft of boundary?.entries ?? []) {
+				committed.push({ role: "custom", customType: draft.customType, content: draft.content });
+			}
+			requests.push(snapshot());
+			return boundary;
+		},
+	};
+}
+
+const isRecall = (m: { customType?: string }) => m.customType === "memory-auto-surfacing";
+
 describe("index wiring — auto-surfacing", () => {
 	let s: Awaited<ReturnType<typeof setupSession>>;
 
@@ -121,8 +172,11 @@ describe("index wiring — auto-surfacing", () => {
 
 		// `injectedFiles` 是活 Set：断言必须在调用瞬间深拷贝。
 		const injectedAtCall: Array<Set<string>> = [];
+		// 侧查询实际收到的那个 Set **引用**：持久化之后它不得跟着变（收到的是快照，spec §5.2.1）。
+		const injectedRefs: Array<Set<string>> = [];
 		runTaskMock.mockImplementation(async (...args: any[]) => {
 			injectedAtCall.push(new Set(args[1].injectedFiles));
+			injectedRefs.push(args[1].injectedFiles);
 			return { files: ["ssh.md", "db.md"], content: RECALL };
 		});
 
@@ -139,6 +193,8 @@ describe("index wiring — auto-surfacing", () => {
 		// 工具结果自然引发下一请求：不声明 continue，不制造额外请求。
 		expect(boundary.continue).toBeUndefined();
 		expect(injectedAtCall).toEqual([new Set()]);
+		// 持久化把本轮文件标进了活 `injectedFiles`，但侧查询手里的那一份是快照，不会回写。
+		expect(injectedRefs[0]).toEqual(new Set());
 
 		// 下一轮：去重标记已生效（已持久化的文件不再浮现）。
 		await handlers["before_agent_start"][0](sectionsEvent("and db?"), ctx);
@@ -147,36 +203,153 @@ describe("index wiring — auto-surfacing", () => {
 	});
 
 	it("keeps the recalled block at one fixed position across the following requests", async () => {
+		// 两次**完全独立**的跑：「不注入基线」与「注入跑」各建一个工厂（独立状态）+ 各自一次
+		// `session_start`，走同一套宿主投影重放。请求序列全部由 handler 的实际返回值累积，
+		// 基线是另一次跑出来的，而不是用同一份数据手搭的等比式。
+		const drive = async (surfacing: boolean) => {
+			await s.writeConfig({ autoSurfacing: { enabled: surfacing } });
+			const { pi, handlers } = createFakePi();
+			memoryFactory(pi as any);
+			await handlers["session_start"][0]({}, s.uiCtx());
+
+			const host = createHostRun();
+			const { setStatus, ctx } = spyUi();
+			await handlers["before_agent_start"][0](sectionsEvent("how do I debug SSH?"), ctx);
+			host.submit("how do I debug SSH?");
+			// 基线没有侧查询（`enabled: false` 在 `before_agent_start` 就早退），没有东西可等。
+			if (surfacing) await flushPrefetch(setStatus);
+			const first = await host.finishTurn(handlers["turn_end"][0], ctx, 1);
+			await host.finishTurn(handlers["turn_end"][0], ctx, 2);
+			return { host, first };
+		};
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md"), entry("db.md")]);
+		runTaskMock.mockResolvedValue({ files: ["ssh.md", "db.md"], content: RECALL });
+
+		const baseline = await drive(false);
+		// 基线里根本没发生侧查询：没有注入点，召回块无处出现。
+		expect(scanEntriesMock).not.toHaveBeenCalled();
+		const surfaced = await drive(true);
+		expect(surfaced.first.entries).toEqual([recallEntry]);
+
+		const base = baseline.host.requests;
+		const real = surfaced.host.requests;
+		expect(base).toHaveLength(3);
+		expect(real).toHaveLength(3);
+
+		// 1. 本轮第一个请求：与未注入基线逐元素相等（召回不影响已有前缀）。
+		expect(real[0]).toEqual(base[0]);
+		expect(real[0].some(isRecall)).toBe(false);
+		// 2. 注入点之后：去掉召回块就**逐元素等于**基线（只多了这一块，没改写任何东西）。
+		for (const i of [1, 2]) {
+			expect(real[i].filter((m) => !isRecall(m))).toEqual(base[i]);
+		}
+		// 3. 只出现一次，且位置固定：紧跟在本 turn 的工具结果之后，后续请求不再移动它。
+		const recallIndex = real[1].findIndex(isRecall);
+		expect(recallIndex).toBe(base[1].length);
+		expect(real[1].filter(isRecall)).toHaveLength(1);
+		expect(real[2].findIndex(isRecall)).toBe(recallIndex);
+		expect(real[2].filter(isRecall)).toHaveLength(1);
+	});
+
+	it("drops a pending recall when a follow-up is queued mid-run", async () => {
+		// 宿主生命周期：中间**没有** `before_agent_start` 的连续 turn。
+		// 1. user run 启动（委托召回 1）→ 零工具 turn_end：pending 保留（本轮可能还有后续请求）；
+		// 2. 用户排入 follow-up（`input` + `streamingBehavior: "followUp"`）——宿主在同一个低层 run
+		//    里 drain 它，不再发 `before_agent_start`；
+		// 3. follow-up 之后带工具的 turn_end：不能把上一个 prompt 的召回记到这一轮头上。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: RECALL };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(await handlers["turn_end"][0](turnEndEvent({ toolResults: [] }), ctx)).toBeUndefined();
+
+		await handlers["input"][0](queuedInput("followUp"), ctx);
+		const boundary = await handlers["turn_end"][0](turnEndEvent({ turnIndex: 2 }), ctx);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// 作废不标去重：下一个 prompt 里同一文件仍可浮现。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh again?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall[1]).toEqual(new Set());
+	});
+
+	it("drops a pending recall when a steering message arrives mid-turn", async () => {
+		// steering 同一个道理：`input` 一响，当前 pending 就不再属于这个 run 的最终上下文。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		runTaskMock.mockResolvedValue({ files: ["ssh.md"], content: RECALL });
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		// turn 1 进行中插入 steering，直到本轮结束都不会再有 `before_agent_start`。
+		await handlers["input"][0](queuedInput("steer"), ctx);
+
+		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+	});
+
+	it("keeps the new status line when a superseded prefetch finishes late", async () => {
+		// `surfacingStatusFor` 的竞争：旧侧查询晚到，不得擦掉新一轮已亮出的状态行。
 		const { setStatus, ctx } = spyUi();
 		const { pi, handlers } = createFakePi();
 		memoryFactory(pi as any);
 		await handlers["session_start"][0]({}, s.uiCtx());
 
-		scanEntriesMock.mockResolvedValue([entry("ssh.md"), entry("db.md")]);
-		runTaskMock.mockResolvedValue({ files: ["ssh.md", "db.md"], content: RECALL });
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		let resolveOld: ((value: { files: string[]; content: string }) => void) | undefined;
+		let resolveNew: ((value: { files: string[]; content: string }) => void) | undefined;
+		runTaskMock
+			.mockImplementationOnce(
+				() =>
+					new Promise<{ files: string[]; content: string }>((resolve) => {
+						resolveOld = resolve;
+					}),
+			)
+			.mockImplementationOnce(
+				() =>
+					new Promise<{ files: string[]; content: string }>((resolve) => {
+						resolveNew = resolve;
+					}),
+			);
 
-		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
-		await flushPrefetch(setStatus);
-		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
-		const persisted = boundary.entries.at(-1);
+		await handlers["before_agent_start"][0](sectionsEvent("first?"), ctx);
+		await flush();
+		expect(setStatus).toHaveBeenCalledWith("surfacing", "Searching relevant memories…");
 
-		// 宿主视角：turn_end 的 entries 追加在本 turn 的 assistant / tool-result 之后。
-		const history = [
-			{ role: "user", content: "how do I debug SSH?" },
-			{ role: "assistant", content: "checking memory" },
-			{ role: "toolResult", content: "ssh.md" },
-		];
-		const firstRequest = [...history]; // 本轮第一次请求：侧查询还没进上下文
-		const nextRequest = [...history, persisted]; // 持久化后的下一个请求
-		const laterRequest = [...nextRequest, { role: "assistant", content: "use 2222" }];
+		// 第一份还在飞时第二个 prompt 启动：它接管了状态行。
+		await handlers["before_agent_start"][0](sectionsEvent("second?"), ctx);
+		await flush();
+		setStatus.mockClear();
 
-		// 召回块之前的序列与「未注入」时逐元素相等（prefix cache 的公共前缀不受影响）。
-		expect(firstRequest).toEqual(history);
-		expect(nextRequest.slice(0, history.length)).toEqual(firstRequest);
-		// 只出现一次，且位置固定。
-		const recalls = laterRequest.filter((m) => (m as { customType?: string }).customType === "memory-auto-surfacing");
-		expect(recalls).toHaveLength(1);
-		expect(laterRequest.indexOf(persisted)).toBe(nextRequest.indexOf(persisted));
+		// 旧的先收尾：它不是持有者，一行都不能写（否则用户的“正在检索”会凭空消失）。
+		resolveOld?.({ files: [], content: "" });
+		await flush();
+		await flush();
+		expect(setStatus).not.toHaveBeenCalled();
+
+		// 新的收尾才轮到清。
+		resolveNew?.({ files: ["ssh.md"], content: RECALL });
+		await waitFor(
+			() => setStatus.mock.calls.some((call: unknown[]) => call[0] === "surfacing" && call[1] === undefined),
+			"新一份 prefetch 收尾清状态行",
+		);
 	});
 
 	it("drops the recall on a turn with no tool results", async () => {
