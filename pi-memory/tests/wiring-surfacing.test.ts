@@ -64,6 +64,26 @@ function turnEndEvent(over: Record<string, unknown> = {}) {
 
 const recallEntry = { type: "custom_message", customType: "memory-auto-surfacing", content: RECALL, display: false };
 
+/** 在会话目录里落一条真的 entry（工具与侧查询都读它）：frontmatter + 正文。 */
+async function writeEntry(dir: string, file: string, name: string, body: string): Promise<void> {
+	await writeFile(
+		join(dir, file),
+		[
+			"---",
+			`name: ${name}`,
+			`description: ${name} note`,
+			"type: project",
+			"created: 2026-01-01",
+			"modified: 2026-01-01",
+			"---",
+			"",
+			body,
+			"",
+		].join("\n"),
+		"utf8",
+	);
+}
+
 /**
  * 宿主的**消息投影重放器**：缓存回归用例的请求序列不再手写，而是按宿主的三件事累积。
  *
@@ -590,6 +610,142 @@ describe("index wiring — auto-surfacing", () => {
 		await handlers["before_agent_start"][0](sectionsEvent("ssh again?"), ctx);
 		await flushPrefetch(setStatus);
 		expect(injectedAtCall[1]).toEqual(new Set());
+	});
+
+	it("discards the recall when the same turn's memory tool mutated the store", async () => {
+		// 竞态：prefetch 选中 ssh.md 之后，主 agent 在**同轮**用 `memory remove` 删掉了它。
+		// 删除不触发 `onContentSeen`（模型没看到正文），所以只有 store 的写入代数能发现这件事 ——
+		// 没有这道门就会把已删条目的正文持久化进会话。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers, tools } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await writeEntry(s.dir, "ssh.md", "SSH", "staging 的 SSH 用 2222 端口");
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: RECALL };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+
+		// 同轮：模型删掉了这份记忆（不读正文，所以没有任何去重标记）。
+		const removed = await tools[0].execute("call-remove", { action: "remove", name: "SSH" }, undefined, undefined, ctx);
+		expect(removed.content[0].text).toContain("Removed");
+
+		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// 作废 = 整份丢掉：不持久化、不标去重（下一轮侧查询仍拿到空集合）。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh elsewhere?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall.at(-1)).toEqual(new Set());
+	});
+
+	it("discards the whole recall when the same turn's memory search already showed one of its files", async () => {
+		// 竞态：prefetch 选中 ssh.md + db.md 之后，主 agent 在**同轮**用 `memory search` 看到了 ssh.md
+		// 的正文（`search` 把完整 body 拼进结果，所以它进了去重集合）。此时再持久化召回，同一份正文
+		// 会在工具结果和召回块里各出现一次。整份作废（不重组、不部分标记）：下一轮重新检索。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers, tools } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+		await writeEntry(s.dir, "ssh.md", "SSH", "staging 的 SSH 用 2222 端口");
+		await writeEntry(s.dir, "db.md", "DB", "连接池上限是 20");
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md"), entry("db.md")]);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md", "db.md"], content: RECALL };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+
+		// 同轮：模型搜到了 ssh.md 的完整正文（不是删除、store 也没变 —— 只有去重交集能发现）。
+		const searched = await tools[0].execute("call-search", { action: "search", query: "2222" }, undefined, undefined, ctx);
+		expect(searched.content[0].text).toContain("staging 的 SSH 用 2222 端口");
+
+		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
+		expect(boundary).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
+
+		// 整份作废的可见证据：db.md 没有被这次作废顺手标记（快照里只有搜索命中的 ssh.md）。
+		await handlers["before_agent_start"][0](sectionsEvent("db?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall.at(-1)).toEqual(new Set(["ssh.md"]));
+	});
+
+	it("keeps the persisted recall when the run ends right after the boundary (deliberate exception)", async () => {
+		// 语义固定：宿主的两条反例（工具结果全要求 terminate 时工具循环就停
+		// `pi-agent-core/dist/agent-loop.js:172`；`finishTurn` 可返回 end，`agent-session.js:538-543`）
+		// 让「completed + 有工具结果」不严格等于「必有下一请求」。宿主没有信号能区分，所以这里**刻意**
+		// 不追严格判定：召回照旧持久化、文件照旧标记 —— 后续轮次与 resume 的历史里仍能看到这块正文，
+		// 代价是多一条注入。dsh 侧没有下一个 pre-step 会作废，这是两边**已知的**语义分叉。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		const injectedAtCall: Array<Set<string>> = [];
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: ["ssh.md"], content: RECALL };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+
+		const boundary = await handlers["turn_end"][0](turnEndEvent(), ctx);
+		expect(boundary.entries.at(-1)).toEqual(recallEntry);
+		expect(notify).toHaveBeenCalledWith("Recalled: 2 entries", "info");
+
+		// run 直接结束（没有后续 turn）：`agent_settled` 只销 pending，不回滚已提交的 entries。
+		await handlers["agent_settled"][0]({ type: "agent_settled", aborted: false }, ctx);
+		expect(boundary.entries.at(-1)).toEqual(recallEntry);
+
+		// 文件已标记去重：下一次检索的输入里已经有它（正文就在历史里，不必再浮现）。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh again?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall.at(-1)).toEqual(new Set(["ssh.md"]));
+	});
+
+	it("drops an in-flight pending at agent_settled instead of waiting for a later boundary", async () => {
+		// pending 的懒清理：零工具轮/取消/未就绪都不清它，只有新 run 与这个收尾点清。
+		// 没有 `agent_settled` 这道门，run 结束后迟到的那份结果会挂在下一个边界上被持久化 ——
+		// 属于一条已经结束的 run。
+		const { notify, setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		let resolveRun: ((value: { files: string[]; content: string }) => void) | undefined;
+		runTaskMock.mockImplementationOnce(
+			() =>
+				new Promise<{ files: string[]; content: string }>((resolve) => {
+					resolveRun = resolve;
+				}),
+		);
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flush();
+		// 零工具边界：本轮之后没有请求，召回作废但 pending 留着（懒清理）。
+		expect(await handlers["turn_end"][0](turnEndEvent({ toolResults: [] }), ctx)).toBeUndefined();
+
+		await handlers["agent_settled"][0]({ type: "agent_settled", aborted: false }, ctx);
+		resolveRun?.({ files: ["ssh.md"], content: RECALL });
+		await flushPrefetch(setStatus);
+
+		// 已销账：下一个带工具边界不再替那条结束了的 run 持久化。
+		expect(await handlers["turn_end"][0](turnEndEvent({ turnIndex: 2 }), ctx)).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
 	});
 
 	it("does not persist a recall from an aborted turn", async () => {

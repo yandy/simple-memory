@@ -28,5 +28,5 @@ export const MEMORY_TOOL_GUIDELINES: readonly string[] = Object.freeze([
 	"Keep one fact per memory and put the detail in content, not in name or description; the index line stays short.",
 	"The index has a hard capacity limit. When a write reports that MEMORY.md is over its limit, act on it: merge related memories, remove stale ones, and move detail into content.",
 	"Use action 'search' with scope='sessions' to find past work in history sessions.",
-	"Relevant memories are surfaced automatically at the start of a turn inside <relevant_memories>; use 'search' or 'list' to look for anything else.",
+	"Relevant memories may be surfaced automatically during a run inside <relevant_memories> — the first request of a turn may carry none, and a run that calls no tools may surface nothing at all; use 'search' or 'list' to look for anything else.",
 ]);

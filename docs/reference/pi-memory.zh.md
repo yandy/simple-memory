@@ -252,6 +252,7 @@ session_shutdown
 | `before_agent_start` | 把冻结值写进 `sections["memory_index"]`（**每一轮、无条件**），然后在**主会话的用户轮**里启动召回预取（不 await、本轮不注入；custom 消息触发的 run 没有用户输入可检索，跳过） |
 | `turn_end` | 召回的消费点：结果已就绪、本轮有工具结果（= 后面还有请求）、且边界仍属于启动检索的那条 prompt 时，把召回块持久化进会话并标记去重。零工具轮、取消、未就绪、被新 prompt 取代的轮都不会碰到这一步 |
 | `agent_end` | `extractMemories.enabled` 开启时触发异步 extract；写入成功通知 `Extracted N memories.`，失败通知 `Extract failed: …`（每会话一次） |
+| `agent_settled` | run 彻底收尾：作废未持久化的在途召回（不跨 run 保留）。已持久化的召回块不受影响 |
 | `session_compact` | 清空已注入集合，**并从磁盘重读索引** —— 会话内唯一的刷新点 |
 | `session_shutdown` | 把待发布的同步推送 flush 一次（上限 `sync.autoTimeoutMs`），并等在途写入收尾（上限 `lock.timeoutMs`），因此退出既不会留下 stale 的 `.lock`，也不会留下一批只到过本地磁盘的记忆 |
 
@@ -273,7 +274,11 @@ pi 用有序的 sections 构建 system prompt，只对**值发生变化**的 sec
 1. 用户轮开始时（主会话、非子 agent、`messageType` 为 `user`）从 store 的 `mtime` 缓存构建清单：`[type] file.md — description`，按 `modified` 降序，最多 200 条、4000 字符（description 预算按条数均分，每条不低于 80 字符）。
 2. 侧查询（`maxTurns: 1`、零工具）在后台启动，从清单里返回至多 `maxFiles` 个文件名；不在清单里的一律丢弃。结果没就绪的请求**不带召回** —— 包括本轮的第一个请求。
 3. 只有「本轮之后还会有请求」的边界才消费：`turn_end` 有工具结果、结果已就绪、且这个边界仍属于启动检索的那条 prompt 时，选中 entry 的**正文**（不含 frontmatter）按 `maxEntryBytes` 截断、净化，作为一条 `display: false` 的 custom 消息**持久化**到会话，外面包 `<relevant_memories>`；总量到 `maxInjectionBytes` 就停。它在下一请求进入上下文，位置固定、只出现一次。你会看到 `Recalled: N entries` 通知。
-4. 消费不了的轮**作废**：零工具调用的单请求轮（本轮之后再没有请求）、取消的轮、结果还没就绪的轮、被新用户 prompt 取代的轮，都不落 session、不标去重；下一轮按新 prompt 重新检索。
+4. 消费不了的轮**作废**：零工具调用的单请求轮（本轮之后再没有请求）、取消的轮、结果还没就绪的轮、被新用户 prompt 取代的轮、以及 `agent_settled` 一到（run 彻底收尾）时仍未持久化的结果，都不落 session、不标去重；下一轮按新 prompt 重新检索。
+
+有一个**刻意的例外**：`turn_end` 有工具结果并不严格等于「后面一定还有请求」—— 工具结果全部要求终止工具循环时，run 会在边界之后直接结束（`finishTurn` 也可以返回 end）。宿主没有信号能把这种提前终止和普通边界区分开，所以这种轮**仍会持久化召回并标记去重**：召回块留在会话历史里（后续轮次、`resume` 都看得见），代价是多出一条注入。dsh 侧没有后续 `pre-step` 时这份结果会作废，这是两边已知的语义分叉。
+
+两道**同步门**守住同轮的并发写入：结果在飞期间 store 被写过（同轮 `memory remove` / `replace`、dream / extract 的 worker、同步写入都算），或者选中的文件里已有一个进了去重集合（同轮 `memory search` 已经把它的完整正文交给模型），整份结果作废 —— 不持久化、不标去重，下一轮重新检索。没有这两道门，同一份正文会在工具结果和召回块里各出现一次，或者把已删 / 已改的正文写进会话。
 5. 去重口径是「本 session 已让模型见过正文的文件」：注入过的 entry，加上**主 session** 的 `memory` 工具读取过的 —— `add` / `replace` 成功写入的文件，以及 `scope=memory` 的 `search` 命中的文件（它的结果带完整正文）。`list`（只有摘要）、`scope=sessions`（搜的是会话日志）、失败的调用都不算。headless 子会话（dream / extract）的工具读到的正文主模型没见过，不标记。
 6. compaction 清空去重集合（正文被挤出上下文，这些 entry 必须能重新浮现）；会话切换时也从空集合开始。
 

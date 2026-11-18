@@ -249,6 +249,8 @@ export function createFakeCtx(
 	emitter: {
 		agentCreated(agent: FakeAgent, source?: SessionStartSource): Promise<void>;
 		agentDisposed(agent: FakeAgent): void;
+		/** `agent/status` 的 emit（`idle` ⇄ `running`；fire-and-forget，与宿主一致）。 */
+		agentStatus(agent: FakeAgent, status: "idle" | "running"): void;
 		turnStopping(payload: { agent: FakeAgent; turn?: number }): Promise<void>;
 		preStep(payload: {
 			agent: FakeAgent;
@@ -316,6 +318,7 @@ export function createFakeCtx(
 	const disposedListeners: ListenerEntry[] = [];
 	const preStepListeners: ListenerEntry[] = [];
 	const turnStoppingListeners: ListenerEntry[] = [];
+	const statusListeners: ListenerEntry[] = [];
 
 	/** 每个 agent 作用域调过的 `tools.restrict()` 过滤器（按调用顺序）。 */
 	const restrictions: Array<{ agentId: string; filter: { allow?: readonly string[]; deny?: readonly string[] } }> = [];
@@ -329,6 +332,7 @@ export function createFakeCtx(
 		else if (event === "agent/disposed") arr = disposedListeners;
 		else if (event === "agent/pre-step") arr = preStepListeners;
 		else if (event === "agent/turn-stopping") arr = turnStoppingListeners;
+		else if (event === "agent/status") arr = statusListeners;
 		if (!arr) throw new Error(`fake ctx: unknown event "${event}"`);
 		const entry: ListenerEntry = { handler, prepend };
 		if (prepend) arr.unshift(entry);
@@ -868,9 +872,15 @@ export function createFakeCtx(
 		}
 	}
 
+	/** 触发 `agent/status`（`emit`，同步派发）。 */
+	function agentStatus(agent: FakeAgent, status: "idle" | "running"): void {
+		for (const { handler } of statusListeners.slice()) handler({ agent, status });
+	}
+
 	const emitter = {
 		agentCreated,
 		agentDisposed,
+		agentStatus,
 		turnStopping,
 		preStep(payload: {
 			agent: FakeAgent;

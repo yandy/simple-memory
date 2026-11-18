@@ -247,6 +247,7 @@ describe("index wiring — memory_index section", () => {
 		// `turn_end` 只消费 prefetch 结果（持久化召回块），不碰索引。
 		expect(Object.keys(handlers).sort()).toEqual([
 			"agent_end",
+			"agent_settled",
 			"before_agent_start",
 			"session_compact",
 			"session_shutdown",

@@ -641,6 +641,68 @@ describe("apply — 启动期降级与每轮召回", () => {
 		expect(third.messages[1].content[0].text).toContain("the codeword is lantern");
 	});
 
+	it("drops an in-flight recall when the agent goes idle", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+
+		// 一次完整的跑：step 1 启动侧查询（被 gate 挡住）→ 可选地发一次 `agent/status` idle → 放行侧查询
+		// → 轮询同轮 step >= 2，返回是否真的消费到了召回。
+		//
+		// 宿主定义里 `idle` = "no driver is active"，所以 `idle` 之后不会再有同轮 step — 这里的 step >= 2
+		// 只是「这份 pending 还在不在」的探针（还在 = 迟到结果会被下一次消费点拿走）。
+		const run = async (goIdle: boolean): Promise<boolean> => {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const text = JSON.stringify({ selected_files: ["Alpha.md"] });
+			const stream = vi.fn(() => ({
+				async *[Symbol.asyncIterator]() {
+					await gate;
+					yield { type: "block-start", index: 0, blockType: "text" };
+					yield { type: "text-delta", index: 0, text };
+					yield { type: "block-end", index: 0, block: { type: "text", text } };
+					yield { type: "finish", reason: { kind: "stop" } };
+				},
+			}));
+			const { fake, dispose } = await setup({ llmStream: stream }, rowConfig({ autoSurfacing: { model: "prov/mod" } }));
+			const agent = fake.makeAgent({ id: "s1", cwd });
+			await fake.emitter.agentCreated(agent);
+			const messages = [createUserMsg("tell me about alpha")];
+			await fake.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+			await waitFor(() => stream.mock.calls.length === 1);
+			if (goIdle) fake.emitter.agentStatus(agent, "idle");
+			release();
+			const deadline = Date.now() + 2000;
+			let step = 2;
+			for (;;) {
+				const decision = await fake.emitter.preStep({
+					agent,
+					messages,
+					turn: 1,
+					step: step++,
+					signal: new AbortController().signal,
+				});
+				if (decision.messages.length > messages.length) {
+					dispose();
+					return true;
+				}
+				if (Date.now() > deadline) {
+					dispose();
+					return false;
+				}
+				await new Promise((resolveTimer) => setTimeout(resolveTimer, 5));
+			}
+		};
+
+		// 对照：不发 idle 时同轮 step >= 2 一定消费到 —— 证明上面那套等待足以让 prefetch 就绪，
+		// 下面那句「没消费」不是「根本没就绪」的假绿。
+		expect(await run(false)).toBe(true);
+		// `agent/status` 转 idle：pending 已销账，迟到的结果不会被任何后续消费点拿走。
+		expect(await run(true)).toBe(false);
+	});
+
 	it("drops the recall dedupe state when the host rebuilds the agent for compact or clear", async () => {
 		const memoryDir = memoryDirFor(cwd);
 		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");

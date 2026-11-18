@@ -18,6 +18,23 @@ import { createFakeCtx, createSyntheticMsg, createUserMsg } from "./helpers/fake
  */
 const WAIT = { timeout: 15_000 } as const;
 
+/**
+ * 一条「上一轮遗留」的 pending。这些用例只关心它在 step 1 被销账，所以 `store` 用一份临时目录里的
+ * 真 store（消费路径根本走不到代数比较）；给了 `over` 就能覆盖字段。
+ */
+function stalePending(over: Partial<PendingRecall> = {}): PendingRecall {
+	return {
+		turn: 1,
+		settled: true,
+		prompt: "old question",
+		files: ["Alpha.md"],
+		content: "<relevant_memories>stale</relevant_memories>",
+		store: makeStore(join(dir, "stale-mem")),
+		generation: 0,
+		...over,
+	};
+}
+
 /** 测试级临时目录总根：所有记忆目录都建在它下面，`afterEach` 一次 `rm -rf` 全清。 */
 let dir: string;
 
@@ -185,9 +202,7 @@ describe("createPreStepListener", () => {
 	it("returns an inner reject unchanged, never queries, and drops any pending recall", async () => {
 		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const refresh = vi.fn(async () => {});
-		const pendingRecalls = new Map<string, PendingRecall>([
-			["s1", { turn: 1, settled: true, prompt: "hi", files: ["Alpha.md"], content: "<relevant_memories>stale</relevant_memories>" }],
-		]);
+		const pendingRecalls = new Map<string, PendingRecall>([["s1", stalePending()]]);
 		const deps = makeDeps({ indexCache: { refresh }, headless: { run: headlessRun }, pendingRecalls });
 		const { ctx, emitter, makeAgent } = createFakeCtx();
 
@@ -274,13 +289,7 @@ describe("createPreStepListener", () => {
 	it("drops the previous turn's pending at step 1 even when the runtime is unavailable", async () => {
 		// 回归：新的一轮在可用性门之前就必须作废旧 pending。否则 runtime 不可用 / no prompt / surfacing
 		// 关闭的轮会在门里直接 return，旧 content/files 一直留在 Map 里等下一个消费点。
-		const stale: PendingRecall = {
-			turn: 1,
-			settled: true,
-			prompt: "old question",
-			files: ["Alpha.md"],
-			content: "<relevant_memories>stale</relevant_memories>",
-		};
+		const stale: PendingRecall = stalePending();
 		const pendingRecalls = new Map<string, PendingRecall>([["s1", stale]]);
 		const headlessRun = vi.fn(async () => selectOutcome(["Alpha.md"]));
 		const deps = makeDeps({ headless: { run: headlessRun }, pendingRecalls });
@@ -305,13 +314,7 @@ describe("createPreStepListener", () => {
 	it("drops the previous turn's pending at step 1 when the new turn claims no human prompt", async () => {
 		const rig = await makeRig();
 		const agent = rig.makeAgent({ id: "s1" });
-		rig.pendingRecalls.set("s1", {
-			turn: 1,
-			settled: true,
-			prompt: "old question",
-			files: ["Alpha.md"],
-			content: "<relevant_memories>stale</relevant_memories>",
-		});
+		rig.pendingRecalls.set("s1", stalePending());
 
 		// 全是合成消息：这一轮没有真人 prompt，不会启动新 prefetch。
 		const messages = [createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z")];
@@ -575,6 +578,58 @@ describe("createPreStepListener", () => {
 		const pending = await waitSettled(rig.pendingRecalls);
 		expect(pending.content).toContain("## Beta");
 		expect(pending.content).not.toContain("## Alpha");
+	});
+
+	it("discards the pending when the same turn mutated the store", async () => {
+		// 竞态：step 1 启动侧查询、选中 Alpha.md 之后，主 agent 在同一轮的 step 1 里用 `memory remove`
+		// 删掉了它（删除不读正文，所以去重集合不变）。消费前 store 的写入代数已经变了 → 整份作废，
+		// 否则会把已删条目的正文 splice 进下一步请求。
+		const rig = await makeRig({ sideQuery: async () => selectOutcome(["Alpha.md"]) });
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("what did I say about alpha?")];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		// 同轮写入：删掉被选中的那份记忆。
+		const store = rig.store;
+		if (store === null) throw new Error("expected a real store");
+		await store.removeEntry("Alpha");
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toBe(messages);
+		// 作废 = 不 splice、不标去重（这份文件没有到模型眼前）。
+		expect(rig.injected.has("s1")).toBe(false);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("discards the whole pending when the same turn's tool already showed one of its files", async () => {
+		// 竞态：选中 Alpha.md + Beta.md 之后，主 agent 在同一轮用 `memory search` 看到了 Alpha.md 的
+		// 完整正文 → 装配层把它标进了本 session 的去重集合。此时再 splice 召回，同一份正文会在
+		// 工具结果和召回块里各出现一次。整份作废，且不顺手标记 Beta.md（下次重新检索）。
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: async () => selectOutcome(["Alpha.md", "Beta.md"]),
+		});
+		const agent = rig.makeAgent({ id: "s1" });
+		const messages = [createUserMsg("what did I say about alpha?")];
+
+		await rig.emitter.preStep({ agent, messages, turn: 1, step: 1, signal: new AbortController().signal });
+		await waitSettled(rig.pendingRecalls);
+
+		// 同轮工具读取（装配层在工具成功后写的同一份账）：只有 Alpha.md，store 没动。
+		rig.injected.set("s1", new Set(["Alpha.md"]));
+
+		const decision = await rig.emitter.preStep({ agent, messages, turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toBe(messages);
+		// 整份作废的可见证据：Beta.md 没有被这次作废顺手标进集合。
+		expect([...(rig.injected.get("s1") ?? [])]).toEqual(["Alpha.md"]);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
 	});
 
 	it("discards the pending when the step claims a new human prompt", async () => {

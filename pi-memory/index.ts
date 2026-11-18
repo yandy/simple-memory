@@ -186,6 +186,12 @@ function unwarnedStartupTail(delivered: string | undefined, warning: string | un
  *    `before_agent_start` handlers 未完成时收到并排队输入（`_startRun` 先把 `_isAgentRunActive`
  *    置为 true），因此「B 的 queued 输入 → A 的 before_agent_start 建 pending」这一时序里第 1 道闸
  *    是哑的，只有消费点按当前上下文校验才能把结果扣在正确的 prompt 上。
+ *
+ * 另外还有两道**同步门**（spec Finding 1）：侧查询在飞时主 agent 可能在同轮用 `memory` 工具
+ * 改 store（`remove` / `replace`）或读到其中某个文件的正文（`search`）。两种情况下这份 recall
+ * 都已经过时 —— 持久化它会让同一份正文在工具结果和召回块里各出现一次，或者把已被删除 / 改写的
+ * 正文写进会话。所以消费前比对 `generation`（store 写入代数）与去重集合交集，任何一项变化就整份
+ * 作废（不持久化、不标去重、下一轮按新 prompt / 新内容重新检索）。
  */
 interface PendingRecall {
 	settled: boolean;
@@ -193,6 +199,10 @@ interface PendingRecall {
 	prompt: string;
 	/** 启动时这条 prompt 附带的图片数（`BeforeAgentStartUserEvent.images`）：0 = 无图轮。 */
 	imageCount: number;
+	/** 启动这一轮检索的那个 store。会话被重建 / 收掉时它是第二道「同一份 store」的证据。 */
+	store: MemoryStore;
+	/** 启动时的 `store.generation`：消费前变了 = 同轮里有写入落盘，这份结果过时。 */
+	generation: number;
 	files: string[];
 	content: string;
 }
@@ -738,6 +748,10 @@ export default function (pi: ExtensionAPI) {
 				settled: false,
 				prompt: promptText,
 				imageCount,
+				store: activeStore,
+				// 写入代数的基线：取**启动这一刻**的值（不等到 scanEntries 之后），所以侧查询在飞期间
+				// 的任何写入都不会被它自己「提前」吞掉。
+				generation: activeStore.generation,
 				files: [],
 				content: "",
 			};
@@ -806,6 +820,14 @@ export default function (pi: ExtensionAPI) {
 		// 消费点归属校验：无论结果要不要，这个边界上的 pending 都只能消费一次。
 		pendingRecall = undefined;
 		if (!boundaryOwnsRecall(lastUserMessage(event.context), pending)) return;
+		// 同步门 1：store 在这份结果在飞期间被写过（主工具 / worker / 同步写入都算）→ 整份作废。
+		// 典型情形：同轮 `memory remove` 删掉了选中的条目，或 `replace` 改掉了它的正文 ——
+		// 持久化会把已删 / 已改的正文写进会话。store 换了（会话重建）也算作废（代数不可比）。
+		const activeStore = store;
+		if (activeStore === null || activeStore !== pending.store || activeStore.generation !== pending.generation) return;
+		// 同步门 2：选中的文件里已经有任何一个进了去重集合（同轮 `search` 把它的完整正文交给了模型，
+		// 或者同轮另一个召回已经持久化了它）→ 整份作废。不重组、不部分标记：保守做法是下一轮重新检索。
+		if (pending.files.some((file) => injectedFiles.has(file))) return;
 		// 渲染成功才算注入（content 非空）；持久化保证它最迟在下一请求进入上下文。
 		for (const f of pending.files) injectedFiles.add(f);
 		// spec §14：让用户看见「这一轮想起了什么」。headless 会话不通知；ctx 只在同步段读一次。
@@ -820,6 +842,15 @@ export default function (pi: ExtensionAPI) {
 				{ type: "custom_message" as const, customType: "memory-auto-surfacing", content: pending.content, display: false },
 			],
 		};
+	});
+
+	// pending 的销账点：run 彻底结束（不再有自动重试 / compaction / 排队续轮）之后。
+	// 零工具轮、取消、未就绪都不在 `turn_end` 清 pending（那些边界只是「本轮这个请求不带」，下一轮
+	// 还会重检），所以没有这一道，一份没赶上的结果会一直驻留到本进程退出，或被某个不相干的边界消费。
+	// 它不回滚已提交的 entries：`turn_end` 持久化之后 run 直接结束（工具结果全要求 terminate /
+	// `finishTurn` 返回 end）时，召回仍在历史里 —— 刻意语义，见 `docs/reference/pi-memory.zh.md`。
+	pi.on("agent_settled", () => {
+		pendingRecall = undefined;
 	});
 
 	// D14：compaction 是**唯一**的会话内刷新点。compaction 已经重写了对话中段，头部再变一次

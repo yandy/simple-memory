@@ -128,9 +128,10 @@ Windows 上的 `/mnt/…`）、空值，以及「根存在但不是目录」或�
 
 1. `step === 1`（轮首，且这一步 claim 的 messages 里有真人 prompt）：先作废**上一轮**的在途召回，再把 `scanEntries` + 侧查询丢到后台，**立即返回原 decision** —— 本轮第一个请求与侧查询并行，可能不带召回。
 2. **同一 turn** 的 `step >= 2`（模型调过工具之后）：结果已就绪才把 `<relevant_memories>` 消息 splice 进这一步 claim 的消息之后（`form: "notice"` + 一行 `Recalled N memories` 摘要），并把这些文件标进去重集合；未就绪就原样返回，留给后面的 step。
-3. 下列情况结果一律作废、不标去重：turn 变了、step 被拒、轮被取消、这一步 claim 里出现与启动时不同的真人输入，以及这一轮没有后续 step（模型直接答完）。同一 turn 重复进 step 1 = 重新启动一次预取，旧结果按身份校验丢弃。
+3. 下列情况结果一律作废、不标去重：turn 变了、step 被拒、轮被取消、这一步 claim 里出现与启动时不同的真人输入、`agent/status` 转 `idle`（这一轮及其排队续轮都跑完了，没赶上的结果不跨轮保留），以及这一轮没有后续 step（模型直接答完）。同一 turn 重复进 step 1 = 重新启动一次预取，旧结果按身份校验丢弃。
 4. 去重口径与 pi 一致：「本 session 已让模型见过正文的文件」—— 召回注入的文件，加上**主 session** `memory` 工具读取过的（`add` / `replace` 成功写入的文件，`scope=memory` 的 `search` 命中的文件；`list` / `scope=sessions` / 失败调用不计）。extract / dream 的常驻 worker 读到的正文只进了子会话，主模型没见过，不标记。
-5. 宿主 compact / clear 会用**同一个 sessionId** 重建 agent（`agent/created` 的 `payload.source` 为 `compact` / `clear`）：这时清空去重集合与在途召回 —— 被挤出或清空的正文若继续算「已见过」，这些 entry 在本会话里就再也不会浮现。`startup` / `resume` 相反：历史还在上下文里，去重状态保留。
+5. 同轮的并发写入同样被两道**同步门**拦住（与 pi 相同的判据）：结果在飞期间 store 被写过（同轮 `memory remove` / `replace`、常驻 worker、同步写入都算），或者选中的文件里已有一个进了去重集合（同轮 `memory search` 已经把完整正文交给模型）→ 整份作废，不 splice、不标去重。
+6. 宿主 compact / clear 会用**同一个 sessionId** 重建 agent（`agent/created` 的 `payload.source` 为 `compact` / `clear`）：这时清空去重集合与在途召回 —— 被挤出或清空的正文若继续算「已见过」，这些 entry 在本会话里就再也不会浮现。`startup` / `resume` 相反：历史还在上下文里，去重状态保留。
 
 ## 跨设备同步
 

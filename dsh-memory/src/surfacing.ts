@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { runTask, scanEntries, TASKS } from "@yandy0725/memory-core";
-import type { HeadlessAgentPort } from "@yandy0725/memory-core";
+import type { HeadlessAgentPort, MemoryStore } from "@yandy0725/memory-core";
 import type { SessionMemoryRuntime } from "./store-registry.js";
 
 /**
@@ -37,10 +37,14 @@ const USER_PROMPT_MAX_CHARS = 4000;
  *    收进新的真人输入（steering / 排队 follow-up），那种情况下这条召回属于**前一条** prompt，
  *    第 1 道闸是哑的（turn 没变），只有按 prompt 校验才能把结果扣在正确的输入上。
  *
+ * 另外还有两道**同步门**（spec Finding 1）：侧查询在飞时主 agent 可能在同轮用 `memory` 工具改 store
+ * （`remove` / `replace`）或读到其中某个文件的正文（`search`）。两种情况下这份 recall 都已经过时，
+ * 消费前比对 `store.generation`（写入代数）与去重集合交集，任何一项变化就整份作废。
+ *
  * `settled` 之前 `files` / `content` 一律不可信（消费点必须先看它）。
  *
- * 装配层持有 `Map<sessionId, PendingRecall>`（宿主的 compact / clear 与 dispose 都要作废它），
- * 会话边界的销账语义在 index.ts。
+ * 装配层持有 `Map<sessionId, PendingRecall>`（宿主的 compact / clear、`agent/status` 转 idle 与 dispose
+ * 都要作废它），会话边界的销账语义在 index.ts。
  *
  * 同一 turn 再进一次 step 1 = 重新启动一次 prefetch（`set` 覆盖旧记录），旧 prefetch 的迟到结果因身份
  * 校验不等而丢弃；若那次重复被可用性门 / 真人 prompt 门挡回，旧记录原样留着给后续 step >= 2 消费。
@@ -50,6 +54,10 @@ export interface PendingRecall {
 	settled: boolean;
 	/** 启动 prefetch 时这一轮 claim 里的真人 prompt（消费点的归属校验用它）。 */
 	prompt: string;
+	/** 启动这一轮 prefetch 的那个 store；store 换了（会话重建）就不能再拿它比代数。 */
+	store: MemoryStore;
+	/** 启动时的 `store.generation`：消费前变了 = 同轮里有写入落盘，这份结果过时。 */
+	generation: number;
 	files: string[];
 	content: string;
 }
@@ -218,7 +226,16 @@ export function createPreStepListener(
 				// 去重集合递**快照**：查询在飞时同轮的消费点可能把别的文件标进活 Set，传引用会让
 				// 「查询输入」随之后写而变。
 				const injectedFiles = new Set(deps.injected.get(sessionId) ?? []);
-				const pending: PendingRecall = { turn: payload.turn, settled: false, prompt, files: [], content: "" };
+				const pending: PendingRecall = {
+					turn: payload.turn,
+					settled: false,
+					prompt,
+					store,
+					// 写入代数的基线：取启动这一刻的值，所以侧查询在飞期间的任何写入都会在消费点被发现。
+					generation: store.generation,
+					files: [],
+					content: "",
+				};
 				// 记下这一轮的 pending：跨轮的旧记录上面已清；同 turn 重复 step 1 时这次 `set` 就是
 				// 「替换」（旧 prefetch 的迟到结果会被下面的身份校验丢弃）。
 				deps.pendingRecalls.set(sessionId, pending);
@@ -270,6 +287,21 @@ export function createPreStepListener(
 			// 未就绪：这个请求不带召回（「永不阻塞」的代价面），pending 留给后面的 step。
 			// 取消不在这条路径上 —— 上面 refresh 之后的 abort 复检已经先销账并返回了。
 			if (!pending.settled) return decision;
+
+			// 同步门 1：store 在这份结果在飞期间被写过（同轮 `memory remove` / `replace`、worker、同步写入
+			// 都算）→ 整份作废。持久化会把已删 / 已改的正文交给模型。store 或代数不可比（会话重建）同理。
+			if (rt === undefined || rt.store === null || rt.store !== pending.store || rt.store.generation !== pending.generation) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
+			}
+
+			// 同步门 2：选中的文件里已经有任何一个进了去重集合（同轮 `search` 把它的完整正文交给了模型）
+			// → 整份作废，不重组、不部分标记。保守做法是下一轮按新 prompt / 新内容重新检索。
+			const alreadySeen = deps.injected.get(sessionId);
+			if (pending.files.some((file) => alreadySeen?.has(file) === true)) {
+				deps.pendingRecalls.delete(sessionId);
+				return decision;
+			}
 
 			// 就绪的 pending 只有一次消费机会：无论成败都销账，绝不让后续 step 再拼一次同样一块。
 			deps.pendingRecalls.delete(sessionId);

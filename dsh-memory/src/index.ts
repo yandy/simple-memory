@@ -540,6 +540,16 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 		{ prepend: true },
 	);
 
+	// 8b. `agent/status` 转 `idle` 时作废在途召回。
+	//
+	// pending 在消费路径上是懒清理的：零工具一轮（模型直接答完）、未就绪、被每一步的 turn / prompt /
+	// 同步门挡回，都只是「不消费」而不销账。所以必须有一个「这一轮真的结束了」的收口点，否则一份没
+	// 赶上的召回会一直驻留到下一次同 turn 的 step >= 2（或进程退出），甚至跨过一轮被误消费。宿主
+	// 把 `idle` 定义为“no driver is active”，正是「这一轮（以及任何排队续轮）都跑完了」。
+	ctx.on("agent/status", ({ agent, status }) => {
+		if (status === "idle") pendingRecalls.delete(agent.session.id);
+	});
+
 	// 9. 每轮收口的抽取挂在 `agent/turn-stopping`（串行、被 await，然后边界才提交）。监听器本体
 	//    同步返回：extract 是一次 120s 的 headless 调用，await 进去等于把每一轮都拖到抽取跑完。
 	//    `enabled` / 子 agent / 无运行时这三道门禁都在 extract.ts 里（触发点决策属于适配层）。
