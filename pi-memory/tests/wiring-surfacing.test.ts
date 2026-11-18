@@ -9,8 +9,9 @@
  */
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DREAM_ACTIONS, type HeadlessAgentPort } from "@yandy0725/memory-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakePi, customTriggerEvent, DISK_INDEX, disposableCtx, flush, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, setupSession, uiWith, waitFor } from "./helpers/wiring-harness";
+import { createFakePi, createMemoryToolSpy, customTriggerEvent, DISK_INDEX, disposableCtx, flush, resetWiringMocks, runTaskMock, scanEntriesMock, sectionsEvent, setupSession, uiWith, waitFor } from "./helpers/wiring-harness";
 import memoryFactory from "../index";
 
 const RECALL = "<relevant_memories>\n## SSH\nx\n\n## DB\ny\n</relevant_memories>";
@@ -845,6 +846,82 @@ describe("index wiring — auto-surfacing", () => {
 
 		// 侧查询的输入里已经包含它：core 的 candidates() 会把这个文件过滤掉。
 		expect(injectedAtCall).toEqual([new Set(["ssh.md"])]);
+	});
+
+	it("does not mark files the headless dream/extract tool read", async () => {
+		const { setStatus, ctx } = spyUi();
+		const { pi, handlers } = createFakePi();
+		memoryFactory(pi as any);
+		await handlers["session_start"][0]({}, s.uiCtx());
+
+		await writeFile(
+			join(s.dir, "ssh.md"),
+			[
+				"---",
+				"name: SSH",
+				"description: staging ssh",
+				"type: project",
+				"created: 2026-01-01",
+				"modified: 2026-01-01",
+				"---",
+				"",
+				"staging 的 SSH 用 2222 端口",
+				"",
+			].join("\n"),
+			"utf8",
+		);
+
+		scanEntriesMock.mockResolvedValue([entry("ssh.md")]);
+		const injectedAtCall: Array<Set<string>> = [];
+		let headless: HeadlessAgentPort | undefined;
+		runTaskMock.mockImplementation(async (...args: any[]) => {
+			// 端口由 index 在每次 pre-step / run 时现造；侧查询这次调用带的就是 headless 子会话的那个。
+			headless = args[2].ports.headless as HeadlessAgentPort;
+			injectedAtCall.push(new Set(args[1].injectedFiles));
+			return { files: [], content: "" };
+		});
+
+		await handlers["before_agent_start"][0](sectionsEvent("ssh?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(headless).toBeDefined();
+		const port = headless as HeadlessAgentPort;
+
+		// 经**真实** headless 端口建一次 dream 的工具：模型故意不可解析（不联网），但工具在
+		// `runHeadlessAgent` 的模型校验**之前**就已经由 `buildMemoryTool` 包好了。
+		createMemoryToolSpy.mockClear();
+		await expect(
+			port.run({
+				task: "dream",
+				cwd: s.dir,
+				model: "missing/model",
+				builtinTools: "file-io",
+				memoryTool: { actions: DREAM_ACTIONS },
+			}),
+		).rejects.toThrow(/not resolvable/);
+
+		// 创建点拿不到 `onContentSeen`：headless 工具没有那个回调。
+		const headlessSpec = createMemoryToolSpy.mock.calls.at(-1)?.[1] as { actions: readonly string[] };
+		expect(headlessSpec.actions).toBe(DREAM_ACTIONS);
+		expect("onContentSeen" in headlessSpec).toBe(false);
+
+		// 真的执行一次（= dream 子会话读了 ssh.md 的正文）：内容进了子会话，主模型没见过。
+		const headlessTool = createMemoryToolSpy.mock.results.at(-1)?.value as {
+			execute: (...args: any[]) => Promise<{ content: Array<{ text: string }> }>;
+		};
+		const read = await headlessTool.execute(
+			"dream-1",
+			{ action: "search", query: "SSH" },
+			undefined,
+			undefined,
+			s.uiCtx(),
+		);
+		expect(read.content[0].text).toContain("staging 的 SSH 用 2222 端口");
+
+		// 主 session 的去重集合因此仍为空：下一轮的侧查询照样把 ssh.md 当候选（与上一个用例相反）。
+		await handlers["before_agent_start"][0](sectionsEvent("ssh again?"), ctx);
+		await flushPrefetch(setStatus);
+		expect(injectedAtCall).toHaveLength(2);
+		expect(injectedAtCall[1]).toEqual(new Set());
 	});
 
 	it("skips the side query for subagents", async () => {

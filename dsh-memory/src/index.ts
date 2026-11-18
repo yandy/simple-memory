@@ -209,7 +209,7 @@ export async function apply(ctx: Context, config: unknown): Promise<() => void> 
 	/** sessionId → 本会话已注入过召回的 entry 文件名。surfacing 读写它，装配层负责在会话结束时销账。 */
 	const injected = new Map<string, Set<string>>();
 	/**
-	 * sessionId → 在途召回（prefetch）状态。传输写入在 surfacing 侧；装配层只负责在会话边界作废它
+	 * sessionId → 在途召回（prefetch）状态。写入在 surfacing 侧；装配层只负责在会话边界作废它
 	 * （compact / clear / disposed）——「哪一代 agent 的召回」不能跨代复用。
 	 */
 	const pendingRecalls = new Map<string, PendingRecall>();

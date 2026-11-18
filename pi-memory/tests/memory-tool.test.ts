@@ -155,6 +155,26 @@ describe("onContentSeen 透传（index.ts 用它做召回去重）", () => {
 		);
 		await expect(run(tool, { action: "search", query: "nothing" })).resolves.toBe("No matches in memory.");
 	});
+
+	it("never fires for a search that misses", async () => {
+		const onContentSeen = vi.fn();
+		const tool = createMemoryTool(deps(), { onContentSeen });
+
+		await expect(run(tool, { action: "search", query: "nothing" })).resolves.toBe("No matches in memory.");
+
+		// 没有任何正文进上下文：不得把空命中当成一次「见过」。
+		expect(onContentSeen).not.toHaveBeenCalled();
+	});
+
+	it("never fires for a sessions scope search", async () => {
+		const onContentSeen = vi.fn();
+		const tool = createMemoryTool(deps(), { onContentSeen });
+
+		// 会话日志不是记忆 entry：去重集合里没有它对应的文件。
+		await expect(run(tool, { action: "search", scope: "sessions", query: "q" })).resolves.toBe("session hits");
+
+		expect(onContentSeen).not.toHaveBeenCalled();
+	});
 });
 
 describe("Saved 通知（pi 通道，core 不认识 ctx.ui）", () => {

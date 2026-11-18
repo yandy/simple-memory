@@ -670,19 +670,24 @@ describe("apply — 启动期降级与每轮召回", () => {
 		await consumeRecall(fake, agent, [createUserMsg("tell me about alpha")], 1, 2);
 
 		// `startup` / `resume` 重建：历史还在上下文里，已注入的正文仍在 → 去重状态必须保留。
+		const restarted = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(restarted, "startup");
+		await recall(restarted, 2);
+		expect(await candidatesOf(2)).not.toContain("Alpha.md");
+
 		const resumed = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(resumed, "resume");
-		await recall(resumed, 2);
-		expect(await candidatesOf(2)).not.toContain("Alpha.md");
+		await recall(resumed, 3);
+		expect(await candidatesOf(3)).not.toContain("Alpha.md");
 
 		// `compact`：宿主把历史压成摘要后重建 agent，已注入的正文被挤出上下文。去重状态若不清空，
 		// 这些文件在本会话里永不再浮现（正文已不在历史里）—— 正是要修的 bug。
 		const compacted = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(compacted, "compact");
 		const compactedMessages = [createUserMsg("tell me about alpha")];
-		await recall(compacted, 3);
-		expect(await candidatesOf(3)).toContain("Alpha.md");
-		expect((await consumeRecall(fake, compacted, compactedMessages, 3, 2)).messages[1].content[0].text).toContain(
+		await recall(compacted, 4);
+		expect(await candidatesOf(4)).toContain("Alpha.md");
+		expect((await consumeRecall(fake, compacted, compactedMessages, 4, 2)).messages[1].content[0].text).toContain(
 			"the codeword is lantern",
 		);
 
@@ -690,9 +695,9 @@ describe("apply — 启动期降级与每轮召回", () => {
 		const cleared = fake.makeAgent({ id: "s1", cwd });
 		await fake.emitter.agentCreated(cleared, "clear");
 		const clearedMessages = [createUserMsg("tell me about alpha")];
-		await recall(cleared, 4);
-		expect(await candidatesOf(4)).toContain("Alpha.md");
-		expect((await consumeRecall(fake, cleared, clearedMessages, 4, 2)).messages).toHaveLength(2);
+		await recall(cleared, 5);
+		expect(await candidatesOf(5)).toContain("Alpha.md");
+		expect((await consumeRecall(fake, cleared, clearedMessages, 5, 2)).messages).toHaveLength(2);
 	});
 
 	it("counts files the main session tool read as already seen", async () => {
@@ -722,6 +727,43 @@ describe("apply — 启动期降级与每轮召回", () => {
 		await waitFor(() => stream.mock.calls.length >= 1);
 		expect(sideQueryPrompt(stream, 0)).not.toContain("Alpha.md");
 		expect(sideQueryPrompt(stream, 0)).toContain("Beta.md");
+	});
+
+	it("does not count files the headless worker tool read", async () => {
+		const memoryDir = memoryDirFor(cwd);
+		await seedEntry(memoryDir, "Alpha", "everything about alpha", "the codeword is lantern");
+		// 探针 entry（见上）：它保证侧查询端口真的被调到。
+		await seedEntry(memoryDir, "Beta", "everything about beta", "the codeword is anchor");
+		const stream = vi.fn(llmStreamReplying(JSON.stringify({ selected_files: ["Alpha.md"] })));
+		const { fake } = await setup(
+			{ llmStream: stream },
+			rowConfig({
+				defaults: { model: "prov/x" },
+				extractMemories: { enabled: true },
+				autoSurfacing: { model: "prov/mod" },
+			}),
+		);
+		const agent = fake.makeAgent({ id: "s1", cwd });
+		await fake.emitter.agentCreated(agent);
+
+		// extract 的常驻 worker 在会话启动时建好；它的 `memory` 工具是**子会话**的工具实例。
+		expect(fake.childSessions).toHaveLength(1);
+		const workerTool = memoryToolOf(fake, `${fake.childSessions[0].sessionId}:child`);
+		expect(workerTool).toBeDefined();
+		const read = await workerTool!.execute({ action: "search", query: "lantern" }, {});
+		expect(read.content).toContain("the codeword is lantern");
+
+		// 正文只进了子会话，主模型没见过：主 session 的去重集合必须仍为空，所以这一轮的侧查询
+		// 候选里 Alpha 还在（与上一个用例——主 session 工具读过——正好相反）。
+		await fake.emitter.preStep({
+			agent,
+			messages: [createUserMsg("tell me about alpha")],
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+		await waitFor(() => stream.mock.calls.length >= 1);
+		expect(sideQueryPrompt(stream, 0)).toContain("Alpha.md");
 	});
 
 	it("registers the recall listener outermost so an inner rewrite cannot drop the recalled block", async () => {

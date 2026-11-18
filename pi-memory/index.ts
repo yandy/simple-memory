@@ -572,14 +572,15 @@ export default function (pi: ExtensionAPI) {
 
 		// register memory tool once
 		if (!toolRegistered) {
+			const tool = buildMemoryTool({
+				// 主 session 才计入召回去重：工具把正文交给了主模型，下一轮 surfaced 不该重复。
+				onContentSeen: ({ files }) => {
+					for (const f of files) injectedFiles.add(f);
+				},
+			});
 			pi.registerTool(
 				// biome-ignore lint/suspicious/noExplicitAny: pi registerTool type cast
-				buildMemoryTool({
-					// 主 session 才计入召回去重：工具把正文交给了主模型，下一轮 surfaced 不该重复。
-					onContentSeen: ({ files }) => {
-						for (const f of files) injectedFiles.add(f);
-					},
-				}) as any,
+				tool as any,
 			);
 			toolRegistered = true;
 		}
