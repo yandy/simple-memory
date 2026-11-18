@@ -19,7 +19,7 @@ describe("prompt hygiene", () => {
 	it("memory 的三通道文案符合约定且不超预算", () => {
 		assertPromptHygiene({
 			pkg: "pi-memory",
-			budget: 2750,
+			budget: 3200,
 			tools: [createMemoryTool(deps)],
 			authored: ["memory"],
 		});

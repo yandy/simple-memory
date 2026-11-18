@@ -7,7 +7,7 @@
  * **文案本身不属于任何宿主**，所以住在这里。
  *
  * 改动这里的任何一个字都会同时改掉所有宿主的提示词；适配层通常还有一道总量预算的钉子
- * （pi 侧是 `prompt-meta.test.ts` 的三通道 2750 字符）。
+ * （pi 侧是 `prompt-meta.test.ts` 的三通道 3200 字符）。
  */
 
 /** 工具名。所有宿主必须用同一个名字：extract / dream 的 prompt 文本里是按名字引用它的。 */
@@ -22,7 +22,7 @@ export const MEMORY_TOOL_DESCRIPTION =
 export const MEMORY_TOOL_SNIPPET = "Read/write persistent project memory (one memory per file)";
 
 export const MEMORY_TOOL_GUIDELINES: readonly string[] = Object.freeze([
-	"Use memory to persist project facts, user preferences, and lessons learned across sessions. Each memory lives in its own file and occupies exactly one line of the MEMORY.md index.",
+	"Use memory only for information that will matter in future sessions: project constraints, user preferences, process rules, durable decisions, and lessons learned. Do not save completed work or repository status changes (such as merges, fixes, releases, or version bumps), facts recoverable with one command, one-time task details, or obvious observations. When in doubt, skip it.",
 	"Always pass a description with action 'add' and 'replace'. It must be self-contained and specific (what, where, which value), because future sessions select memories from descriptions alone. Bad: \"Debugging tips\". Good: \"staging SSH listens on 2222, not 22\".",
 	"Give each memory a unique, human-readable name. Adding a name that already exists overwrites that memory instead of creating a second one — use 'search' or 'list' first when you are unsure.",
 	"Keep one fact per memory and put the detail in content, not in name or description; the index line stays short.",

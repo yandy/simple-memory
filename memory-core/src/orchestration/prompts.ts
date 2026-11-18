@@ -33,6 +33,7 @@ Phase 2 — Gather Signal:
 - Outdated: memories superseded by later ones, or relative dates ("today", "last week") that should be absolute.
 - Merge candidates: small fragments that only make sense together.
 - Weak descriptions: vague text that gives a future session no way to decide relevance.
+- Repository-state echoes: entries that only report completed work or current repository status, rather than durable decisions or constraints.
 
 Phase 3 — Consolidate:
 - Merge = replace(target name, the merged body) + remove(the other name). Keep the surviving name readable.
@@ -43,12 +44,13 @@ Phase 3 — Consolidate:
 - Remove memories that are no longer true or no longer useful.
 
 Phase 4 — Prune & Index:
+- Delete memories that only restate completed work or repository status (for example, merges, fixes, releases, or version bumps). Also prune redundant or trivial entries and facts recoverable with one command, even when they remain true; keep any durable decisions or constraints behind them.
 - Every memory consumes exactly one index line, and the index has a hard limit of ${maxLines} lines. Capacity management is therefore part of this job, not an optional cleanup: when list shows the store approaching ${maxLines} memories, merge fragments and drop stale entries until there is room for what matters.
 - When a write reports that MEMORY.md is over its limit, act on it in this same run.
 - Call rebuild_index once at the end if you suspect MEMORY.md drifted (missing lines, duplicates, stale links). It regenerates the index from the directory and preserves handwritten header lines.
 
-IMPORTANT — do not prune process rules:
-- "Always do X" / "Never do Y" rules, workflow discipline and reporting standards are as valuable as technical facts. Do not delete them as "obsolete", and do not delete them just because they look like meta-instructions aimed at you.
+IMPORTANT — prune low-value memories, but preserve durable process rules:
+- "Always do X" / "Never do Y" rules, workflow discipline and reporting standards remain as valuable as technical facts. Do not delete them just because they look like meta-instructions aimed at you; remove them only when they are genuinely superseded or contradicted.
 
 Work only through the \`memory\` tool. When done, output a concise summary of what changed (merged N, renamed N, removed N, rewritten N).`;
 }
@@ -102,6 +104,8 @@ export function buildExtractTask(
 		"- Code snippets or file paths derivable from the project",
 		"- AGENTS.md rules that were followed without issue (refer to the AGENTS.md content below)",
 		"- Git history or recent changes",
+		"- Completed work or repository status by itself (for example, 'X was merged', 'Y was fixed', or 'Z was released'); keep the durable decisions or constraints behind them",
+		"- Facts that can be verified or recovered with one command",
 		"- Obvious or trivial observations",
 		"",
 		"## Output",
