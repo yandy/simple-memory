@@ -328,6 +328,106 @@ describe("createPreStepListener", () => {
 		expect(rig.pendingRecalls.size).toBe(0);
 	});
 
+	it("keeps a same-turn pending when a duplicate step 1 is turned away by the no-prompt gate", async () => {
+		// 回归：同 turn 重复进 step 1（宿主重试）不是「新的一轮」。若那次重复被真人 prompt 门挡回，
+		// 原来那份合法召回必须原样存活 —— 否则它被无谓作废，后续 step >= 2 再也拿不到这份召回，
+		// 还白付一次侧查询（重建也救不回来：有 prompt 门时压根不会重建）。
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const user = createUserMsg("what did I say about alpha?");
+
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		const settled = await waitSettled(rig.pendingRecalls);
+		expect(settled.content.startsWith("<relevant_memories>")).toBe(true);
+
+		// 同一 turn 又进了 step 1，但这回 claim 里全是合成消息 → 在 prompt 门提前返回。
+		const syntheticOnly = [createSyntheticMsg("time-context", "now: 2026-11-09T00:00:00Z")];
+		const duplicate = await rig.emitter.preStep({
+			agent,
+			messages: syntheticOnly,
+			turn: 1,
+			step: 1,
+			signal: new AbortController().signal,
+		});
+
+		expect(duplicate.messages).toBe(syntheticOnly);
+		// 没启动第二次侧查询，且记录还是原来那一条（既没删也没被替换）。
+		expect(rig.headlessRun).toHaveBeenCalledTimes(1);
+		expect(rig.pendingRecalls.get("s1")).toBe(settled);
+
+		// 后续 step >= 2 照常消费这份召回。
+		const decision = await rig.emitter.preStep({
+			agent,
+			messages: [user],
+			turn: 1,
+			step: 2,
+			signal: new AbortController().signal,
+		});
+
+		expect(decision.messages).toHaveLength(2);
+		expect(decision.messages[1]).toMatchObject({ source: { kind: "simple-memory", form: "notice" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+		expect(rig.pendingRecalls.has("s1")).toBe(false);
+	});
+
+	it("keeps a same-turn pending when a duplicate step 1 is turned away by the availability gate", async () => {
+		// 同上一条的另一扇门：surfacing 在轮中被降级（模型被换掉等）时，同 turn 的重复 step 1 也必须在
+		// 门里提前返回，而不是把待消费的记录删掉。
+		const rig = await makeRig();
+		const agent = rig.makeAgent({ id: "s1" });
+		const user = createUserMsg("hi");
+
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		const settled = await waitSettled(rig.pendingRecalls);
+
+		rig.rt.surfacing = { available: false, reason: "no model" };
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+
+		expect(rig.headlessRun).toHaveBeenCalledTimes(1);
+		expect(rig.pendingRecalls.get("s1")).toBe(settled);
+		expect(rig.injected.has("s1")).toBe(false);
+
+		// 恢复可用后，后续 step >= 2 仍能消费那条存活下来的记录（空 claim → 追加到末尾）。
+		rig.rt.surfacing = { available: true, reason: null };
+		const decision = await rig.emitter.preStep({ agent, messages: [], turn: 1, step: 2, signal: new AbortController().signal });
+
+		expect(decision.messages).toHaveLength(1);
+		expect(decision.messages[0]).toMatchObject({ source: { kind: "simple-memory", form: "notice" } });
+		expect(rig.injected.get("s1")?.has("Alpha.md")).toBe(true);
+	});
+
+	it("replaces (rebuilds) the pending when a same-turn duplicate step 1 gets past the gates", async () => {
+		// 同 turn 重复 step 1 只要真能启动，就按「替换」处理：新记录覆盖旧的，旧 prefetch 的迟到结果被
+		// 身份校验丢弃。这条钉住上一条修复没有走成「同 turn 一律保留旧记录」。
+		const deferred = deferredSideQuery();
+		const rig = await makeRig({
+			entries: [
+				["Alpha", "alpha body"],
+				["Beta", "beta body"],
+			],
+			sideQuery: deferred.run,
+		});
+		const agent = rig.makeAgent({ id: "s1" });
+		const user = createUserMsg("hi");
+
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(deferred.calls()).toBe(1), WAIT);
+		await rig.emitter.preStep({ agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal });
+		await vi.waitFor(() => expect(deferred.calls()).toBe(2), WAIT);
+
+		// 旧那份迟到返回：已被新记录取代，结果不写回。
+		deferred.resolve(0, ["Alpha.md"]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const current = rig.pendingRecalls.get("s1") as PendingRecall;
+		expect(current.settled).toBe(false);
+		expect(current.content).toBe("");
+
+		deferred.resolve(1, ["Beta.md"]);
+		const pending = await waitSettled(rig.pendingRecalls);
+		expect(pending.content).toContain("## Beta");
+		expect(pending.content).not.toContain("## Alpha");
+	});
+
 	it("only starts the prefetch at step 1: the decision messages are untouched and the pending is recorded", async () => {
 		const rig = await makeRig();
 		const agent = rig.makeAgent({ id: "s1" });

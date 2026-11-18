@@ -9,9 +9,9 @@ import type { SessionMemoryRuntime } from "./store-registry.js";
  *
  * **prefetch 两段式**（侧查询不阻塞任何请求）：
  *
- * - `step === 1`：先**无条件作废**上一轮的 pending（再谈能不能启动），然后记下真人 prompt，把
+ * - `step === 1`：先作废**上一轮**（turn 不同）的 pending（再谈能不能启动），然后记下真人 prompt，把
  *   `scanEntries` + `runTask` 丢到后台（fire-and-forget），**立即返回原 decision** —— 这一轮的第一个
- *   请求与侧查询并行，不等它。
+ *   请求与侧查询并行，不等它。同一 turn 重复进的 step 1 不走「作废」而是「替换」（见下）。
  * - **同一 turn** 的 `step >= 2`：pending 已就绪且渲染非空才消费（splice + 标记去重 + 销账）。
  *   未就绪就留给后面的 step；turn 变了、被拒、取消、或这一步 claim 里出现别的真人输入 → 作废。
  *
@@ -32,7 +32,7 @@ const USER_PROMPT_MAX_CHARS = 4000;
  * 一条在途的召回（prefetch）状态。
  *
  * 归属有两道闸，缺一不可：
- * 1. `turn`：只有**同一轮**的后续 step 才消费（新的一轮在 step 1 就先把旧记录销账）；
+ * 1. `turn`：只有**同一轮**的后续 step 才消费（新的一轮在 step 1 就先把跨轮的旧记录销账）；
  * 2. `prompt`：消费前拿这一刻 step claim 的真人 prompt 比对 —— 宿主的 inbox 可以在 handler 未完成时
  *    收进新的真人输入（steering / 排队 follow-up），那种情况下这条召回属于**前一条** prompt，
  *    第 1 道闸是哑的（turn 没变），只有按 prompt 校验才能把结果扣在正确的输入上。
@@ -41,6 +41,9 @@ const USER_PROMPT_MAX_CHARS = 4000;
  *
  * 装配层持有 `Map<sessionId, PendingRecall>`（宿主的 compact / clear 与 dispose 都要作废它），
  * 会话边界的销账语义在 index.ts。
+ *
+ * 同一 turn 再进一次 step 1 = 重新启动一次 prefetch（`set` 覆盖旧记录），旧 prefetch 的迟到结果因身份
+ * 校验不等而丢弃；若那次重复被可用性门 / 真人 prompt 门挡回，旧记录原样留着给后续 step >= 2 消费。
  */
 export interface PendingRecall {
 	turn: number;
@@ -168,11 +171,15 @@ export function createPreStepListener(
 				return decision;
 			}
 
-			// 新的一轮在 step 1 就作废上一轮的 pending：**先销账，再谈能不能启动**。放在可用性门 /
+			// 新的一轮在 step 1 就作废**上一轮**的 pending：**先销账，再谈能不能启动**。放在可用性门 /
 			// 真人 prompt 门**之前**，也放在下面的 `indexCache.refresh` await 之前 —— 那一轮就算 runtime
 			// 不可用、store 为空、surfacing 关着或没有真人 prompt，旧的 content/files 也不该继续驻留
 			// （「后续 step 靠 turn 不匹配清掉」只在后续 step 恰好来了时才成立，不是作废语义）。
-			if (payload.step === 1) {
+			// 判据必须带 `turn`：**同一 turn** 重复进 step 1（宿主重试）不在这里删，走下面启动段的
+			// 「替换」语义（新 pending 在 `set` 时覆盖旧记录）——否则那次重复若被可用性门 / 真人 prompt
+			// 门挡回，就没人在原来位置重建记录，后续 step >= 2 白白丢掉一份合法召回（还可能白付一次侧查询）。
+			const previous = deps.pendingRecalls.get(sessionId);
+			if (payload.step === 1 && previous !== undefined && previous.turn !== payload.turn) {
 				deps.pendingRecalls.delete(sessionId);
 			}
 
@@ -212,7 +219,8 @@ export function createPreStepListener(
 				// 「查询输入」随之后写而变。
 				const injectedFiles = new Set(deps.injected.get(sessionId) ?? []);
 				const pending: PendingRecall = { turn: payload.turn, settled: false, prompt, files: [], content: "" };
-				// 记下这一轮的 pending（上面已按「新的一轮作废旧记录」清过，这里只是在空位上 set）。
+				// 记下这一轮的 pending：跨轮的旧记录上面已清；同 turn 重复 step 1 时这次 `set` 就是
+				// 「替换」（旧 prefetch 的迟到结果会被下面的身份校验丢弃）。
 				deps.pendingRecalls.set(sessionId, pending);
 				const prefetch = (async () => {
 					try {
