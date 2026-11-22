@@ -118,3 +118,5 @@ blob 并算 sha256（`ls-tree` 给的是 sha1，不同源），`read()` 复用�
 | `pack-smoke` | tarball 里带齐 `dist/`、types、`LICENSE` 与 `pi-memory` 的 TS 入口；干净目录装包后能跑 |
 
 `pack-smoke` 跑 Node 20.16.0（`memory-core` 的 `engines` 下限）与 24 两档，只验证运行时形状，不跑 vitest。
+
+<!-- ci docs-only probe -->
