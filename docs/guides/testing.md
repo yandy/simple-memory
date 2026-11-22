@@ -75,11 +75,15 @@ loadConfigMock.mockRejectedValueOnce(new Error("getAgentDir failed"));
 | 输出 | 命中条件 | 打开哪些 job |
 |---|---|---|
 | `code` | 任何非 `.md`、非 `docs/` 的改动 | `test`（ubuntu + windows：`typecheck` / `lint` / `vitest`） |
-| `artifact` | 源码、`package.json`、构建与打包配置、`scripts/`、`LICENSE`、CI 自身 | `test-dist`、`workspace-smoke`、`pack-smoke`、以及 push 到 main 时的 `registry-smoke` |
-| `manifest` | 三个 `package.json` 与 `package-lock.json` | `lockfile-sync` |
+| `artifact` | 源码、`package.json`、构建与打包配置、`scripts/`、`LICENSE`、随包发布的 README、`dsh-memory/cordis.patch.yml`、CI 自身 | `test-dist`、`workspace-smoke`、`pack-smoke`、以及 push 到 main 时的 `registry-smoke` |
+| `manifest` | 根目录与三个 workspace 的 `package.json`，以及 `package-lock.json` | `lockfile-sync` |
 
-只改文档时三个输出全为 false，只剩 `changes` 跑 —— 文档改动不触发任何代码测试。只改 `*/tests/**` 会跑
-`code` 那一档（含 Windows），但不跑任何冒烟。
+只改仓库级文档（`docs/**` 与根目录的 `*.md`）时三个输出全为 false，只剩 `changes` 跑 —— 这些改动不触发
+任何测试。只改 `*/tests/**` 会跑 `code` 那一档（含 Windows），但不跑任何冒烟。
+
+随包发布的 README（`*/README*.md`）与 `dsh-memory/cordis.patch.yml` 是另一档：它们不跑代码测试（`code`
+仍把 Markdown 当文档），但会打开 `artifact` —— npm 总把 README 打进 tarball、`assert-pack-manifest` 要求它
+存在，`cordis.patch.yml` 同时在 `files`、`exports` 与 `dsh.bundle.patch` 里，删掉它们就是发一个坏包。
 
 `artifact` 是**显式清单**：新增顶层源目录或新的构建配置文件时必须加进去，否则打包与 registry 冒烟会在相关
 改动上静默跳过。`*/vitest.config.ts` 也在清单里 —— 它是 `test-dist` 关 alias 的开关。

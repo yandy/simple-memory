@@ -44,6 +44,8 @@ artifact:  # 可能影响发出去的东西 → tier2 / tier3；显式正向清�
   - 'vitest.config.ts'
   - '*/vitest.config.ts'
   - 'LICENSE'
+  - '*/README*.md'
+  - 'dsh-memory/cordis.patch.yml'
   - 'scripts/**'
   - '*/src/**'
   - '*/index.ts'
@@ -57,6 +59,10 @@ manifest:  # 只影响依赖图 → 额外跑 lockfile-sync
 `artifact` 用显式正向清单而不是「code 减去 tests」：向后兼容的写法在新增目录时会静默漏掉，显式清单漏掉
 时 **tier1 仍然会跑**（fail safe），代价只是少跑一次冒烟，且清单本身是「哪些路径能改变产物」这个判断的
 落地处。workflow 里会写一行注释说明新增构建路径时要加进来。
+
+随包发布的东西比「源码」宽：npm 总把 `README` 打进 tarball（`scripts/assert-pack-manifest.mjs` 要求它存在），
+`dsh-memory/cordis.patch.yml` 同时在 `files`、`exports` 与 `dsh.bundle.patch` 里。这两类在清单中打开 tier2/3，
+但不打开 `code` —— 改 README 不需要跑代码测试，只需要验产物形态。
 
 ### 分档
 

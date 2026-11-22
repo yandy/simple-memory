@@ -31,7 +31,8 @@ jobs:
         with:
           predicate-quantifier: some-with-excludes
           filters: |
-            # 任何非文档改动。文档 = 任何 .md 与 docs/ 下的文件：它们改不动代码也改不动产物。
+            # 任何非文档改动。文档 = 任何 .md 与 docs/ 下的文件：它们改不动代码。
+            # 例外是随包发布的 README 与 dsh bundle 配置：它们不跑代码测试，但要跑产物冒烟（见 artifact）。
             code:
               - "**"
               - "!**/*.md"
@@ -49,6 +50,10 @@ jobs:
               - "vitest.config.ts"
               - "*/vitest.config.ts"
               - "LICENSE"
+              # 随包发布的 README（npm 总是把它们打进 tarball，assert-pack-manifest 要求存在）。
+              - "*/README*.md"
+              # dsh bundle 的插入配置：同时在 files、exports 与 dsh.bundle.patch 里。
+              - "dsh-memory/cordis.patch.yml"
               - "scripts/**"
               - "*/src/**"
               - "*/index.ts"
