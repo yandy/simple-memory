@@ -66,3 +66,30 @@ loadConfigMock.mockRejectedValueOnce(new Error("getAgentDir failed"));
 每个包把「真机验过什么、怎么验、还有哪些限制」写在自己的参考文档里（`docs/reference/dsh-memory.zh.md`
 的「验证状态」一节）。跨设备同步还有一层**真实托管远端**（网络 + 凭据）的验收，自动化测试覆盖不到，照
 [sync-e2e.md](./sync-e2e.md) 手动走一遍。
+
+## CI 分层
+
+`.github/workflows/test.yml` 先用一个 `changes` job（`dorny/paths-filter`）判出三个输出，再把其余 job 挂在
+它们上面：
+
+| 输出 | 命中条件 | 打开哪些 job |
+|---|---|---|
+| `code` | 任何非 `.md`、非 `docs/` 的改动 | `test`（ubuntu + windows：`typecheck` / `lint` / `vitest`） |
+| `artifact` | 源码、`package.json`、构建与打包配置、`scripts/`、`LICENSE`、随包发布的 README、`dsh-memory/cordis.patch.yml`、CI 自身 | `test-dist`、`workspace-smoke`、`pack-smoke`、以及 push 到 main 时的 `registry-smoke` |
+| `manifest` | 根目录与三个 workspace 的 `package.json`，以及 `package-lock.json` | `lockfile-sync` |
+
+只改仓库级文档（`docs/**` 与根目录的 `*.md`）时三个输出全为 false，只剩 `changes` 跑 —— 这些改动不触发
+任何测试。只改 `*/tests/**` 会跑 `code` 那一档（含 Windows），但不跑任何冒烟。
+
+随包发布的 README（`*/README*.md`）与 `dsh-memory/cordis.patch.yml` 是另一档：它们不跑代码测试（`code`
+仍把 Markdown 当文档），但会打开 `artifact` —— npm 总把 README 打进 tarball、`assert-pack-manifest` 要求它
+存在，`cordis.patch.yml` 同时在 `files`、`exports` 与 `dsh.bundle.patch` 里，删掉它们就是发一个坏包。
+
+`artifact` 是**显式清单**：新增顶层源目录或新的构建配置文件时必须加进去，否则打包与 registry 冒烟会在相关
+改动上静默跳过。`*/vitest.config.ts` 也在清单里 —— 它是 `test-dist` 关 alias 的开关。
+
+三条 check 脚本（`check:license` / `check:host-deps` / `check:memory-core-deps`）只在 ubuntu 腿跑：它们是
+纯 Node 脚本，与平台无关。
+
+PR 上的分级按**整个 PR 相对 base 的改动**算，不是按最后一个 commit：一个已经改过 `*/src/**` 的分支，后面再
+追加一次纯文档提交，仍然是 `artifact` 档。
