@@ -438,3 +438,5 @@ describe("公开出口", () => {
 		expect(typeof api.moduleStatusRows).toBe("function");
 	});
 });
+
+// ci tests-only probe
