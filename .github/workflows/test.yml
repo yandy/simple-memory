@@ -7,7 +7,61 @@ on:
     branches: [main]
 
 jobs:
+  # 分级闸门：算出这次改动能不能碰代码、能不能换产物，后面的 job 用 if 挂在这三个输出上。
+  # 只改 `**/*.md` / `docs/**` 时三个输出全为 false，只剩这个 job 跑 —— 它就是 docs-only 的结论。
+  # predicate-quantifier: some-with-excludes —— 文件命中任一正向规则且不命中任何排除规则才算数，
+  # 否则 `code: ['**', '!**/*.md', ...]` 里的排除规则会被默认的 'some' 语义当成「也算命中」。
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      artifact: ${{ steps.filter.outputs.artifact }}
+      manifest: ${{ steps.filter.outputs.manifest }}
+    steps:
+      # PR 事件走 REST API 不需要 checkout；push 到 main 时 paths-filter 用 git diff 算改动，
+      # 深度不足会把「全部文件都算改动」当结果（全量跑，浪费但不漏）。仓库小，直接全历史。
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          predicate-quantifier: some-with-excludes
+          filters: |
+            # 任何非文档改动。文档 = 任何 .md 与 docs/ 下的文件：它们改不动代码也改不动产物。
+            code:
+              - "**"
+              - "!**/*.md"
+              - "!docs/**"
+            # 能改变「用户装到的东西」的路径：源码、package.json（exports/files/deps）、构建与打包配置、
+            # 打包脚本、LICENSE（tarball 里的副本由 prepack 生成）、以及 CI 自身（改闸门就要跑全量验证）。
+            # **新增顶层源目录或新的构建配置文件时必须加进来**，否则 tier2 冒烟会在相关改动上静默跳过。
+            # */vitest.config.ts 是 test-dist 的 alias 开关（MEMORY_CORE_FROM_DIST），不能漏。
+            artifact:
+              - "package.json"
+              - "package-lock.json"
+              - "*/package.json"
+              - "tsconfig.base.json"
+              - "*/tsconfig*.json"
+              - "vitest.config.ts"
+              - "*/vitest.config.ts"
+              - "LICENSE"
+              - "scripts/**"
+              - "*/src/**"
+              - "*/index.ts"
+              - ".github/workflows/**"
+            # 只影响依赖图：package.json 的 deps 变了 lockfile 就该跟着变。
+            manifest:
+              - "package.json"
+              - "*/package.json"
+              - "package-lock.json"
+
   lockfile-sync:
+    needs: changes
+    if: needs.changes.outputs.manifest == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -20,6 +74,8 @@ jobs:
           git diff --exit-code -- package-lock.json
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -32,9 +88,13 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci
+      # 三条 check 是纯 Node 脚本，与平台无关：只在 ubuntu 腿跑，Windows 腿只管平台相关的事。
       - run: npm run check:license
+        if: runner.os == 'Linux'
       - run: npm run check:host-deps
+        if: runner.os == 'Linux'
       - run: npm run check:memory-core-deps
+        if: runner.os == 'Linux'
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
@@ -43,6 +103,8 @@ jobs:
   # 这个 job 把 alias 关掉，让 pi-memory 与 dsh-memory 的测试经包 exports 打到 memory-core/dist ——
   # 用户拿到的那条解析路径必须被真实执行一次，否则首次发布就是它的第一次运行。
   test-dist:
+    needs: changes
+    if: needs.changes.outputs.artifact == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -77,6 +139,8 @@ jobs:
   # PR 上 core 可能尚未发布：用仓内 tarball 与适配层 tarball 在干净目录里同时安装，验证发布形态与
   # 实际解析，不把 workspace 链接或 registry 可用性当成前提。输出明确标为 workspace，不冒充 registry。
   workspace-smoke:
+    needs: changes
+    if: needs.changes.outputs.artifact == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -91,7 +155,8 @@ jobs:
 
   # registry 路径只在 main 上验：PR 阶段尚未发布的 core 客观上没有这条路径可验，不能假装通过。
   registry-smoke:
-    if: github.event_name == 'push'
+    needs: changes
+    if: github.event_name == 'push' && needs.changes.outputs.artifact == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -107,6 +172,8 @@ jobs:
   # 20.16.0 是 memory-core 的 engines 下限（dsh 生态声明的最低宿主版本），24 是开发版本。
   # 这个 job 只验证运行时形状，不跑 vitest：开发工具链的 Node 下限高于 engines。
   pack-smoke:
+    needs: changes
+    if: needs.changes.outputs.artifact == 'true'
     strategy:
       matrix:
         node: ["20.16.0", "24"]
