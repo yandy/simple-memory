@@ -86,3 +86,6 @@ loadConfigMock.mockRejectedValueOnce(new Error("getAgentDir failed"));
 
 三条 check 脚本（`check:license` / `check:host-deps` / `check:memory-core-deps`）只在 ubuntu 腿跑：它们是
 纯 Node 脚本，与平台无关。
+
+PR 上的分级按**整个 PR 相对 base 的改动**算，不是按最后一个 commit：一个已经改过 `*/src/**` 的分支，后面再
+追加一次纯文档提交，仍然是 `artifact` 档。
